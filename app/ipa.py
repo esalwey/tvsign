@@ -169,6 +169,8 @@ def latest_github(repo: str, tag_prefix: str | None, channel: str = "stable",
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo or ""):
         raise SourceRejected("dépôt GitHub attendu sous la forme owner/projet")
     releases = _get_json(f"https://api.github.com/repos/{repo}/releases?per_page=30")
+    # L'API ne renvoie pas toujours la plus récente en premier : on trie par date de publication.
+    releases = sorted(releases, key=lambda r: r.get("published_at") or r.get("created_at") or "", reverse=True)
     for rel in releases:
         if rel.get("draft") or (tag_prefix and not rel["tag_name"].startswith(tag_prefix)):
             continue
