@@ -93,7 +93,7 @@ SESSION_DAYS = int(_env("TVSIGN_SESSION_DAYS", "30"))
 GITHUB_TOKEN = _env("TVSIGN_GITHUB_TOKEN")
 PRESETS_FILE = Path(_env("TVSIGN_PRESETS_FILE") or (ROOT / "app" / "presets.json"))
 # Copy an existing PlumeImpactor folder (Apple session, pairings) on first launch.
-IMPORT_PLUME = _flag("TVSIGN_IMPORT_PLUME", True)
+IMPORT_PLUME = _flag("TVSIGN_IMPORT_PLUME", False)   # opt-in: an existing session could share an Apple ID with another tvsign
 
 # ---------- renewal loop ----------
 # Loop period, in seconds.
