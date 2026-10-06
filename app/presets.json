@@ -1,16 +1,20 @@
 {
-  "_comment": "App presets shown in onboarding and in 'Add app'. Override the whole file with TVSIGN_PRESETS_FILE.",
   "presets": [
     {
       "id": "nuviotv",
       "name": "NuvioTV",
       "repo": "esalwey/NuvioTV",
-      "tag_prefix": "custom-",
       "asset": "NuvioTV.ipa",
-      "channels": [
-        "stable",
-        "beta"
-      ],
+      "channels": {
+        "stable": {
+          "tag_prefixes": ["tvos-v"],
+          "prereleases": false
+        },
+        "beta": {
+          "tag_prefixes": ["tvos-v", "custom-"],
+          "prereleases": true
+        }
+      },
       "default_channel": "beta",
       "description": {
         "en": "Nuvio, made for Apple TV. Builds from github.com/esalwey/NuvioTV.",

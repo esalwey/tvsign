@@ -152,6 +152,13 @@ Everything is optional. The main variables: `TZ`, `PUID`, `PGID`, `TVSIGN_PORT` 
 `TVSIGN_RENEW_BEFORE_HOURS` (60), `TVSIGN_ANISETTE_URL`, `TVSIGN_GITHUB_TOKEN`, `TVSIGN_LANGUAGE`.
 Settings set in the web UI are stored in the database; an environment variable always wins.
 
+App open on the Apple TV: the Apple TV holds an update until the app is closed. Automatic renewals
+and new releases are postponed while the app has a process on the TV (retry every
+`TVSIGN_DEFER_RETRY_MINUTES`, 15), unless the profile expires within `TVSIGN_DEFER_URGENT_HOURS` (6)
+or they were postponed for `TVSIGN_DEFER_MAX_HOURS` (12): an app left in the background keeps its
+process. Once an installation is on hold, the app card asks to close the app; tvsign gives up after
+`TVSIGN_APP_WAIT_MINUTES` (30) and retries later.
+
 Building from source: see [docs/building.md](docs/building.md).
 
 ---
@@ -299,6 +306,14 @@ Tout est facultatif. Variables principales : `TZ`, `PUID`, `PGID`, `TVSIGN_PORT`
 `TVSIGN_RENEW_BEFORE_HOURS` (60), `TVSIGN_ANISETTE_URL`, `TVSIGN_GITHUB_TOKEN`, `TVSIGN_LANGUAGE`.
 Les réglages faits dans l'interface sont enregistrés en base ; une variable d'environnement a
 toujours la priorité.
+
+App ouverte sur l'Apple TV : l'Apple TV garde une mise à jour en attente tant que l'app est ouverte.
+Les renouvellements automatiques et les nouvelles versions sont reportés tant que l'app a un
+processus sur la TV (nouvel essai toutes les `TVSIGN_DEFER_RETRY_MINUTES`, 15), sauf si le profil
+expire dans moins de `TVSIGN_DEFER_URGENT_HOURS` (6) ou après `TVSIGN_DEFER_MAX_HOURS` (12) de
+report : une app laissée en arrière-plan garde son processus. Quand une installation est en attente,
+la carte de l'app demande de fermer l'app ; tvsign abandonne au bout de `TVSIGN_APP_WAIT_MINUTES`
+(30) et réessaie plus tard.
 
 Compiler soi-même : voir [docs/building.md](docs/building.md).
 

@@ -92,6 +92,9 @@ const CAUSES = [
   [/anisette/i, "c_anisette"],
   [/reconnexion|-22406|HTTP Some\(401\)|unauthori[sz]ed|session .*(expir|invalid)|not logged|log ?in required/i, "c_session"],
   [/plumesign occupé/i, "c_busy"],
+  [/est ouverte sur l'Apple TV|app ouverte sur la TV/i, "c_app_open"],
+  [/plumesign trop ancien/i, "c_plumesign_old"],
+  [/réseau ou Apple injoignable/i, "c_apple_net"],
   [/maximum (number )?of (apps|app ids)|too many|app id limit|limit of \d+/i, "c_limit"],
   [/identifiant d'app changé/i, "c_bundle"],
   [/empreinte SHA-256/i, "c_digest"],
@@ -179,13 +182,21 @@ async function busy(b, attr, label, fn) {
 
 // ---------- état d'une app ----------
 // [ton, libellé] ; ton : ok | warn | err | cours | neutre
+const reportee = (a, now) => !a.running && a.deferred_reason === "app_running" && a.next_attempt_at > now;
 function etatApp(a, now, s) {
   const exp = a.expires_at, fenetre = s.renew_before_hours * 3600;
   const expiree = exp ? exp <= now : false;
-  if (a.running) return ["cours", t("st_renewing")];
+  if (a.running) {
+    const ph = a.phase || {};
+    if (ph.step === "waiting_app") return ["warn", t("st_waiting_app")];
+    if (ph.step === "installing" && ph.percent != null) return ["cours", t("st_installing_pct", { n: ph.percent })];
+    if (["checking", "signing", "uploading", "installing"].includes(ph.step)) return ["cours", t("st_" + ph.step)];
+    return ["cours", t("st_renewing")];
+  }
   if (!a.enabled) return ["neutre", t("st_paused")];
   if (!a.device_id) return ["err", t("st_no_tv")];
   if (exp && expiree) return ["err", t("st_expired")];
+  if (reportee(a, now)) return ["neutre", t("st_deferred")];
   if (a.status === "error") return ["err", exp && exp - now < 24 * 3600 ? t("st_failed_soon") : t("st_failed")];
   if (!exp) return ["warn", t("st_to_install")];
   if (exp - now < fenetre) return ["warn", t("st_to_renew")];
@@ -221,6 +232,23 @@ function jauge(a, now, s, ton) {
         ${reste > 0 ? `<span class="jauge__repere" style="left:${(100 - posRenouv).toFixed(1)}%" title="${esc(t("auto_renewal"))}"></span>` : ""}
       </div>
       <p class="validite__legende"><span>${esc(t("expires", { date: fmtDate(exp) }))}</span>${a.enabled && reste > 0 && a.status !== "error" && !a.running ? `<span>${esc(t("auto_renewal_when", { when: renouv <= now ? t("asap") : relatif(renouv, now) }))}</span>` : ""}</p>
+    </div>`;
+}
+
+// App ouverte sur l'Apple TV : installation en attente (installd) ou reportée (pas d'interruption).
+function noteApp(a, now) {
+  const tv = a.device_name || "Apple TV";
+  let titre, texte;
+  if (a.running && a.phase?.step === "waiting_app") {
+    titre = t("wait_app_t", { name: a.name });
+    texte = t("wait_app", { tv, when: relatif(a.phase.deadline, now) });
+  } else if (reportee(a, now)) {
+    titre = t("deferred_t", { name: a.name, tv });
+    texte = t("deferred", { when: relatif(a.next_attempt_at, now) });
+  } else return "";
+  return `<div class="probleme probleme--info" role="status">
+      <span class="probleme__ic">${ICONS.tv}</span>
+      <div class="probleme__texte"><p class="probleme__titre">${esc(titre)}</p><p>${esc(texte)}</p></div>
     </div>`;
 }
 
@@ -264,6 +292,7 @@ function carteApp(a, now, s) {
       <span class="etat etat--${ton}">${esc(mot)}</span>
     </div>
     ${jauge(a, now, s, ton)}
+    ${noteApp(a, now)}
     ${problemeApp(a, now)}
     <dl class="meta">
       <div><dt>Apple TV</dt><dd>${a.device_id ? esc(a.device_name || "Apple TV") : `<span class="texte-err">${t("none_f")}</span>`}</dd></div>
@@ -296,6 +325,7 @@ function synthese(s, now) {
     && (a.renew_at ?? a.expires_at - s.renew_before_hours * 3600) < now - lim);
   const arret = boucleArretee(h, now);
   const cours = s.apps.filter((a) => a.running);
+  const attente = cours.filter((a) => a.phase?.step === "waiting_app");
 
   if (ECHECS >= 2) return ["off", t("sum_unreachable_t"), t("sum_unreachable")];
   if (arret) return ["off", t("sum_stopped_t"), t("sum_stopped", { since: relatif(h.last_loop_at, now) })];
@@ -303,6 +333,7 @@ function synthese(s, now) {
   if (expirees.length) return ["off", tn("sum_expired_t", expirees.length), t("sum_expired")];
   if (echecs.length) return ["warn", tn("sum_failed_t", echecs.length), t("sum_failed")];
   if (enRetard.length) return ["warn", t("sum_late_t"), t("sum_late")];
+  if (attente.length) return ["warn", t("st_waiting_app"), t("wait_app_t", { name: attente.map((a) => a.name).join(", ") })];
   if (cours.length) return ["cours", t("st_renewing"), t("sum_running", { names: cours.map((a) => a.name).join(", ") })];
   if (!s.apps.length) return ["neutre", t("sum_empty_t"), t("sum_empty")];
   const prochaine = actives.filter((a) => a.expires_at).sort((x, y) => x.expires_at - y.expires_at)[0];
@@ -641,8 +672,20 @@ async function fillAppForm() {
   syncTabs();
   const list = await presets();
   $("#app-presets").innerHTML = presetCartes(list, "preset");
+  canalDuPreset("preset", "channel");
   if (!list.length && f.source_type.value === "preset") { f.source_type.value = "github"; syncTabs(); }
 }
+// canal proposé par défaut : celui du préréglage choisi (ex. bêtas tant qu'il n'y a pas de version stable)
+function canalDuPreset(nomPreset, nomCanal) {
+  const choix = $(`input[name="${nomPreset}"]:checked`);
+  const p = (PRESETS || []).find((x) => x.id === choix?.value);
+  const r = p && $(`input[name="${nomCanal}"][value="${p.default_channel === "beta" ? "beta" : "stable"}"]`);
+  if (r) r.checked = true;
+}
+document.addEventListener("change", (e) => {
+  if (e.target.name === "preset") canalDuPreset("preset", "channel");
+  if (e.target.name === "wiz-preset") canalDuPreset("wiz-preset", "wiz-canal");
+});
 function syncTabs() {
   const type = $("#form-app").source_type.value;
   $$("#form-app [data-for]").forEach((el) => (el.hidden = !el.dataset.for.split(" ").includes(type)));
@@ -779,18 +822,22 @@ function watchSession(sess, box, { cle, label, doneText, numerique, onEnd }) {
     box.innerHTML = `<div class="code"><p class="group__header">${esc(label)}</p>
       ${invite(sess) ? `<p class="code__invite">${esc(invite(sess))}</p>` : ""}
       ${envois ? `<p class="code__invite">${t("new_entry")}</p>` : ""}
-      <div class="list"><input ${numerique ? 'inputmode="numeric" pattern="[0-9]*" maxlength="8"' : 'inputmode="text" maxlength="12"'} autocomplete="one-time-code" aria-label="${esc(label)}" spellcheck="false"><button type="button" class="btn btn--primary">${t("validate")}</button></div></div>`;
+      <div class="list"><input ${numerique ? 'inputmode="numeric" pattern="[0-9]*" maxlength="8"' : 'inputmode="text" maxlength="12"'} autocomplete="one-time-code" aria-label="${esc(label)}" spellcheck="false"><button type="button" class="btn btn--primary" data-valider>${t("validate")}</button></div>
+      ${/type 'sms'/i.test(sess.prompt || "") ? `<p class="code__invite"><button type="button" class="lien" data-sms>${t("send_sms")}</button></p>` : ""}</div>`;
     const input = $("input", box);
-    const go = async () => {
+    const go = async (valeur) => {
       if (!saisie) return;
-      if (!input.value.trim()) return input.focus();
+      const v = (valeur ?? input.value).trim();
+      if (!v) return input.focus();
       saisie = false; envois++; gen++;
       statut(`<span class="etat etat--cours">${t("verifying")}</span>`);
-      try { await api(`/api/sessions/${sess.id}/answer`, { json: { value: input.value.trim() } }); }
+      try { await api(`/api/sessions/${sess.id}/answer`, { json: { value: v } }); }
       catch (e) { if (e.status !== 409) box.insertAdjacentHTML("beforeend", `<p class="erreur">${esc(e.message)}</p>`); }
       gen++;   // l'état « running » est posé par le serveur avant la réponse : tout « waiting » ultérieur est une nouvelle demande
     };
-    $("button", box).onclick = go;
+    $("[data-valider]", box).onclick = () => go();
+    const sms = $("[data-sms]", box);
+    if (sms) sms.onclick = () => go("sms");
     input.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); go(); } };
     input.focus();
   };
@@ -1025,8 +1072,8 @@ const WIZ_RENDU = {
       ${PRESETS ? presetCartes(PRESETS, "wiz-preset") : `<p class="statut"><span class="etat etat--cours">${t("loading")}</span></p>`}
       <p class="group__header espace">${t("channel")}</p>
       <div class="segmented" role="radiogroup" aria-label="${esc(t("channel"))}">
-        <label><input type="radio" name="wiz-canal" value="stable" checked><span>${t("channel_stable")}</span></label>
-        <label><input type="radio" name="wiz-canal" value="beta"><span>${t("channel_beta")}</span></label>
+        <label><input type="radio" name="wiz-canal" value="stable" ${PRESETS?.[0]?.default_channel === "beta" ? "" : "checked"}><span>${t("channel_stable")}</span></label>
+        <label><input type="radio" name="wiz-canal" value="beta" ${PRESETS?.[0]?.default_channel === "beta" ? "checked" : ""}><span>${t("channel_beta")}</span></label>
       </div>
       <p class="group__footer">${t("channel_note")}</p>
       ${tvs.length ? "" : `<p class="erreur">${t("pair_first")}</p>`}

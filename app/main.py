@@ -298,10 +298,14 @@ def state():
     default = plume.default_account()
     for a in apps:
         a["running"] = a["id"] in renew._RUNNING
+        # étape en cours (signing, uploading, installing, waiting_app…) : voir renew.PHASE
+        a["phase"] = renew.PHASE.get(a["id"]) if a["running"] else None
         exp = a["expires_at"]
         a["expired"] = bool(exp) and exp <= now
         # moment où la boucle lancera le renouvellement automatique (None : dès que possible)
         a["renew_at"] = exp - before * 3600 if exp else None
+        if a["deferred_reason"] and a["next_attempt_at"] and a["renew_at"]:
+            a["renew_at"] = max(a["renew_at"], a["next_attempt_at"])   # reporté : app ouverte sur la TV
         a["effective_account"] = a["account_email"] or default
     health = renew.health(now)
     return {
@@ -512,9 +516,10 @@ async def app_create(
         p = ipa.preset(preset or "")
         if not p:
             raise HTTPException(400, "préréglage inconnu")
-        source_type, source, source_filter = "github", p["repo"], p.get("tag_prefix")
+        # préfixes de tag : ceux du canal, relus dans le préréglage à chaque recherche (ipa.release_rule)
+        source_type, source, source_filter = "github", p["repo"], None
         asset_name = p.get("asset")
-        channel = channel or p.get("default_channel", "stable")
+        channel = channel if channel in p["channels"] else p["default_channel"]
     else:
         preset = None
     if source_type not in ("upload", "github", "url"):

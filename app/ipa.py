@@ -162,19 +162,23 @@ def _sha256_of(rel: dict, asset: dict) -> str | None:
     return None
 
 
-def latest_github(repo: str, tag_prefix: str | None, channel: str = "stable",
+def latest_github(repo: str, tag_prefixes: list[str] | str | None, prereleases: bool = False,
                   asset_name: str | None = None) -> dict | None:
     """Release la plus récente qui correspond : {tag, url, sha256, prerelease, asset}.
-    Canal « stable » : les prereleases sont ignorées ; « beta » : elles sont incluses."""
+    tag_prefixes : le tag doit commencer par l'un d'eux (aucun : tous les tags).
+    prereleases : False (canal stable) les ignore, True (canal beta) les inclut."""
+    if isinstance(tag_prefixes, str):
+        tag_prefixes = [tag_prefixes]
+    tag_prefixes = [p for p in (tag_prefixes or []) if p]
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo or ""):
         raise SourceRejected("dépôt GitHub attendu sous la forme owner/projet")
     releases = _get_json(f"https://api.github.com/repos/{repo}/releases?per_page=30")
     # L'API ne renvoie pas toujours la plus récente en premier : on trie par date de publication.
     releases = sorted(releases, key=lambda r: r.get("published_at") or r.get("created_at") or "", reverse=True)
     for rel in releases:
-        if rel.get("draft") or (tag_prefix and not rel["tag_name"].startswith(tag_prefix)):
+        if rel.get("draft") or (tag_prefixes and not rel["tag_name"].startswith(tuple(tag_prefixes))):
             continue
-        if rel.get("prerelease") and channel != "beta":
+        if rel.get("prerelease") and not prereleases:
             continue
         ipas = [a for a in rel.get("assets", [])
                 if a["name"].lower().endswith(".ipa") and a.get("state", "uploaded") == "uploaded"]
@@ -231,13 +235,68 @@ def download(url: str, dest: Path, sha256: str | None = None, expect_bundle: str
 
 # ---------- préréglages ----------
 
+CHANNELS = ("stable", "beta")
+
+
+def preset_channels(p: dict) -> dict[str, dict]:
+    """Canaux d'un préréglage : {canal: {tag_prefixes: [...], prereleases: bool}}.
+
+    Format actuel : "channels": {"stable": {"tag_prefixes": ["tvos-v"]}, "beta": {...}}
+    (prereleases : faux pour stable, vrai sinon, sauf mention contraire).
+    Ancien format : "tag_prefix": "custom-" et "channels": ["stable", "beta"]."""
+    ch = p.get("channels")
+    if isinstance(ch, dict):
+        out = {}
+        for name, c in ch.items():
+            if name not in CHANNELS or not isinstance(c, dict):
+                continue
+            prefixes = c.get("tag_prefixes")
+            if isinstance(prefixes, str):
+                prefixes = [prefixes]
+            out[name] = {"tag_prefixes": [x for x in (prefixes or []) if isinstance(x, str) and x],
+                         "prereleases": bool(c.get("prereleases", name != "stable"))}
+        if out:
+            return out
+    legacy = [p["tag_prefix"]] if p.get("tag_prefix") else []
+    return {"stable": {"tag_prefixes": legacy, "prereleases": False},
+            "beta": {"tag_prefixes": legacy, "prereleases": True}}
+
+
 def presets() -> list[dict]:
     try:
         data = json.loads(PRESETS_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return []
-    return [p for p in data.get("presets", []) if p.get("id") and p.get("repo")]
+    out = []
+    for p in data.get("presets", []):
+        if not (isinstance(p, dict) and p.get("id") and p.get("repo")):
+            continue
+        channels = preset_channels(p)
+        default = p.get("default_channel")
+        out.append({**p, "channels": channels,
+                    "default_channel": default if default in channels else next(iter(channels))})
+    return out
 
 
 def preset(preset_id: str) -> dict | None:
     return next((p for p in presets() if p["id"] == preset_id), None)
+
+
+def release_rule(app: dict) -> tuple[list[str], bool]:
+    """(préfixes de tag, prereleases incluses) suivis par une app GitHub.
+
+    App issue d'un préréglage : les préfixes du canal choisi, relus dans presets.json (une mise à
+    jour des préréglages s'applique aux apps existantes). Un préfixe propre à l'app (réglages) qui
+    n'est pas l'un de ceux du préréglage reste prioritaire. Les apps créées avant les canaux par
+    préréglage gardent leur préfixe (ex. « custom- ») en source_filter : il fait partie du canal
+    beta, elles suivent donc le préréglage."""
+    channel = "beta" if app.get("channel") == "beta" else "stable"
+    own = (app.get("source_filter") or "").strip()
+    p = preset(app["preset"]) if app.get("preset") else None
+    if p:
+        channels = p["channels"]
+        known = {x for c in channels.values() for x in c["tag_prefixes"]}
+        if not own or own in known:
+            c = channels.get(channel) or {"tag_prefixes": [own] if own else [], "prereleases": channel == "beta"}
+            return c["tag_prefixes"], c["prereleases"]
+    return ([own] if own else []), channel == "beta"

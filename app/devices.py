@@ -15,15 +15,20 @@ import time
 from pathlib import Path
 
 from . import db, plume
-from .config import DEVICE_TIMEOUT, PAIR_HOST, PLUMESIGN
+from .config import DEVICE_TIMEOUT, INSTALL_TIMEOUT, PAIR_HOST, PLUMESIGN
 from .proc import Result, Session, register, run, spawn
 
 # Nom d'hôte de plumesign par défaut : appairages faits hors de tvsign (plumesign en CLI).
 CLI_HOST = "plume"
 
-# Codes de sortie de plumesign pair info/check/install/apps.
+# Codes de sortie de plumesign pair info/check/install/apps/processes/running.
 EXIT_PAIRING_LOST = 2
 EXIT_NOT_FOUND = 3
+EXIT_NOT_RUNNING = 4       # pair running : l'app n'a pas de processus sur la TV
+EXIT_UNSUPPORTED = 5       # pair processes/running : la TV ne sait pas lister ses processus
+
+# Erreur d'utilisation de clap (code 2, comme PAIRING_LOST) : plumesign plus ancien que tvsign.
+_CLI_ERROR = re.compile(r"unrecognized subcommand|unexpected argument|invalid value .* for", re.I)
 
 
 class PairingLost(RuntimeError):
@@ -32,6 +37,14 @@ class PairingLost(RuntimeError):
 
 class Unreachable(RuntimeError):
     """Apple TV introuvable sur le réseau ou qui ne répond plus."""
+
+
+class AppInUse(RuntimeError):
+    """installd garde l'installation en attente : l'app est ouverte sur l'Apple TV."""
+
+
+class OldPlumesign(RuntimeError):
+    """plumesign ne connaît pas cette commande ou cette option."""
 
 
 # Une connexion à la fois par appareil.
@@ -196,15 +209,21 @@ def _error_line(res: Result) -> str:
     return res.tail(2)
 
 
-async def _wireless(device: dict, command: str, *extra, timeout: float = 120) -> Result:
-    """Lance `plumesign pair <command> -i <UDID> …` et traduit les codes de sortie."""
+async def _wireless(device: dict, command: str, *extra, timeout: float = 120, ok_codes=(0,),
+                    on_line=None, on_timeout=None) -> Result:
+    """Lance `plumesign pair <command> -i <UDID> …` et traduit les codes de sortie.
+    on_timeout() fournit le message d'un délai dépassé (contexte de l'appelant)."""
     target = _target(device)
     e = plume.env()
-    res = await run(PLUMESIGN, "pair", command, *target, *extra, env=e, timeout=timeout, split=True)
-    if res.ok:
+    res = await run(PLUMESIGN, "pair", command, *target, *extra, env=e, timeout=timeout, split=True,
+                    on_line=on_line)
+    if res.code in ok_codes:
         db.update("devices", device["id"], last_seen=time.time(), last_error=None, pairing_lost=0)
         return res
     why = _error_line(res)
+    if res.code == EXIT_PAIRING_LOST and _CLI_ERROR.search(res.err):
+        # pas une perte d'appairage : plumesign trop ancien (TVSIGN_PLUMESIGN vers un autre binaire ?)
+        raise OldPlumesign(f"plumesign trop ancien pour « pair {command} » : {res.tail(1)}")
     if res.code == EXIT_PAIRING_LOST:
         msg = (f"appairage perdu avec « {device['name']} » : réappaire-la depuis tvsign "
                f"(TV réinitialisée, ou tvsign retiré dans Réglages > Télécommandes et appareils) [{why}]")
@@ -215,8 +234,9 @@ async def _wireless(device: dict, command: str, *extra, timeout: float = 120) ->
         _failed(device, "introuvable sur le réseau : " + why)
         raise Unreachable(msg)
     if res.code == -1:
-        _failed(device, f"délai dépassé ({command})")
-        raise Unreachable(f"Apple TV « {device['name']} » : délai dépassé ({command})")
+        msg = on_timeout() if on_timeout else f"délai dépassé ({command})"
+        _failed(device, msg)
+        raise Unreachable(f"Apple TV « {device['name']} » : {msg}")
     _failed(device, f"{command} : {why}")
     raise RuntimeError(f"{command} : {why}")
 
@@ -270,10 +290,94 @@ async def installed_apps(device: dict, bundle_id: str | None = None) -> list[dic
     return out
 
 
-async def install(device: dict, ipas: list[Path]) -> None:
-    """Installe une ou plusieurs IPA signées."""
+async def running_apps(device: dict) -> set[str] | None:
+    """Bundle IDs des apps qui ont un processus sur l'Apple TV (lecture seule). None si on ne
+    peut pas le savoir (plumesign ancien, TV sans service de liste des processus).
+    Une app laissée en arrière-plan garde son processus : « ouverte » ne veut pas dire « à l'écran »."""
+    async with lock(device["id"]):
+        try:
+            res = await _wireless(device, "processes", "--json", timeout=90, ok_codes=(0, EXIT_UNSUPPORTED))
+        except OldPlumesign:
+            return None
+    if res.code == EXIT_UNSUPPORTED:
+        return None
+    out = set()
+    for line in res.lines():
+        if line.startswith("{"):
+            try:
+                bundle = json.loads(line).get("bundle_id")
+            except json.JSONDecodeError:
+                continue
+            if bundle:
+                out.add(bundle.lower())
+    return out
+
+
+async def app_running(device: dict, bundle_ids: list[str]) -> bool | None:
+    """Une des identités de l'app (bundle ID signé « <original>.<TEAMID> », original) a-t-elle un
+    processus sur l'Apple TV ? None si inconnu."""
+    running = await running_apps(device)
+    if running is None:
+        return None
+    return any(b.lower() in running for b in bundle_ids if b)
+
+
+def _app_label(device: dict, app_name: str | None) -> str:
+    return f"{app_name or 'L’app'} est ouverte sur l'Apple TV « {device['name']} »"
+
+
+async def install(device: dict, ipas: list[Path], on_event=None, wait_cap: float | None = None,
+                  app_name: str | None = None) -> None:
+    """Installe une ou plusieurs IPA signées.
+
+    on_event(étape, **infos) suit l'avancement : uploading, installing (percent), waiting
+    (percent, since) quand installd ne progresse plus (app ouverte sur la TV : il attend qu'elle
+    soit fermée). Au-delà de wait_cap secondes d'attente : AppInUse, l'installation est abandonnée."""
+    def event(step: str, **info) -> None:
+        if on_event:
+            on_event(step, **info)
+
     async with lock(device["id"]):
         for ipa in ipas:
-            res = await _wireless(device, "install", ipa, timeout=900)
+            st = {"percent": None, "waiting_since": None}
+
+            def line(text: str) -> None:
+                parts = text.split()
+                if not parts:
+                    return
+                if parts[0] == "UPLOADING":
+                    event("uploading")
+                elif parts[0] == "UPLOADED":
+                    st["percent"] = 0
+                    event("installing", percent=0)
+                elif parts[0] == "PROGRESS" and len(parts) > 1 and parts[1].isdigit():
+                    st["percent"], st["waiting_since"] = int(parts[1]), None
+                    event("installing", percent=st["percent"])
+                elif parts[0] == "WAITING" and len(parts) > 2 and parts[2].isdigit():
+                    if st["waiting_since"] is None:
+                        st["waiting_since"] = time.time() - int(parts[2])
+                    event("waiting", percent=st["percent"], since=st["waiting_since"])
+                    waited = max(time.time() - st["waiting_since"], int(parts[2]))
+                    if wait_cap and waited >= wait_cap:
+                        raise AppInUse(
+                            f"{_app_label(device, app_name)} : installation en attente depuis "
+                            f"{waited / 60:.0f} min, abandonnée. Ferme l'app pour terminer la mise à jour")
+
+            def on_timeout() -> str:
+                if st["waiting_since"]:
+                    return (f"installation bloquée à {st['percent']} % depuis "
+                            f"{(time.time() - st['waiting_since']) / 60:.0f} min (app ouverte sur la TV ?)")
+                if st["percent"] is None:
+                    return "envoi de l'IPA trop long (Wi-Fi lent ou Apple TV en veille ?)"
+                return f"installation trop longue, arrêtée à {st['percent']} %"
+
+            budget = INSTALL_TIMEOUT + (wait_cap or 0)
+            try:
+                res = await _wireless(device, "install", ipa, "--stall", "60", timeout=budget,
+                                      on_line=line, on_timeout=on_timeout)
+            except OldPlumesign:
+                # plumesign sans --stall : installation sans détection de l'attente
+                res = await _wireless(device, "install", ipa, timeout=budget, on_line=line,
+                                      on_timeout=on_timeout)
             if "INSTALLED" not in res.lines():
                 raise RuntimeError(f"installation de {ipa.name} : {res.tail()}")

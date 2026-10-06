@@ -190,6 +190,26 @@ def _classify(res: Result) -> bool | None:
     return None
 
 
+class SessionExpired(RuntimeError):
+    """Apple a fermé la session : reconnexion du compte nécessaire."""
+
+
+class Transient(RuntimeError):
+    """Anisette, réseau ou Apple momentanément indisponibles : nouvel essai rapproché."""
+
+
+def _failure(email: str, what: str, res: Result) -> RuntimeError:
+    """Erreur d'une commande plumesign du compte, classée : session expirée (bouton Reconnecter),
+    passagère (anisette, réseau), ou autre."""
+    if session_expired(res.output):
+        _set_status(email, False, "session expirée, reconnexion nécessaire")
+        return SessionExpired(f"session Apple de {email} expirée : reconnecte-le (bouton Reconnecter) "
+                              f"[{what} : {res.tail(2)}]")
+    if re.search(r"anisette|panicked", res.output, re.I) or _TRANSIENT.search(res.output) or res.code == -1:
+        return Transient(f"{what} : {_why(res)} (passager, nouvel essai automatique)")
+    return RuntimeError(f"{what} : {res.tail()}")
+
+
 def _why(res: Result) -> str:
     if re.search(r"anisette|panicked", res.output, re.I):
         return f"serveur anisette indisponible : {res.tail(2)}"
@@ -293,9 +313,7 @@ async def ensure_device(email: str, udid: str, name: str) -> None:
             listed = await run(PLUMESIGN, "account", "devices", env=env(), timeout=90)
     if not res.ok and not _DUPLICATE.search(res.output):
         if not (listed and listed.ok and udid.lower() in listed.output.lower()):
-            if session_expired(res.output):
-                _set_status(email, False, "session expirée, reconnexion nécessaire")
-            raise RuntimeError(f"enregistrement de l'appareil sur {email} : {res.tail()}")
+            raise _failure(email, f"enregistrement de l'appareil sur {email}", res)
     _set_status(email, True, "session valide")
     db.execute("INSERT OR IGNORE INTO account_devices (email, udid) VALUES (?, ?)", email, udid)
 
@@ -311,9 +329,7 @@ async def sign(email: str, ipa: Path, out: Path) -> bool:
             e["RUST_LOG"] = "warn"
             res = await run(PLUMESIGN, "sign", "-p", ipa, "--apple-id", "-o", tmp, env=e, timeout=600)
         if not res.ok or not tmp.exists():
-            if session_expired(res.output):
-                _set_status(email, False, "session expirée, reconnexion nécessaire")
-            raise RuntimeError(f"signature : {res.tail()}")
+            raise _failure(email, "signature", res)
         replace_retry(tmp, out)
     finally:
         tmp.unlink(missing_ok=True)

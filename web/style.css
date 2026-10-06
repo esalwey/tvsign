@@ -248,6 +248,12 @@ h3 { margin: 0; }
 .probleme__titre { font-weight: 600; color: var(--red-text); }
 .probleme__retry { color: var(--label-2); font-size: var(--t-foot); }
 .probleme .btn { align-self: center; }
+.probleme--info {
+  background: color-mix(in srgb, var(--blue) 7%, var(--surface));
+  border-color: color-mix(in srgb, var(--blue) 22%, transparent);
+}
+.probleme--info .probleme__ic, .probleme--info .probleme__titre { color: var(--blue-text); }
+.probleme + .probleme { margin-top: var(--sp-2); }
 
 .details { margin-top: var(--sp-2); font-size: var(--t-foot); }
 .details summary { cursor: pointer; color: var(--blue-text); min-height: 28px; display: inline-flex; align-items: center; }

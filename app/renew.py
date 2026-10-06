@@ -5,10 +5,17 @@ import time
 import urllib.request
 
 from . import db, devices, ipa, plume, proc, settings
-from .config import (ACCOUNT_CHECK_HOURS, CHECK_INTERVAL, IPA_DIR, RELEASE_CHECK_MINUTES,
+from .config import (ACCOUNT_CHECK_HOURS, APP_WAIT_MINUTES, CHECK_INTERVAL, DEFER_MAX_HOURS,
+                     DEFER_RETRY_MINUTES, DEFER_URGENT_HOURS, IPA_DIR, RELEASE_CHECK_MINUTES,
                      RENEW_TIMEOUT_MINUTES, RETRY_MINUTES)
 
 _RUNNING: set[int] = set()
+# Étape du renouvellement en cours, par app, pour l'interface :
+# {"step": checking|signing|uploading|installing|waiting_app, "since": ts, ...}
+PHASE: dict[int, dict] = {}
+# Déclencheurs qui peuvent attendre que l'app soit fermée sur la TV (personne devant l'écran à
+# interrompre) ; les autres (manuel, ajout…) installent tout de suite et attendent installd.
+DEFERRABLE = ("auto", "nouvelle version")
 _RERUN: set[int] = set()                # destination changée pendant un renouvellement : on relance après
 _ACC_ALERTED: set[str] = set()          # comptes déjà signalés déconnectés (une alerte par épisode)
 
@@ -111,7 +118,9 @@ async def refresh_source(app: dict) -> bool:
             if not found:
                 if not dest.exists():
                     channel = "stable" if app.get("channel") != "beta" else "beta"
-                    raise RuntimeError(f"aucune IPA trouvée dans les releases ({channel}) de {app['source']}")
+                    prefixes, _ = ipa.release_rule(app)
+                    which = f", tags {' / '.join(x + '*' for x in prefixes)}" if prefixes else ""
+                    raise RuntimeError(f"aucune IPA trouvée dans les releases ({channel}{which}) de {app['source']}")
                 return False
             tag, url, sha256 = found["tag"], found["url"], found["sha256"]
         else:
@@ -144,8 +153,8 @@ async def refresh_source(app: dict) -> bool:
 
 
 def _latest(app: dict) -> dict | None:
-    return ipa.latest_github(app["source"], app["source_filter"],
-                             "beta" if app.get("channel") == "beta" else "stable", app.get("asset_name"))
+    prefixes, prereleases = ipa.release_rule(app)
+    return ipa.latest_github(app["source"], prefixes, prereleases, app.get("asset_name"))
 
 
 async def new_release(app: dict) -> bool:
@@ -182,6 +191,7 @@ async def renew(app_id: int, trigger: str = "manuel") -> None:
     finally:
         _RUNNING.discard(app_id)
         _RERUN.discard(app_id)
+        PHASE.pop(app_id, None)
 
 
 def spawn(app_id: int, trigger: str = "manuel") -> bool:
@@ -198,9 +208,12 @@ def rerun(app_id: int) -> None:
         _RERUN.add(app_id)
 
 
-def _retry_at(app: dict, now: float) -> float:
-    """Prochain essai : plus rapproché quand l'expiration approche, jamais après elle."""
+def _retry_at(app: dict, now: float, transient: bool = False) -> float:
+    """Prochain essai : plus rapproché quand l'expiration approche (ou pour une panne passagère :
+    anisette, réseau), jamais après elle."""
     delay = RETRY_MINUTES * 60
+    if transient:
+        delay = min(delay, 15 * 60)
     exp = app["expires_at"]
     if exp and exp - now < 12 * 3600:
         delay = min(delay, 10 * 60)
@@ -232,6 +245,64 @@ def _serials(signed) -> str | None:
         return None
 
 
+def _phase(app_id: int, step: str, **info) -> None:
+    prev = PHASE.get(app_id)
+    since = prev["since"] if prev and prev["step"] == step else time.time()
+    PHASE[app_id] = {"step": step, "since": since, **info}
+
+
+def _identities(app: dict, email: str) -> list[str]:
+    """Bundle IDs possibles de l'app sur la TV : plumesign signe « <original>.<TEAMID> »."""
+    bundle = app.get("bundle_id")
+    if not bundle:
+        return []
+    team = next((a["team_id"] for a in plume.accounts() if a["email"] == email and a.get("team_id")), None)
+    return [f"{bundle}.{team}", bundle] if team else [bundle]
+
+
+async def _app_open(app: dict, device: dict, email: str) -> bool | None:
+    """L'app a-t-elle un processus sur la TV ? None si on ne peut pas le savoir (sans bloquer)."""
+    ids = _identities(app, email)
+    if not ids:
+        return None
+    try:
+        return await devices.app_running(device, ids)
+    except (devices.PairingLost, devices.Unreachable):
+        raise
+    except Exception as e:  # noqa: BLE001 - la vérification est une précaution, pas un préalable
+        db.log(f"{app['name']} : impossible de savoir si l'app est ouverte sur la TV ({e})", "warn", app_id=app["id"])
+        return None
+
+
+def _may_defer(app: dict, trigger: str, now: float) -> bool:
+    """Report possible : renouvellement automatique ou nouvelle version, profil pas proche de
+    l'expiration, et report en cours pas trop ancien (une app laissée en arrière-plan garde son
+    processus : au-delà, on tente l'installation, installd attendra si quelqu'un regarde)."""
+    if trigger not in DEFERRABLE:
+        return False
+    exp = app["expires_at"]
+    if not exp or exp - now < DEFER_URGENT_HOURS * 3600:
+        return False
+    since = app.get("deferred_since")
+    return not (since and now - since > DEFER_MAX_HOURS * 3600)
+
+
+async def _defer(app: dict, device: dict, trigger: str, now: float) -> None:
+    """App ouverte sur la TV : on n'installe pas maintenant, nouvel essai plus tard.
+    L'état d'avant (ok, erreur…) est conservé : ce n'est pas un échec."""
+    retry = now + DEFER_RETRY_MINUTES * 60
+    if app["expires_at"]:
+        retry = min(retry, max(now + 60, app["expires_at"] - DEFER_URGENT_HOURS * 3600))
+    first = not app.get("deferred_since")
+    db.update("apps", app["id"], status=app["status"] if app["status"] != "running" else "pending",
+              last_error=app["last_error"], deferred_reason="app_running",
+              deferred_since=app.get("deferred_since") or now, next_attempt_at=retry)
+    if first:
+        what = "mise à jour" if trigger == "nouvelle version" else "renouvellement"
+        db.log(f"{app['name']} est ouverte sur l'Apple TV « {device['name']} » : {what} reporté pour ne pas "
+               f"interrompre la lecture (nouvel essai toutes les {DEFER_RETRY_MINUTES:.0f} min)", app_id=app["id"])
+
+
 async def _renew(app_id: int, trigger: str) -> None:
     app = db.row("SELECT * FROM apps WHERE id = ?", app_id)
     if not app:
@@ -246,26 +317,45 @@ async def _renew(app_id: int, trigger: str) -> None:
         email = app["account_email"] or plume.default_account()
         if not email:
             raise RuntimeError("aucun compte Apple connecté")
-        if email not in {a["email"] for a in plume.accounts()}:
+        accounts = {a["email"]: a for a in plume.accounts()}
+        if email not in accounts:
             raise RuntimeError(f"compte Apple {email} déconnecté : reconnecte-le "
                                "(en choisir un autre installerait une 2e copie de l'app)")
+        if accounts[email]["ok"] == 0:
+            # session déjà connue comme expirée : inutile de solliciter Apple
+            raise plume.SessionExpired(f"session Apple de {email} expirée : reconnecte-le (bouton Reconnecter)")
 
-        updated = await refresh_source(app)
-        if trigger == "nouvelle version" and not updated and app["status"] == "ok":
-            # téléchargement raté ou version refusée : inutile de re-signer l'ancienne version
-            db.update("apps", app_id, status="ok", last_error=None)
-            return
-        original = app_dir(app_id) / "original.ipa"
-        signed = app_dir(app_id) / "signed.ipa"
-        if not original.exists():
-            raise RuntimeError("IPA d'origine absente : réimporte l'app")
-
-        # 1. Apple TV joignable ? On échoue vite, avant tout appel à Apple.
+        # 1. Apple TV joignable ? On échoue vite, avant tout appel à Apple ; et l'app y est-elle
+        # ouverte ? Vérifié avant le téléchargement : une nouvelle version reportée reste « nouvelle ».
+        _phase(app_id, "checking")
         if not device["udid"]:
             await devices.refresh_info(device["id"])
             device = db.row("SELECT * FROM devices WHERE id = ?", device["id"])
         else:
             await devices.check_reachable(device)
+        now = time.time()
+        if _may_defer(app, trigger, now):
+            if await _app_open(app, device, email):
+                await _defer(app, device, trigger, now)
+                return
+        elif trigger in DEFERRABLE and app.get("deferred_reason"):
+            # fin du report (expiration proche, ou report trop long) : signalé une fois
+            db.update("apps", app_id, deferred_reason=None)
+            urgent = app["expires_at"] and app["expires_at"] - now < DEFER_URGENT_HOURS * 3600
+            db.log(f"{app['name']} : installation tentée même si l'app est ouverte sur la TV ("
+                   + ("expiration proche" if urgent else
+                      f"reportée depuis {(now - (app['deferred_since'] or now)) / 3600:.0f} h")
+                   + ") ; installd attendra sa fermeture", "warn", app_id=app_id)
+
+        updated = await refresh_source(app)
+        if trigger == "nouvelle version" and not updated and app["status"] == "ok":
+            # téléchargement raté ou version refusée : inutile de re-signer l'ancienne version
+            db.update("apps", app_id, status="ok", last_error=None, deferred_reason=None, deferred_since=None)
+            return
+        original = app_dir(app_id) / "original.ipa"
+        signed = app_dir(app_id) / "signed.ipa"
+        if not original.exists():
+            raise RuntimeError("IPA d'origine absente : réimporte l'app")
 
         # 2. Signature (réutilise une signature récente jamais installée, sauf demande manuelle).
         force = trigger in ("manuel", "nouvelle destination")
@@ -273,6 +363,7 @@ async def _renew(app_id: int, trigger: str) -> None:
         if expires:
             db.log(f"{app['name']} : signature du {_fmt(signed.stat().st_mtime)} réutilisée", app_id=app_id)
         else:
+            _phase(app_id, "signing")
             await plume.ensure_device(email, device["udid"], device["name"])
             db.log(f"{app['name']} : signature avec {email}", app_id=app_id)
             if await plume.sign(email, original, signed):
@@ -282,12 +373,29 @@ async def _renew(app_id: int, trigger: str) -> None:
                 await notify(msg)
             expires = ipa.profile_expiry(signed) or time.time() + 7 * 86400
 
-        # 3. Installation.
+        # 3. Installation. Si l'app est ouverte sur la TV, installd attend qu'elle soit fermée :
+        # l'interface le signale, et on abandonne au bout de APP_WAIT_MINUTES.
         db.log(f"{app['name']} : installation sur « {device['name']} »", app_id=app_id)
-        await devices.install(device, [signed])
+        wait_cap = APP_WAIT_MINUTES * 60
+        logged = set()
+
+        def on_event(step: str, percent=None, since=None) -> None:
+            if step == "waiting":
+                _phase(app_id, "waiting_app", percent=percent, waiting_since=since,
+                       deadline=(since or time.time()) + wait_cap)
+                if "waiting" not in logged:
+                    logged.add("waiting")
+                    db.log(f"{app['name']} : installation en attente, l'app est sans doute ouverte sur "
+                           f"« {device['name']} » ; elle se terminera dès sa fermeture", "warn", app_id=app_id)
+            else:
+                _phase(app_id, step, percent=percent)
+
+        _phase(app_id, "uploading")
+        await devices.install(device, [signed], on_event=on_event, wait_cap=wait_cap, app_name=app["name"])
 
         fields = dict(status="ok", signed_at=time.time(), expires_at=expires, next_attempt_at=None,
-                      last_error=None, notified_level=None, cert_serial=_serials(signed))
+                      last_error=None, notified_level=None, cert_serial=_serials(signed),
+                      deferred_reason=None, deferred_since=None)
         cur = db.row("SELECT account_email FROM apps WHERE id = ?", app_id)
         if cur and not cur["account_email"]:
             # fige le compte : un autre compte = autre équipe = autre bundle ID (2e copie).
@@ -306,7 +414,9 @@ async def _renew(app_id: int, trigger: str) -> None:
         raise
     except Exception as e:  # noqa: BLE001 - l'erreur est remontée dans l'interface
         now = time.time()
-        db.update("apps", app_id, status="error", last_error=str(e), next_attempt_at=_retry_at(app, now))
+        transient = isinstance(e, (plume.Transient, devices.AppInUse))
+        db.update("apps", app_id, status="error", last_error=str(e),
+                  next_attempt_at=_retry_at(app, now, transient))
         db.log(f"{app['name']} : échec, {e}", "error", app_id=app_id)
         await alert(db.row("SELECT * FROM apps WHERE id = ?", app_id) or app, str(e), now)
 

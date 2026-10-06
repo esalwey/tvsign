@@ -37,9 +37,11 @@ class Result:
         return [l.strip() for l in self.output.splitlines() if l.strip()]
 
 
-async def run(*args, env: dict | None = None, timeout: float = 600, split: bool = False) -> Result:
+async def run(*args, env: dict | None = None, timeout: float = 600, split: bool = False,
+              on_line=None) -> Result:
     """Exécute une commande. split=True garde stderr à part (plumesign : journal sur stderr,
-    résultats sur stdout)."""
+    résultats sur stdout). on_line(ligne) est appelé pour chaque ligne de stdout dès qu'elle
+    arrive ; une exception qu'il lève arrête le processus et remonte à l'appelant."""
     proc = await _exec(
         *args,
         stdin=asyncio.subprocess.DEVNULL,
@@ -49,13 +51,22 @@ async def run(*args, env: dict | None = None, timeout: float = 600, split: bool 
     )
     out, err = bytearray(), bytearray()
 
-    async def _pump(stream, buf) -> None:
+    async def _pump(stream, buf, lines: bool = False) -> None:
         # lecture par blocs : les barres de progression (\r sans \n) dépassent la limite de readline
+        pending = b""
         while chunk := await stream.read(65536):
             buf.extend(chunk)
+            if lines:
+                *done, pending = re.split(rb"[\r\n]", pending + chunk)
+                for raw in done:
+                    if raw.strip():
+                        on_line(raw.decode("utf-8", "replace").strip())
+        if lines and pending.strip():
+            on_line(pending.decode("utf-8", "replace").strip())
 
     async def _read() -> None:
-        await asyncio.gather(_pump(proc.stdout, out), *([_pump(proc.stderr, err)] if split else []))
+        await asyncio.gather(_pump(proc.stdout, out, on_line is not None),
+                             *([_pump(proc.stderr, err)] if split else []))
         await proc.wait()
 
     def text(buf) -> str:
