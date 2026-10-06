@@ -5,6 +5,9 @@
 #ifndef AppVersion
   #define AppVersion "0.9.0"
 #endif
+#ifndef AppNumVersion
+  #define AppNumVersion AppVersion
+#endif
 #define AppName "tvsign"
 #define AppExe "tvsign.exe"
 #define SourceDir "..\dist\tvsign"
@@ -15,7 +18,7 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 AppPublisher=esalwey
-VersionInfoVersion={#AppVersion}
+VersionInfoVersion={#AppNumVersion}
 VersionInfoProductName={#AppName}
 PrivilegesRequired=lowest
 DefaultDirName={localappdata}\Programs\{#AppName}

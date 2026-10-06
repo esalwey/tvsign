@@ -91,6 +91,6 @@ if (-not $iscc) {
     return
 }
 Step "Inno Setup ($iscc)"
-& $iscc /Q "/DAppVersion=$version" (Join-Path $here 'installer\tvsign.iss'); Check 'ISCC'
+& $iscc /Q "/DAppVersion=$version" "/DAppNumVersion=$($version.Split('-')[0])" (Join-Path $here 'installer\tvsign.iss'); Check 'ISCC'
 $setup = Join-Path $dist "installer\tvsign-setup-$version.exe"
 Write-Host ("{0}: {1:N1} MB" -f $setup, ((Get-Item $setup).Length / 1MB))
