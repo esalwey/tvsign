@@ -128,7 +128,17 @@ def index():
     return FileResponse(WEB / "index.html", headers={"Cache-Control": "no-cache"})
 
 
-app.mount("/static", StaticFiles(directory=WEB), name="static")
+class RevalidatedStatic(StaticFiles):
+    """Interface toujours revalidée (ETag) : après une mise à jour, le navigateur ne garde pas
+    l'ancien app.js en cache."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+app.mount("/static", RevalidatedStatic(directory=WEB), name="static")
 
 
 # ---------- authentification ----------
