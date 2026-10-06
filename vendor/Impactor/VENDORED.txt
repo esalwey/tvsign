@@ -1,6 +1,6 @@
 Vendored from the Impactor fork (plumesign with wireless tvOS pairing/install).
-commit: 7c8019d0fb5e3ea17514a5828d585a9524981464
+commit: 84446f828a321e9d1e20694772a61b37a141c2b2
 branch: tvsign
-date:   2026-10-06T11:09:21Z
+date:   2026-10-06T13:15:11Z
 paths:  Cargo.toml Cargo.lock LICENSE README.md rustfmt.toml apps crates 3rdparty locales
 Regenerate with scripts/vendor-impactor.sh (or .ps1). Do not edit files here by hand.

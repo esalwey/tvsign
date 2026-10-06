@@ -507,7 +507,7 @@ impl AnisetteHeadersProvider for RemoteAnisetteProviderV3 {
                     plist::to_file_xml(config_path, state)?;
                     client.get_headers(&state).await?
                 } else {
-                    panic!()
+                    return Err(err)
                 }
             }
         };

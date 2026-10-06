@@ -294,4 +294,4 @@ Compiler soi-même : voir [docs/building.md](docs/building.md).
 
 ---
 
-License: see [LICENSE-NOTE.md](LICENSE-NOTE.md).
+License: MIT, see [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
