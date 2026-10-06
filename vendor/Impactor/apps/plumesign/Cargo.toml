@@ -23,6 +23,7 @@ clap = { version = "4.5", default-features = false, features = ["std", "derive"]
 dialoguer = "0.12"
 anyhow = "1.0"
 serde_json.workspace = true
+zip.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 plume_gestalt = { path = "../../crates/plume_gestalt" }

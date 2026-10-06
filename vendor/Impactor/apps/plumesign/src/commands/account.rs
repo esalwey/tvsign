@@ -156,6 +156,18 @@ async fn login(args: LoginArgs) -> Result<()> {
         let can_use_sms = !req.trusted_phone_numbers.is_empty();
         match req.method {
             TwoFactorMethod::Sms => log::info!("Enter the code sent via SMS: "),
+            TwoFactorMethod::Device if can_use_sms && req.trusted_phone_numbers.len() > 1 => {
+                let endings: Vec<String> = req
+                    .trusted_phone_numbers
+                    .iter()
+                    .map(|p| p.last_two_digits.to_string())
+                    .collect();
+                log::info!(
+                    "Enter the code sent to your device, or type 'sms' to receive it by text message (numbers ending in {}; 'sms {}' picks one): ",
+                    endings.join(", "),
+                    endings[0]
+                )
+            }
             TwoFactorMethod::Device if can_use_sms => {
                 log::info!("Enter the code sent to your device, or type 'sms' to receive it by text message: ")
             }
@@ -168,8 +180,23 @@ async fn login(args: LoginArgs) -> Result<()> {
             .map_err(|e| e.to_string())?;
         let input = input.trim();
 
-        if input.eq_ignore_ascii_case("sms") && can_use_sms {
-            let id = if req.trusted_phone_numbers.len() == 1 {
+        let lowered = input.to_ascii_lowercase();
+        let sms_request = lowered == "sms" || lowered.starts_with("sms ") || lowered.starts_with("sms:");
+        if sms_request && can_use_sms {
+            use std::io::IsTerminal;
+            // "sms 34" / "sms:34": the number ending in 34, without a menu, so a
+            // parent process driving stdin can choose.
+            let ending = lowered[3..].trim_start_matches([':', ' ']).trim().to_string();
+            let picked = (!ending.is_empty())
+                .then(|| {
+                    req.trusted_phone_numbers
+                        .iter()
+                        .find(|p| p.last_two_digits.to_string().ends_with(&ending))
+                })
+                .flatten();
+            let id = if let Some(phone) = picked {
+                phone.id
+            } else if req.trusted_phone_numbers.len() == 1 || !std::io::stdin().is_terminal() {
                 req.trusted_phone_numbers[0].id
             } else {
                 let labels: Vec<String> = req

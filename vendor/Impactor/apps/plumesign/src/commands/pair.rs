@@ -1,6 +1,6 @@
 use std::io::{BufRead, Write};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -56,9 +56,14 @@ pub enum PairCommands {
     Install(InstallArgs),
     /// List the user apps installed on a paired device
     Apps(AppsArgs),
+    /// List the processes running on a paired device, with their bundle ID when known
+    Processes(ProcessesArgs),
+    /// Tell whether an app is running on a paired device (exit 0 running, 4 not running)
+    Running(RunningArgs),
 }
 
-/// Exit codes for the wireless commands (`info`, `check`, `install`, `apps`).
+/// Exit codes for the wireless commands (`info`, `check`, `install`, `apps`,
+/// `processes`, `running`).
 pub mod exit_code {
     pub const OK: i32 = 0;
     pub const OTHER: i32 = 1;
@@ -66,6 +71,10 @@ pub mod exit_code {
     pub const PAIRING_LOST: i32 = 2;
     /// No matching device on the network, or it stopped responding.
     pub const NOT_FOUND: i32 = 3;
+    /// `running`: the app has no process on the device.
+    pub const NOT_RUNNING: i32 = 4;
+    /// The device exposes no service able to list processes.
+    pub const UNSUPPORTED: i32 = 5;
 }
 
 #[derive(Debug, Args)]
@@ -105,6 +114,37 @@ pub struct InstallArgs {
     /// Signed .ipa (or .app directory) to install
     #[arg(value_name = "PACKAGE", required = true)]
     pub package: std::path::PathBuf,
+    /// Print a `WAITING <percent> <seconds>` line when installd, once the package
+    /// is uploaded, makes no progress for this many seconds (0 disables). installd
+    /// holds an update while the app is in use on the device.
+    #[arg(long = "stall", value_name = "SECONDS", default_value_t = 45)]
+    pub stall: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct ProcessesArgs {
+    #[command(flatten)]
+    pub target: TargetArgs,
+    /// Also list processes that belong to no installed app (daemons)
+    #[arg(long = "all")]
+    pub all: bool,
+    /// Print one JSON object per process
+    #[arg(long = "json")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RunningArgs {
+    #[command(flatten)]
+    pub target: TargetArgs,
+    /// Bundle identifier of the app
+    #[arg(
+        short = 'b',
+        long = "bundle-id",
+        value_name = "BUNDLE_ID",
+        required = true
+    )]
+    pub bundle_id: String,
 }
 
 #[derive(Debug, Args)]
@@ -168,6 +208,12 @@ pub async fn execute(args: PairArgs) -> Result<()> {
         }
         Some(PairCommands::Apps(apps_args)) => {
             exit_with(run_apps(&store, &args.host, apps_args).await)
+        }
+        Some(PairCommands::Processes(processes_args)) => {
+            exit_with(run_processes(&store, &args.host, processes_args).await)
+        }
+        Some(PairCommands::Running(running_args)) => {
+            exit_with_code(run_running(&store, &args.host, running_args).await)
         }
         None => run_pair(&store, args).await,
     }
@@ -395,25 +441,141 @@ async fn run_install(store: &PairingStore, host: &str, args: InstallArgs) -> Res
     flush_stdout();
 
     let last = AtomicU64::new(u64::MAX);
-    idevice::utils::installation::install_package_with_callback_rsd(
-        &mut connection.adapter,
-        &mut connection.handshake,
-        &args.package,
-        None,
-        |(percent, ())| {
-            // installd repeats a percentage across several status updates.
-            if last.swap(percent, Ordering::Relaxed) != percent {
-                println!("PROGRESS {percent}");
-                flush_stdout();
+    let started = std::time::Instant::now();
+    // Milliseconds since `started` of the last progress report.
+    let last_change = AtomicU64::new(0);
+    // The stall notice is armed once the package is on the device (or installd
+    // reported progress): the upload before it has no progress callback.
+    let armed = AtomicBool::new(false);
+    let callback = |(percent, ()): (u64, ())| {
+        // installd repeats a percentage across several status updates.
+        if last.swap(percent, Ordering::Relaxed) != percent {
+            last_change.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            armed.store(true, Ordering::Relaxed);
+            println!("PROGRESS {percent}");
+            flush_stdout();
+        }
+        async {}
+    };
+    let install = async {
+        if args.package.is_file() {
+            let (remote, options) = upload_ipa(&mut connection, &args.package).await?;
+            last_change.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            armed.store(true, Ordering::Relaxed);
+            println!("UPLOADED");
+            flush_stdout();
+            let mut client = InstallationProxyClient::connect_rsd(
+                &mut connection.adapter,
+                &mut connection.handshake,
+            )
+            .await?;
+            client
+                .install_with_callback(remote, Some(options), callback, ())
+                .await?;
+        } else {
+            idevice::utils::installation::install_package_with_callback_rsd(
+                &mut connection.adapter,
+                &mut connection.handshake,
+                &args.package,
+                None,
+                callback,
+                (),
+            )
+            .await?;
+        }
+        anyhow::Ok(())
+    };
+    tokio::pin!(install);
+
+    let mut ticker = tokio::time::interval(Duration::from_secs(5));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut waiting_reported = 0u64;
+    loop {
+        tokio::select! {
+            result = &mut install => {
+                result?;
+                break;
             }
-            async {}
-        },
-        (),
-    )
-    .await?;
+            _ = ticker.tick() => {
+                if args.stall == 0 || !armed.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let since = started.elapsed().as_millis() as u64
+                    - last_change.load(Ordering::Relaxed);
+                let stalled = since / 1000;
+                // Report once per stall period while it lasts.
+                if stalled >= args.stall && stalled / args.stall > waiting_reported {
+                    waiting_reported = stalled / args.stall;
+                    let percent = match last.load(Ordering::Relaxed) {
+                        u64::MAX => 0,
+                        p => p,
+                    };
+                    println!("WAITING {percent} {stalled}");
+                    flush_stdout();
+                } else if stalled < args.stall {
+                    waiting_reported = 0;
+                }
+            }
+        }
+    }
 
     println!("INSTALLED");
     Ok(())
+}
+
+/// Uploads an .ipa to `PublicStaging` over AFC, as idevice's install helper does,
+/// so the caller knows when the upload ends and installd's work begins.
+/// Returns the remote path and the Install options.
+async fn upload_ipa(
+    connection: &mut RsdConnection,
+    package: &std::path::Path,
+) -> Result<(String, plist::Value)> {
+    use idevice::afc::AfcClient;
+    use idevice::afc::opcode::AfcFopenMode;
+
+    let data = tokio::fs::read(package).await?;
+    let bundle_id = ipa_bundle_id(&data)?;
+
+    let mut afc = AfcClient::connect_rsd(&mut connection.adapter, &mut connection.handshake).await?;
+    if afc.get_file_info("PublicStaging").await.is_err() {
+        afc.mk_dir("PublicStaging").await?;
+    }
+    let remote = "PublicStaging/idevice.ipa".to_string();
+    let mut file = afc.open(remote.clone(), AfcFopenMode::WrOnly).await?;
+    file.write_entire(&data).await?;
+    file.close().await?;
+
+    let options = plist::Value::Dictionary(plist::Dictionary::from_iter([(
+        "CFBundleIdentifier".to_string(),
+        plist::Value::String(bundle_id),
+    )]));
+    Ok((remote, options))
+}
+
+/// `CFBundleIdentifier` of `Payload/<name>.app/Info.plist` inside an .ipa.
+fn ipa_bundle_id(data: &[u8]) -> Result<String> {
+    use std::io::Read;
+
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(data))?;
+    let name = (0..archive.len())
+        .filter_map(|i| archive.name_for_index(i).map(str::to_string))
+        .find(|n| {
+            let parts: Vec<_> = n.split('/').collect();
+            parts.len() == 3
+                && parts[0] == "Payload"
+                && parts[1].ends_with(".app")
+                && parts[2] == "Info.plist"
+        });
+    let Some(name) = name else {
+        bail!("Not an .ipa: no Payload/*.app/Info.plist");
+    };
+    let mut raw = Vec::new();
+    archive.by_name(&name)?.read_to_end(&mut raw)?;
+    let info: plist::Dictionary = plist::from_bytes(&raw)?;
+    match info.get("CFBundleIdentifier").and_then(|v| v.as_string()) {
+        Some(id) => Ok(id.to_string()),
+        None => bail!("No CFBundleIdentifier in {name}"),
+    }
 }
 
 async fn run_apps(store: &PairingStore, host: &str, args: AppsArgs) -> Result<()> {
@@ -465,11 +627,254 @@ async fn run_apps(store: &PairingStore, host: &str, args: AppsArgs) -> Result<()
     Ok(())
 }
 
+/// An installed app, as far as matching it to a process goes.
+struct InstalledApp {
+    bundle_id: String,
+    /// Bundle path on the device (`/private/var/containers/Bundle/Application/<UUID>/X.app`).
+    path: Option<String>,
+    executable: Option<String>,
+    user: bool,
+}
+
+/// A process seen on the device.
+struct RunningProcess {
+    pid: u64,
+    name: Option<String>,
+    path: Option<String>,
+    bundle_id: Option<String>,
+}
+
+const APP_SERVICE: &str = "com.apple.coredevice.appservice";
+const OS_TRACE_SERVICE: &str = "com.apple.os_trace_relay.shim.remote";
+
+async fn installed_apps_for_matching(connection: &mut RsdConnection) -> Result<Vec<InstalledApp>> {
+    let mut client =
+        InstallationProxyClient::connect_rsd(&mut connection.adapter, &mut connection.handshake)
+            .await?;
+    let apps = client.get_apps(Some("Any"), None).await?;
+    Ok(apps
+        .into_iter()
+        .map(|(bundle_id, info)| {
+            let field = |key: &str| {
+                info.as_dictionary()
+                    .and_then(|d| d.get(key))
+                    .and_then(|v| v.as_string())
+                    .map(str::to_string)
+            };
+            InstalledApp {
+                path: field("Path"),
+                executable: field("CFBundleExecutable"),
+                user: field("ApplicationType").as_deref() == Some("User"),
+                bundle_id,
+            }
+        })
+        .collect())
+}
+
+/// `/private/var/x` and `/var/x` name the same place; URLs may carry `file://`.
+fn normalize_path(path: &str) -> String {
+    let path = path.strip_prefix("file://").unwrap_or(path);
+    let path = path.strip_prefix("/private").unwrap_or(path);
+    path.trim_end_matches('/').to_string()
+}
+
+fn match_by_path<'a>(apps: &'a [InstalledApp], executable: &str) -> Option<&'a InstalledApp> {
+    let executable = normalize_path(executable);
+    apps.iter().find(|app| {
+        app.path
+            .as_deref()
+            .is_some_and(|p| executable.starts_with(&(normalize_path(p) + "/")))
+    })
+}
+
+fn match_by_name<'a>(apps: &'a [InstalledApp], name: &str) -> Option<&'a InstalledApp> {
+    // A user app's executable name can shadow a system one: prefer user apps.
+    let matches = |app: &&InstalledApp| app.executable.as_deref() == Some(name);
+    apps.iter()
+        .filter(|a| a.user)
+        .find(matches)
+        .or_else(|| apps.iter().find(matches))
+}
+
+/// Process list through CoreDevice's app service when the device offers it,
+/// otherwise through the os_trace relay (process names only). Read-only.
+async fn list_processes(
+    connection: &mut RsdConnection,
+) -> Result<(Vec<RunningProcess>, &'static str)> {
+    let mut names: Vec<_> = connection.handshake.services.keys().cloned().collect();
+    names.sort();
+    log::debug!("RSD services: {}", names.join(", "));
+
+    let apps = installed_apps_for_matching(connection).await?;
+
+    if connection.handshake.services.contains_key(APP_SERVICE) {
+        use idevice::core_device::AppServiceClient;
+        match AppServiceClient::connect_rsd(&mut connection.adapter, &mut connection.handshake)
+            .await
+        {
+            Ok(mut client) => match client.list_processes().await {
+                Ok(tokens) => {
+                    let processes = tokens
+                        .into_iter()
+                        .map(|token| {
+                            let path = token.executable_url.map(|u| u.relative);
+                            let app = path.as_deref().and_then(|p| match_by_path(&apps, p));
+                            let name = path
+                                .as_deref()
+                                .and_then(|p| p.rsplit('/').next())
+                                .map(str::to_string);
+                            RunningProcess {
+                                pid: token.pid as u64,
+                                bundle_id: app.map(|a| a.bundle_id.clone()),
+                                name,
+                                path: path.map(|p| normalize_path(&p)),
+                            }
+                        })
+                        .collect();
+                    return Ok((processes, "coredevice"));
+                }
+                Err(e) => log::warn!("CoreDevice process list failed, trying os_trace: {e}"),
+            },
+            Err(e) => log::warn!("CoreDevice app service unavailable, trying os_trace: {e}"),
+        }
+    }
+
+    if connection.handshake.services.contains_key(OS_TRACE_SERVICE) {
+        let pids = os_trace_pid_list(connection).await?;
+        let processes = pids
+            .into_iter()
+            .map(|(pid, name)| {
+                let app = name.as_deref().and_then(|n| match_by_name(&apps, n));
+                RunningProcess {
+                    pid,
+                    bundle_id: app.map(|a| a.bundle_id.clone()),
+                    path: app.and_then(|a| a.path.clone()),
+                    name,
+                }
+            })
+            .collect();
+        return Ok((processes, "os_trace"));
+    }
+
+    Err(ProcessListUnsupported.into())
+}
+
+#[derive(Debug)]
+struct ProcessListUnsupported;
+
+impl std::fmt::Display for ProcessListUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the device offers no service that lists processes")
+    }
+}
+
+impl std::error::Error for ProcessListUnsupported {}
+
+/// `PidList` request of the os_trace relay, keeping the process names that
+/// idevice's `get_pid_list` drops: `{ "Payload": { "<pid>": { "ProcessName": ... } } }`.
+async fn os_trace_pid_list(connection: &mut RsdConnection) -> Result<Vec<(u64, Option<String>)>> {
+    use idevice::os_trace_relay::OsTraceRelayClient;
+
+    let mut client =
+        OsTraceRelayClient::connect_rsd(&mut connection.adapter, &mut connection.handshake).await?;
+    let mut request = Vec::new();
+    plist::Value::Dictionary(plist::Dictionary::from_iter([(
+        "Request".to_string(),
+        plist::Value::String("PidList".into()),
+    )]))
+    .to_writer_binary(&mut request)?;
+    let mut message = (request.len() as u32).to_be_bytes().to_vec();
+    message.extend_from_slice(&request);
+    client.idevice.send_raw(&message).await?;
+
+    // One status byte, then a length-prefixed plist.
+    client.idevice.read_raw(1).await?;
+    let len = client.idevice.read_raw(4).await?;
+    let len = u32::from_be_bytes([len[0], len[1], len[2], len[3]]) as usize;
+    let body = client.idevice.read_raw(len).await?;
+    let response: plist::Dictionary = plist::from_bytes(&body)?;
+
+    let Some(payload) = response.get("Payload").and_then(|p| p.as_dictionary()) else {
+        bail!("unexpected PidList response: no Payload");
+    };
+    let mut out: Vec<_> = payload
+        .iter()
+        .filter_map(|(pid, info)| {
+            let pid = pid.parse::<u64>().ok()?;
+            log::trace!("PidList {pid}: {info:?}");
+            let name = info
+                .as_dictionary()
+                .and_then(|d| d.get("ProcessName"))
+                .and_then(|n| n.as_string())
+                .map(str::to_string);
+            Some((pid, name))
+        })
+        .collect();
+    out.sort_by_key(|(pid, _)| *pid);
+    Ok(out)
+}
+
+async fn run_processes(store: &PairingStore, host: &str, args: ProcessesArgs) -> Result<()> {
+    let mut connection = connect(store, host, &args.target).await?;
+    let (processes, source) = list_processes(&mut connection).await?;
+    log::info!("{} processes listed through {source}", processes.len());
+
+    for process in processes {
+        if !args.all && process.bundle_id.is_none() {
+            continue;
+        }
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "pid": process.pid,
+                    "name": process.name,
+                    "bundle_id": process.bundle_id,
+                    "path": process.path,
+                    "source": source,
+                })
+            );
+        } else {
+            println!(
+                "{} {} {}",
+                process.pid,
+                process.bundle_id.as_deref().unwrap_or("-"),
+                process.name.as_deref().unwrap_or("-")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Exit code OK when the app has a process on the device, NOT_RUNNING otherwise.
+async fn run_running(store: &PairingStore, host: &str, args: RunningArgs) -> Result<i32> {
+    let mut connection = connect(store, host, &args.target).await?;
+    let (processes, source) = list_processes(&mut connection).await?;
+    let found = processes.iter().find(|p| {
+        p.bundle_id
+            .as_deref()
+            .is_some_and(|b| b.eq_ignore_ascii_case(&args.bundle_id))
+    });
+    match found {
+        Some(process) => {
+            println!("RUNNING {} {} {source}", args.bundle_id, process.pid);
+            Ok(exit_code::OK)
+        }
+        None => {
+            println!("NOT_RUNNING {} {source}", args.bundle_id);
+            Ok(exit_code::NOT_RUNNING)
+        }
+    }
+}
+
 /// Maps an error to its exit code and the keyword of its `ERROR` line.
 fn classify(error: &anyhow::Error) -> (i32, &'static str) {
     use plume_utils::Error as E;
 
     for cause in error.chain() {
+        if cause.downcast_ref::<ProcessListUnsupported>().is_some() {
+            return (exit_code::UNSUPPORTED, "UNSUPPORTED");
+        }
         if let Some(e) = cause.downcast_ref::<E>() {
             return match e {
                 E::PairingNotAccepted | E::PairingNotFound(_) => {
@@ -492,8 +897,13 @@ fn classify(error: &anyhow::Error) -> (i32, &'static str) {
 /// Ends the process with a stable exit code. Failures also print one
 /// `ERROR <KIND> <message>` line on stdout for callers reading line by line.
 fn exit_with(result: Result<()>) -> ! {
+    exit_with_code(result.map(|()| exit_code::OK))
+}
+
+/// Like `exit_with`, for commands whose success carries its own exit code.
+fn exit_with_code(result: Result<i32>) -> ! {
     let code = match result {
-        Ok(()) => exit_code::OK,
+        Ok(code) => code,
         Err(e) => {
             let (code, kind) = classify(&e);
             log::error!("{e:#}");
@@ -615,4 +1025,53 @@ fn read_pin() -> String {
     }
 
     line.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ipa(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut out = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut out);
+        for (name, data) in entries {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(data).unwrap();
+        }
+        zip.finish().unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn bundle_id_from_ipa() {
+        let mut info = Vec::new();
+        plist::Value::Dictionary(plist::Dictionary::from_iter([(
+            "CFBundleIdentifier".to_string(),
+            plist::Value::String("com.example.tv".into()),
+        )]))
+        .to_writer_xml(&mut info)
+        .unwrap();
+        let data = ipa(&[
+            ("Payload/X.app/Frameworks/F.framework/Info.plist", b"nope"),
+            ("Payload/X.app/Info.plist", &info),
+        ]);
+        assert_eq!(ipa_bundle_id(&data).unwrap(), "com.example.tv");
+        assert!(ipa_bundle_id(&ipa(&[("Payload/readme.txt", b"x")])).is_err());
+    }
+
+    #[test]
+    fn paths_match_with_or_without_private() {
+        let apps = vec![InstalledApp {
+            bundle_id: "com.example.tv".into(),
+            path: Some("/private/var/containers/Bundle/Application/U/X.app".into()),
+            executable: Some("X".into()),
+            user: true,
+        }];
+        assert!(match_by_path(&apps, "file:///var/containers/Bundle/Application/U/X.app/X").is_some());
+        assert!(match_by_path(&apps, "/private/var/containers/Bundle/Application/U/X.apps/X").is_none());
+        assert!(match_by_name(&apps, "X").is_some());
+        assert!(match_by_name(&apps, "Y").is_none());
+    }
 }
