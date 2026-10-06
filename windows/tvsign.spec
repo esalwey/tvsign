@@ -18,7 +18,7 @@ ROOT = HERE.parent                         # tvsign/ (app/, web/)
 ASSETS = HERE / "assets"
 PLUMESIGN = Path(os.environ.get("TVSIGN_PLUMESIGN_EXE")
                  or ROOT.parent / "Impactor" / "target" / "release" / "plumesign.exe")
-VERSION = (HERE / "version.txt").read_text(encoding="utf-8").strip()
+VERSION = (HERE / "version.txt").read_text(encoding="utf-8-sig").strip()
 
 if not PLUMESIGN.is_file():
     raise SystemExit(f"plumesign.exe not found: {PLUMESIGN} (set TVSIGN_PLUMESIGN_EXE)")
