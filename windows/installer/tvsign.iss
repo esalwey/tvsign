@@ -117,7 +117,10 @@ begin
   RemoveData := False;
   Result := True;
   if UninstallSilent then
+  begin
+    QuitRunningApp();   { files of a running tvsign would stay locked }
     Exit;
+  end;
   Form := CreateCustomForm(ScaleX(440), ScaleY(170), False, True);
   try
     Form.Caption := CustomMessage('RemoveDataTitle');

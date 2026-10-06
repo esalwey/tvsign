@@ -19,7 +19,10 @@ FORMAT = "tvsign-backup"
 FORMAT_VERSION = 1
 STORE = PLUME_HOME / "PlumeImpactor"
 # Clés propres à l'instance : conservées lors d'une restauration (mot de passe choisi ici, etc.).
+# Celles d'AUTH_LOCAL sont reprises telles quelles, absence comprise : une sauvegarde venant d'une
+# instance protégée ne doit pas imposer son mot de passe (ni ses sessions) à celle-ci.
 KEEP_LOCAL = ("admin_password", "setup_done", "session_version", "onboarded", "language")
+AUTH_LOCAL = ("admin_password", "setup_done", "session_version")
 
 
 def export(include_uploads: bool = False) -> Path:
@@ -101,7 +104,8 @@ def restore(archive: Path) -> dict:
                 p = _safe(n)
                 if p.parts[0] == "plume" and len(p.parts) > 1:
                     dest = plume_dir.joinpath(*p.parts[1:])
-                elif p.parts[0] == "ipas" and len(p.parts) == 3 and p.parts[1].isdigit():
+                elif (p.parts[0] == "ipas" and len(p.parts) == 3 and p.parts[1].isdigit()
+                      and p.parts[2] == "original.ipa"):
                     dest = work / "ipas" / p.parts[1] / p.parts[2]
                     ipas.append(p.parts[1])
                 else:
@@ -134,7 +138,7 @@ def restore(archive: Path) -> dict:
 
     db.init()
     for k, v in keep.items():
-        if v is not None:
+        if v is not None or k in AUTH_LOCAL:
             settings.raw_set(k, v)
     settings.raw_set("onboarded", "1")
     counts = {

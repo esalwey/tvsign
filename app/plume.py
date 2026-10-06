@@ -24,6 +24,8 @@ def env() -> dict:
     e["APPDATA" if os.name == "nt" else "XDG_CONFIG_HOME"] = str(PLUME_HOME)
     e.setdefault("RUST_LOG", "info")
     e.pop("PLUMESIGN_PASSWORD", None)        # jamais hérité : passé seulement à « account login »
+    for secret in ("TVSIGN_PASSWORD", "TVSIGN_LAUNCH_TOKEN", "TVSIGN_GITHUB_TOKEN"):
+        e.pop(secret, None)                  # secrets de tvsign : inutiles à plumesign
     anisette = settings.anisette_url()
     if anisette:
         e["PLUMESIGN_ANISETTE_URL"] = anisette

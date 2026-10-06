@@ -240,7 +240,9 @@ def host_allowed(request) -> bool:
     name = host_name(request)
     if ALLOWED_HOSTS:
         return full in ALLOWED_HOSTS or name in ALLOWED_HOSTS or name in _LOOPBACK_HOSTS
-    if enabled() and has_password():
+    if enabled() and (has_password() or not setup_done()):
+        # mot de passe, ou setup en attente (code de setup exigé hors accès local de confiance) :
+        # un nom DNS quelconque (proxy, ts.net) doit pouvoir terminer le setup
         return True
     return _local_name(name)
 
