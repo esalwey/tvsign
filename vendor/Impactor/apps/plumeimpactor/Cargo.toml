@@ -1,0 +1,46 @@
+[package]
+name = "plumeimpactor"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+idevice.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+plist.workspace = true
+futures.workspace = true
+env_logger.workspace = true
+log.workspace = true
+chrono.workspace = true
+rustls.workspace = true
+image.workspace = true
+tiny-skia = "0.11.4"
+plume_core = { path = "../../crates/plume_core", features = ["tweaks"] }
+plume_utils = { path = "../../crates/plume_utils" }
+plume_store = { path = "../../crates/plume_store" }
+
+iced = { version = "0.14", features = ["image-without-codecs", "advanced"] }
+wgpu = { version = "27.0", default-features = false, features = ["std"] }     # Power references
+tray-icon = { version = "0.21", default-features = false }                    # System tray icon
+rfd = "0.16"                                                                  # File dialogs
+open = "5.3"                                                                  # Opening links (I know, useless)
+notify-rust = "4.11"                                                          # Notifications
+single-instance = "0.3"                                                       # Ensuring single instance of the app on Linux and Windows
+auto-launcher = "0.6"                                                         # Auto-launching on startup
+rust-i18n = "4.0"
+current_locale = "0.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+plume_gestalt = { path = "../../crates/plume_gestalt" }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication"] }
+
+[build-dependencies]
+winresource = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"                                                                    # System tray icon

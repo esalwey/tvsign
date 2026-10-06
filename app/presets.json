@@ -1,0 +1,19 @@
+{
+  "_comment": "App presets shown in onboarding and in 'Add app'. Override the whole file with TVSIGN_PRESETS_FILE.",
+  "presets": [
+    {
+      "id": "nuviotv",
+      "name": "NuvioTV (officiel)",
+      "_todo": "TODO: placeholder. The official NuvioTV repository, tag prefix and asset name are not decided yet (branding pending). Replace repo/tag_prefix/asset before any public release.",
+      "repo": "esalwey/NuvioTV",
+      "tag_prefix": "tvos-v",
+      "asset": "NuvioTV.ipa",
+      "channels": ["stable", "beta"],
+      "default_channel": "stable",
+      "description": {
+        "en": "Media center for Apple TV. Stable releases only, or beta builds too.",
+        "fr": "Centre multimédia pour Apple TV. Versions stables uniquement, ou bêtas aussi."
+      }
+    }
+  ]
+}

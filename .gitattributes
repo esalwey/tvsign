@@ -1,0 +1,14 @@
+# Normalise text files to LF in the repository.
+* text=auto
+# Scripts run inside Linux containers / on Linux hosts: always LF, even from a Windows checkout.
+*.sh            text eol=lf
+docker/*        text eol=lf
+Dockerfile      text eol=lf
+*.yml           text eol=lf
+*.py            text eol=lf
+requirements*   text eol=lf
+*.ps1           text eol=crlf
+*.iss           text eol=crlf
+vendor/**       -text
+*.png           binary
+*.ico           binary

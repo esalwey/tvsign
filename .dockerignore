@@ -1,0 +1,12 @@
+# Allow-list: only what the Dockerfile copies reaches the build context.
+*
+!app/
+!web/
+!docker/
+!requirements.lock
+!vendor/Impactor/
+vendor/Impactor/target/
+**/__pycache__/
+**/*.pyc
+**/*.ipa
+**/*.db

@@ -1,0 +1,5 @@
+# Desktop shell (on top of ../requirements.txt). Exact versions are pinned by build.ps1's lock file.
+pywebview>=5.4,<7
+pystray==0.19.5
+pillow>=11
+pyinstaller>=6.11

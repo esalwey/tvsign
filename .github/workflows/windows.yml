@@ -1,0 +1,92 @@
+name: windows
+
+# Windows desktop edition: plumesign.exe (from vendor/Impactor) + PyInstaller app + Inno Setup
+# per-user installer. The packaging itself lives in windows/build.ps1; this workflow only provides
+# the toolchains and the plumesign.exe it bundles (TVSIGN_PLUMESIGN_EXE).
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore: ['**.md', 'docker-compose*.yml', 'install.sh']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check vendored Impactor
+        run: |
+          if (-not (Test-Path vendor/Impactor/Cargo.lock)) {
+            Write-Output "::error::vendor/Impactor is empty: run scripts/vendor-impactor.ps1 and commit it"; exit 1
+          }
+          Get-Content vendor/Impactor/VENDORED.txt
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vendor/Impactor -> target
+          key: plumesign-windows
+
+      - name: Build plumesign.exe
+        working-directory: vendor/Impactor
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: '0'
+          CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: 'off'
+          CARGO_PROFILE_RELEASE_INCREMENTAL: 'false'
+        run: |
+          cargo build --release --locked -p plumesign
+          ./target/release/plumesign.exe --version
+          "TVSIGN_PLUMESIGN_EXE=$PWD\target\release\plumesign.exe" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            windows/requirements-windows.txt
+
+      - name: Inno Setup
+        run: |
+          if (-not (Get-Command iscc.exe -ErrorAction SilentlyContinue) -and
+              -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Build installer (windows/build.ps1, version from windows/version.txt)
+        run: ./windows/build.ps1
+
+      - name: Checksums
+        run: |
+          $files = @(Get-ChildItem windows/dist/installer -File -Filter *.exe)
+          $files | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Tee-Object windows/dist/installer/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tvsign-windows-installer
+          path: windows/dist/installer/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plumesign-windows-x64
+          path: vendor/Impactor/target/release/plumesign.exe
+          retention-days: 30

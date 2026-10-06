@@ -1,0 +1,44 @@
+# Runtime data: Apple sessions, certificate private keys, pairings, database. NEVER commit.
+/data/
+/tvsign-data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.db.pre-*
+accounts.json
+accounts.json.bak
+state.plist
+remotepairing/
+setup-code.txt
+secret.key
+*.pem
+*.key
+*.p12
+*.mobileprovision
+*.tvsign-backup
+tvsign-backup-*.zip
+.env
+.env.*
+secrets/
+
+# Apps
+*.ipa
+
+# Build output
+/build/
+/dist/
+/out/
+/windows/build/
+/windows/dist/
+vendor/Impactor/target/
+__pycache__/
+*.py[cod]
+.venv*/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

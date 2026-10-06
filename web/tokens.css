@@ -1,0 +1,127 @@
+/**
+ * tvsign — systeme visuel iOS.
+ * Couleurs systeme Apple (systemGroupedBackground, label, systemBlue...),
+ * echelle typographique SF, listes groupees inserees.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  /* Fonds groupes — iOS systemGroupedBackground */
+  --bg:             #F2F2F7;
+  --surface:        #FFFFFF;
+  --surface-press:  #E5E5EA;
+  --separator:      rgb(60 60 67 / 0.29);
+
+  /* Texte — label, secondaryLabel, tertiaryLabel */
+  --label:          #000000;
+  --label-2:        rgb(60 60 67 / 0.78);   /* >= 4.89:1 sur les 4 surfaces claires */
+  --label-3:        rgb(60 60 67 / 0.30);   /* decoratif seulement, jamais du texte */
+  --label-dim:      rgb(60 60 67 / 0.76);   /* 5.42:1 sur blanc, 4.72:1 sur le champ de recherche */
+  --fill-hover:     rgb(60 60 67 / 0.06);
+  --border-control: rgb(60 60 67 / 0.55);   /* 3.02:1 sur --surface */
+
+  /* Couleurs systeme */
+  /* Remplissages : teintes systeme Apple exactes (switch, pastilles). */
+  --blue:           #007AFF;
+  --green:          #34C759;
+  --orange:         #FF9500;
+  --red:            #FF3B30;
+  --teal:           #30B0C7;
+
+  /* Texte : variantes assombries, >= 4.5:1 sur blanc.
+     Apple mesure en APCA et s'appuie sur ses reglages systeme ;
+     sur le web on n'a que WCAG, donc le texte prend ces valeurs. */
+  --blue-text:      #0063CC;   /* 5.74:1 */
+  --red-text:       #D70015;   /* 5.38:1 */
+  --green-text:     #23883C;   /* 4.51:1 sur blanc : utilisable pour du texte */
+  --fill-tertiary:  rgb(118 118 128 / 0.12);
+
+  /* Surlignage d'une option de menu : bleu systeme assombri de 7% pour que le
+     blanc pose dessus atteigne 4.58:1 (le #007AFF brut plafonne a 4.02:1). */
+  --popup-actif:    #0071ED;
+
+  /* Liquid Glass — couche flottante seulement */
+  --glass-fill:     #FAFAFC;
+  --glass-raised:   rgb(255 255 255 / 0.92);
+  --glass-edge:     rgb(255 255 255 / 0.55);
+
+  /* Typographie — SF en tete, fallback systeme partout */
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable Text",
+          "Segoe UI", system-ui, sans-serif;
+  --font-num: ui-monospace, "SF Mono", "Cascadia Mono", "Segoe UI Mono", monospace;
+
+  /* Echelle SF — largeTitle 34, title1 28, title2 22, body 17, footnote 13, caption 12 */
+  --t-large:    34px;
+  --t-title:    28px;
+  --t-title2:   22px;
+  --t-body:     17px;
+  --t-subhead:  15px;
+  --t-foot:     13px;
+  --t-caption:  12px;
+
+  --sp-1: 4px;  --sp-2: 8px;  --sp-3: 12px;
+  --sp-4: 16px; --sp-5: 20px; --sp-6: 28px; --sp-7: 40px; --sp-8: 56px;
+
+  --r-row:   10px;
+  --r-group: 12px;
+
+  --row-h: 44px;  /* cible tactile minimale Apple */
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --bg:            #0C0C0E;
+    --surface:       #1C1C1E;
+    --surface-press: #2C2C2E;
+    --separator:     rgb(84 84 88 / 0.65);
+
+    --label:         #FFFFFF;
+    --label-2:       rgb(235 235 245 / 0.60);  /* 5.94:1 */
+    --label-3:       rgb(235 235 245 / 0.30);
+    --label-dim:     rgb(235 235 245 / 0.60);   /* 5.94:1 sur #1C1C1E */
+    --fill-hover:    rgb(235 235 245 / 0.08);
+    --border-control: rgb(235 235 245 / 0.26);
+
+    --blue:          #0A84FF;
+    --green:         #30D158;
+    --orange:        #FF9F0A;
+    --red:           #FF453A;
+    --teal:          #40C8E0;
+    --blue-text:     #0A84FF;   /* 4.66:1 sur #1C1C1E */
+    --red-text:      #FF453A;   /* 4.99:1 */
+    --green-text:    #30D158;   /* 8.42:1 */
+    --fill-tertiary: rgb(118 118 128 / 0.24);
+    --popup-actif:   #0975E3;   /* blanc 4.50:1 */
+
+    --glass-fill:    #161618;
+    --glass-raised:  rgb(72 72 78 / 0.85);
+    --glass-edge:    rgb(255 255 255 / 0.14);
+  }
+}
+
+:root[data-theme='dark'] {
+  --bg:            #0C0C0E;
+  --surface:       #1C1C1E;
+  --surface-press: #2C2C2E;
+  --separator:     rgb(84 84 88 / 0.65);
+  --label:         #FFFFFF;
+  --label-2:       rgb(235 235 245 / 0.60);
+  --label-3:       rgb(235 235 245 / 0.30);
+  --label-dim:     rgb(235 235 245 / 0.60);
+  --fill-hover:    rgb(235 235 245 / 0.08);
+  --border-control: rgb(235 235 245 / 0.26);
+  --blue:          #0A84FF;
+  --green:         #30D158;
+  --orange:        #FF9F0A;
+  --red:           #FF453A;
+  --teal:          #40C8E0;
+  --blue-text:     #0A84FF;   /* 4.66:1 sur #1C1C1E */
+  --red-text:      #FF453A;   /* 4.99:1 */
+  --green-text:    #30D158;   /* 8.42:1 */
+  --fill-tertiary: rgb(118 118 128 / 0.24);
+  --popup-actif:   #0975E3;   /* blanc 4.50:1 */
+  --glass-fill:    #161618;
+  --glass-raised:  rgb(72 72 78 / 0.85);
+  --glass-edge:    rgb(255 255 255 / 0.14);
+}

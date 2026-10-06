@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>tvsign</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23007AFF' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><rect x='2.5' y='4' width='19' height='12.5' rx='2'/><path d='M8 20h8M12 16.5V20'/></svg>">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <a class="evitement" href="#apps-titre" data-i18n="skip_to_apps">Skip to apps</a>
+
+  <!-- ═══════════ Connexion / premier lancement ═══════════ -->
+  <main class="porte" id="vue-auth" hidden>
+    <div class="porte__carte">
+      <div class="porte__marque">
+        <span class="porte__logo" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="12.5" rx="2"/><path d="M8 20h8M12 16.5V20"/></svg></span>
+        <h1 class="porte__titre">tvsign</h1>
+      </div>
+      <div class="segmented segmented--petit langue" role="radiogroup" data-i18n-aria="language">
+        <label><input type="radio" name="langue-porte" value="fr"><span>Français</span></label>
+        <label><input type="radio" name="langue-porte" value="en"><span>English</span></label>
+      </div>
+      <form id="form-auth" novalidate>
+        <h2 class="porte__sous" id="auth-titre"></h2>
+        <p class="porte__texte" id="auth-texte"></p>
+        <div class="list">
+          <label class="field field--pile" id="auth-code-champ"><span data-i18n="setup_code">Setup code</span>
+            <input name="code" autocomplete="one-time-code" spellcheck="false" autocapitalize="characters" maxlength="12" class="mono"></label>
+          <label class="field field--pile"><span id="auth-mdp-label" data-i18n="password">Password</span>
+            <input name="password" type="password" autocomplete="current-password"></label>
+          <label class="field field--pile" id="auth-confirm-champ"><span data-i18n="password_confirm">Confirm password</span>
+            <input name="confirm" type="password" autocomplete="new-password"></label>
+        </div>
+        <p class="group__footer" id="auth-note"></p>
+        <p class="erreur" id="auth-error" role="alert"></p>
+        <button class="btn btn--primary btn--large" id="auth-submit"></button>
+      </form>
+    </div>
+  </main>
+
+  <!-- ═══════════ Assistant de premier lancement ═══════════ -->
+  <main class="assistant" id="vue-onboarding" hidden aria-labelledby="wiz-titre">
+    <header class="assistant__tete">
+      <span class="assistant__marque">tvsign</span>
+      <ol class="etapes" id="wiz-etapes" aria-label="Progress"></ol>
+    </header>
+    <section class="assistant__corps" id="wiz-corps" aria-live="polite"></section>
+    <footer class="assistant__pied">
+      <button class="btn" id="wiz-retour" type="button" data-i18n="back">Back</button>
+      <span class="assistant__espace"></span>
+      <button class="lien" id="wiz-passer" type="button" data-i18n="skip_for_now">Skip for now</button>
+      <button class="btn btn--primary" id="wiz-suivant" type="button" data-i18n="continue">Continue</button>
+    </footer>
+  </main>
+
+  <!-- ═══════════ Page principale ═══════════ -->
+  <main class="content" id="vue-main" hidden>
+    <header class="entete">
+      <div class="entete__texte">
+        <h1 class="page__title"><span class="point point--attente" id="etat-global" role="img" aria-label="…"></span>tvsign</h1>
+        <p class="page__sub" id="resume" data-i18n="loading_state">Loading…</p>
+      </div>
+      <div class="entete__actions">
+        <a class="btn btn--icone" href="#/settings" id="lien-reglages" data-i18n-aria="settings" data-i18n-title="settings"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg></a>
+        <button class="btn btn--primary" data-open="dlg-app" data-i18n="add_app">Add app</button>
+      </div>
+    </header>
+
+    <div id="alertes" class="alertes" role="status" aria-live="polite"></div>
+
+    <section class="group" aria-labelledby="apps-titre">
+      <h2 class="group__header" id="apps-titre" tabindex="-1" data-i18n="apps">Apps</h2>
+      <div id="apps"><div class="squelette" aria-hidden="true"></div></div>
+    </section>
+
+    <section class="group" aria-labelledby="tv-titre">
+      <div class="group__titre">
+        <h2 class="group__header" id="tv-titre">Apple TV</h2>
+        <button class="lien" data-open="dlg-pair" data-i18n="pair">Pair</button>
+      </div>
+      <div id="devices"></div>
+    </section>
+
+    <section class="group" aria-labelledby="compte-titre">
+      <div class="group__titre">
+        <h2 class="group__header" id="compte-titre" data-i18n="apple_account">Apple account</h2>
+        <button class="lien" data-open="dlg-login" data-i18n="add_account">Add account</button>
+      </div>
+      <div id="accounts"></div>
+    </section>
+
+    <section class="group" aria-labelledby="sys-titre" id="systeme-bloc" hidden>
+      <h2 class="group__header" id="sys-titre" data-i18n="monitoring">Monitoring</h2>
+      <div id="systeme"></div>
+    </section>
+
+    <details class="group journal-bloc" id="journal-bloc">
+      <summary class="group__header" data-i18n="log">Log</summary>
+      <div class="journal-outils">
+        <div class="segmented segmented--petit" role="radiogroup" data-i18n-aria="filter_log">
+          <label><input type="radio" name="journal-filtre" value="tout" checked><span data-i18n="all">All</span></label>
+          <label><input type="radio" name="journal-filtre" value="erreurs"><span data-i18n="problems">Problems</span></label>
+        </div>
+      </div>
+      <div id="events"></div>
+    </details>
+  </main>
+
+  <!-- ═══════════ Réglages ═══════════ -->
+  <main class="content" id="vue-settings" hidden aria-labelledby="t-reglages">
+    <nav class="retour"><a class="lien lien--retour" href="#/" data-i18n="back_home">tvsign</a></nav>
+    <h1 class="page__title" id="t-reglages" data-i18n="settings">Settings</h1>
+    <p class="page__sub" data-i18n="settings_sub">Rarely changed options. Values set by environment variables are shown read-only.</p>
+
+    <form id="form-reglages" novalidate>
+      <section class="group">
+        <h2 class="group__header" data-i18n="general">General</h2>
+        <div class="list">
+          <label class="field"><span data-i18n="language">Language</span>
+            <select name="language">
+              <option value="auto" data-i18n="language_auto">Automatic</option>
+              <option value="fr">Français</option>
+              <option value="en">English</option>
+            </select></label>
+          <label class="field"><span data-i18n="renew_before">Renew before expiry</span>
+            <span class="field__unite"><input name="renew_before_hours" type="number" min="12" max="150" step="1" inputmode="numeric"><span aria-hidden="true">h</span></span></label>
+        </div>
+        <p class="group__footer" data-i18n="renew_before_note">A free Apple ID profile lasts 7 days (168 h). The default, 60 h, leaves two and a half days of margin if the Apple TV or this computer is off.</p>
+      </section>
+
+      <section class="group">
+        <h2 class="group__header" data-i18n="notifications">Notifications</h2>
+        <div class="list">
+          <label class="field"><span>ntfy</span><input name="ntfy_url" type="url" placeholder="https://ntfy.sh/…" autocomplete="off" spellcheck="false"></label>
+        </div>
+        <p class="group__footer"><span data-i18n="ntfy_note">Alerts when a renewal fails or an app is about to expire. Use a hard-to-guess topic.</span> <button class="lien lien--inline" type="button" id="ntfy-test" data-i18n="send_test">Send a test</button></p>
+      </section>
+
+      <section class="group">
+        <h2 class="group__header" data-i18n="signing_service">Signing service</h2>
+        <div class="list">
+          <label class="field"><span data-i18n="anisette_server">Anisette server</span><input name="anisette_url" type="url" placeholder="https://ani.sidestore.app" autocomplete="off" spellcheck="false"></label>
+        </div>
+        <p class="group__footer" data-i18n="anisette_note">Used to sign in to Apple. Leave empty for the default server, or point to your own anisette-v3 server.</p>
+      </section>
+      <p class="erreur" id="reglages-error" role="alert"></p>
+      <div class="actions-form"><button class="btn btn--primary" id="reglages-submit" data-i18n="save">Save</button></div>
+    </form>
+
+    <section class="group" aria-labelledby="t-securite">
+      <h2 class="group__header" id="t-securite" data-i18n="security">Security</h2>
+      <div id="securite"></div>
+    </section>
+
+    <section class="group" aria-labelledby="t-sauvegarde">
+      <h2 class="group__header" id="t-sauvegarde" data-i18n="backup">Backup</h2>
+      <div class="list">
+        <div class="row">
+          <div class="row__label">
+            <p class="row__title" data-i18n="backup_export">Export a backup</p>
+            <p class="row__sub" data-i18n="backup_export_sub">Database, Apple sessions, certificate keys and Apple TV pairings.</p>
+            <label class="case"><input type="checkbox" id="backup-uploads"> <span data-i18n="backup_uploads">Include uploaded .ipa files</span></label>
+          </div>
+          <div class="row__buttons"><a class="row__action row__action--go" id="backup-export" href="/api/backup/export" download data-i18n="export">Export</a></div>
+        </div>
+        <div class="row">
+          <div class="row__label">
+            <p class="row__title" data-i18n="backup_import">Restore a backup</p>
+            <p class="row__sub" data-i18n="backup_import_sub">Replaces apps, Apple TVs and Apple accounts with those of the backup. Your current ones are kept aside on disk.</p>
+          </div>
+          <div class="row__buttons"><label class="row__action fichier"><input type="file" id="backup-file" accept=".tvsign-backup,.zip"><span data-i18n="choose_file">Choose file…</span></label></div>
+        </div>
+      </div>
+      <p class="group__footer" data-i18n="backup_warning">A backup contains secrets: anyone holding it can use your Apple ID session. Keep it private, and never run two tvsign instances with the same Apple ID.</p>
+    </section>
+
+    <section class="group">
+      <h2 class="group__header" data-i18n="about">About</h2>
+      <div class="list">
+        <a class="row row--lien" href="#/diagnostics">
+          <span class="row__icon row__icon--blue"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l2-5 4 10 2-5h6"/></svg></span>
+          <div class="row__label"><p class="row__title" data-i18n="diagnostics">Diagnostics</p><p class="row__sub" data-i18n="diagnostics_sub">Check the network, Apple services and this computer.</p></div>
+          <span class="chevron" aria-hidden="true">›</span>
+        </a>
+        <div class="row"><div class="row__label"><p class="row__title" data-i18n="version">Version</p></div><span class="row__valeur mono" id="version">—</span></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ═══════════ Diagnostic ═══════════ -->
+  <main class="content" id="vue-diagnostics" hidden aria-labelledby="t-diag">
+    <nav class="retour"><a class="lien lien--retour" href="#/settings" data-i18n="settings">Settings</a></nav>
+    <div class="entete">
+      <div class="entete__texte">
+        <h1 class="page__title" id="t-diag" data-i18n="diagnostics">Diagnostics</h1>
+        <p class="page__sub" data-i18n="diag_sub">Read-only checks: nothing is signed, paired or installed.</p>
+      </div>
+      <button class="btn" id="diag-relancer" data-i18n="run_again">Run again</button>
+    </div>
+    <div id="diag"></div>
+  </main>
+
+  <!-- Feuille : ajout d'app -->
+  <dialog class="sheet" id="dlg-app" aria-labelledby="t-app">
+    <form id="form-app" method="dialog">
+      <header class="sheet__bar">
+        <button class="sheet__link" type="button" data-close data-i18n="cancel">Cancel</button>
+        <h2 id="t-app" data-i18n="new_app">New app</h2>
+        <button class="sheet__link sheet__link--done" id="app-submit" value="ok" data-i18n="add">Add</button>
+      </header>
+      <div class="sheet__body">
+        <div class="segmented" role="radiogroup" data-i18n-aria="source">
+          <label><input type="radio" name="source_type" value="preset" checked><span data-i18n="src_preset">Suggested</span></label>
+          <label><input type="radio" name="source_type" value="github"><span>GitHub</span></label>
+          <label><input type="radio" name="source_type" value="upload"><span data-i18n="src_file">File</span></label>
+          <label><input type="radio" name="source_type" value="url"><span data-i18n="src_link">Link</span></label>
+        </div>
+
+        <div data-for="preset"><div id="app-presets"></div></div>
+
+        <div class="list" data-for="github" hidden>
+          <label class="field"><span data-i18n="repository">Repository</span><input name="source" placeholder="owner/project" autocomplete="off" spellcheck="false"></label>
+          <label class="field"><span data-i18n="tag_prefix">Tag prefix</span><input name="source_filter" data-i18n-placeholder="tag_prefix_ph" placeholder="optional" autocomplete="off" spellcheck="false"></label>
+        </div>
+        <div data-for="preset github">
+          <p class="group__header espace" data-i18n="channel">Releases</p>
+          <div class="segmented" role="radiogroup" data-i18n-aria="channel">
+            <label><input type="radio" name="channel" value="stable" checked><span data-i18n="channel_stable">Stable</span></label>
+            <label><input type="radio" name="channel" value="beta"><span data-i18n="channel_beta">Beta too</span></label>
+          </div>
+          <p class="group__footer" data-i18n="github_note">The latest release is installed, then every new version automatically.</p>
+        </div>
+
+        <div class="list" data-for="upload" hidden>
+          <label class="field"><span data-i18n="ipa_file">.ipa file</span><input type="file" name="file" accept=".ipa"></label>
+        </div>
+
+        <div class="list" data-for="url" hidden>
+          <label class="field"><span data-i18n="address">Address</span><input name="source_url" type="url" placeholder="https://…/app.ipa" autocomplete="off" spellcheck="false"></label>
+        </div>
+
+        <p class="group__header espace" data-i18n="destination">Destination</p>
+        <div class="list">
+          <label class="field"><span>Apple TV</span><select name="device_id"></select></label>
+          <label class="field"><span data-i18n="account">Account</span><select name="account_email"></select></label>
+        </div>
+        <p class="erreur" id="app-error" role="alert"></p>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Feuille : réglages d'une app -->
+  <dialog class="sheet" id="dlg-edit" aria-labelledby="t-edit">
+    <form id="form-edit" method="dialog">
+      <header class="sheet__bar">
+        <button class="sheet__link" type="button" data-close data-i18n="cancel">Cancel</button>
+        <h2 id="t-edit" data-i18n="settings">Settings</h2>
+        <button class="sheet__link sheet__link--done" id="edit-submit" value="ok" data-i18n="save">Save</button>
+      </header>
+      <div class="sheet__body">
+        <p class="group__header" data-i18n="destination">Destination</p>
+        <div class="list">
+          <label class="field"><span>Apple TV</span><select name="device_id"></select></label>
+          <label class="field"><span data-i18n="account">Account</span><select name="account_email"></select></label>
+        </div>
+        <p class="group__footer" data-i18n="account_change_note">Changing the account installs a second copy of the app: each free account signs under its own team.</p>
+
+        <div data-for="github">
+          <p class="group__header espace" data-i18n="github_source">GitHub source</p>
+          <div class="list">
+            <label class="field"><span data-i18n="repository">Repository</span><input name="source" placeholder="owner/project" autocomplete="off" spellcheck="false"></label>
+            <label class="field"><span data-i18n="tag_prefix">Tag prefix</span><input name="source_filter" data-i18n-placeholder="tag_prefix_ph" placeholder="optional" autocomplete="off" spellcheck="false"></label>
+            <label class="field"><span data-i18n="channel">Releases</span>
+              <select name="channel"><option value="stable" data-i18n="channel_stable">Stable</option><option value="beta" data-i18n="channel_beta">Beta too</option></select></label>
+          </div>
+        </div>
+        <div data-for="url">
+          <p class="group__header espace" data-i18n="source">Source</p>
+          <div class="list">
+            <label class="field"><span data-i18n="address">Address</span><input name="source_url" type="url" autocomplete="off" spellcheck="false"></label>
+          </div>
+        </div>
+        <p class="erreur" id="edit-error" role="alert"></p>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Feuille : appairage -->
+  <dialog class="sheet" id="dlg-pair" aria-labelledby="t-pair">
+    <form method="dialog">
+      <header class="sheet__bar">
+        <button class="sheet__link" type="button" data-close data-i18n="close">Close</button>
+        <h2 id="t-pair" data-i18n="pair_title">Pair an Apple TV</h2>
+        <button class="sheet__link" type="button" id="pair-rescan" data-i18n="search">Search</button>
+      </header>
+      <div class="sheet__body">
+        <ol class="consigne" id="pair-consigne"></ol>
+        <div id="pair-list" aria-live="polite"></div>
+        <div id="pair-session" aria-live="polite"></div>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Feuille : connexion Apple -->
+  <dialog class="sheet" id="dlg-login" aria-labelledby="t-login">
+    <form id="form-login" method="dialog">
+      <header class="sheet__bar">
+        <button class="sheet__link" type="button" data-close data-i18n="cancel">Cancel</button>
+        <h2 id="t-login" data-i18n="apple_account">Apple account</h2>
+        <button class="sheet__link sheet__link--done" id="login-submit" value="ok" data-i18n="sign_in">Sign in</button>
+      </header>
+      <div class="sheet__body">
+        <div class="list">
+          <label class="field"><span>Apple ID</span><input name="email" type="email" required autocomplete="username" placeholder="name@example.com"></label>
+          <label class="field"><span data-i18n="password">Password</span><input name="password" type="password" required autocomplete="current-password"></label>
+        </div>
+        <p class="group__footer" data-i18n="login_note">Preferably use a dedicated Apple ID. The password is not stored: only the session token is.</p>
+        <div id="login-session" aria-live="polite"></div>
+        <p class="erreur" id="login-error" role="alert"></p>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+  <script src="/static/i18n.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

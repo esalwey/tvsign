@@ -1,0 +1,34 @@
+# tvsign: keeps tvOS apps signed with a free Apple ID and reinstalled on your Apple TVs before
+# they expire. Linux hosts only (Raspberry Pi OS 64-bit, Debian/Ubuntu, Synology, QNAP, Unraid,
+# TrueNAS SCALE, Proxmox). Docker Desktop on Windows/macOS is not supported: on Windows use the
+# tvsign desktop app instead.
+#
+#   docker compose up -d
+#   docker compose logs tvsign     # shows the one-time setup code on first start
+#   open http://<this-host>:8765
+#
+# Never expose tvsign to the Internet (no port forwarding). For remote access use a VPN
+# (Tailscale, WireGuard).
+services:
+  tvsign:
+    image: ghcr.io/esalwey/tvsign:1
+    container_name: tvsign
+    restart: unless-stopped
+    # Required: mDNS discovery of the Apple TVs (multicast does not cross a bridge network).
+    # The tunnel to the Apple TV runs in user space: no NET_ADMIN, no /dev/net/tun, no root.
+    network_mode: host
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 60s          # lets an install in progress finish
+    environment:
+      TZ: Europe/Paris              # your time zone (renewal times, journal)
+      PUID: "1000"                  # owner of ./tvsign-data on the host (`id -u`)
+      PGID: "1000"                  # (`id -g`)
+      # TVSIGN_PORT: "8765"         # web UI port (host network: pick a free one)
+      # TVSIGN_HOST: 127.0.0.1      # only when a reverse proxy on this host serves the UI
+      # TVSIGN_PASSWORD_FILE: /run/secrets/tvsign_password   # otherwise chosen in the web UI
+      # TVSIGN_NTFY_URL: https://ntfy.sh/your-topic          # or set it in Settings
+    volumes:
+      # Apple session, certificate private key, Apple TV pairings, database.
+      # BACK IT UP, NEVER SHARE IT (no SMB/NFS share, no cloud sync folder in clear).
+      - ./tvsign-data:/data

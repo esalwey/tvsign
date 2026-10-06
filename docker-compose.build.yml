@@ -1,0 +1,11 @@
+# Local build instead of the published image (vendor/Impactor must be populated first:
+# scripts/vendor-impactor.sh). Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+# On a Raspberry Pi with 4 GB of RAM or less, keep PLUME_LIGHT=1 (no LTO, 2 build jobs).
+services:
+  tvsign:
+    image: tvsign:local
+    build:
+      context: .
+      args:
+        PLUME_LIGHT: ${PLUME_LIGHT:-0}
