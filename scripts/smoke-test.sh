@@ -60,7 +60,8 @@ echo "== runs unprivileged, data is private"
 owner=$(docker exec "$NAME" stat -c '%u:%g %a' /data/tvsign.db /data)
 echo "$owner"
 grep -q '^0:' <<<"$owner" && fail "files in /data are owned by root"
-pid_uid=$(docker exec "$NAME" sh -c 'for p in /proc/[0-9]*; do grep -q "python" $p/cmdline 2>/dev/null && awk "/^Uid:/{print \$2}" $p/status; done' | sort -u)
+# Match on the process name (comm), not the command line: this sh's own cmdline contains "python".
+pid_uid=$(docker exec "$NAME" sh -c 'for p in /proc/[0-9]*; do case "$(cat $p/comm 2>/dev/null)" in python*|uvicorn*) awk "/^Uid:/{print \$2}" $p/status;; esac; done' | sort -u)
 echo "python uid: $pid_uid"
 [ -n "$pid_uid" ] && ! grep -qx 0 <<<"$pid_uid" || fail "python runs as root"
 
