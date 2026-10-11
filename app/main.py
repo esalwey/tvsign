@@ -316,8 +316,6 @@ def state():
         a["expired"] = bool(exp) and exp <= now
         # moment où la boucle lancera le renouvellement automatique (None : dès que possible)
         a["renew_at"] = exp - before * 3600 if exp else None
-        if a["deferred_reason"] and a["next_attempt_at"] and a["renew_at"]:
-            a["renew_at"] = max(a["renew_at"], a["next_attempt_at"])   # reporté : app ouverte sur la TV
         a["effective_account"] = a["account_email"] or default
     health = renew.health(now)
     return {

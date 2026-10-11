@@ -21,11 +21,9 @@ from .proc import Result, Session, register, run, spawn
 # Nom d'hôte de plumesign par défaut : appairages faits hors de tvsign (plumesign en CLI).
 CLI_HOST = "plume"
 
-# Codes de sortie de plumesign pair info/check/install/apps/processes/running.
+# Codes de sortie de plumesign pair info/check/install/apps.
 EXIT_PAIRING_LOST = 2
 EXIT_NOT_FOUND = 3
-EXIT_NOT_RUNNING = 4       # pair running : l'app n'a pas de processus sur la TV
-EXIT_UNSUPPORTED = 5       # pair processes/running : la TV ne sait pas lister ses processus
 
 # Erreur d'utilisation de clap (code 2, comme PAIRING_LOST) : plumesign plus ancien que tvsign.
 _CLI_ERROR = re.compile(r"unrecognized subcommand|unexpected argument|invalid value .* for", re.I)
@@ -291,42 +289,6 @@ async def installed_apps(device: dict, bundle_id: str | None = None) -> list[dic
             except json.JSONDecodeError:
                 pass
     return out
-
-
-async def running_apps(device: dict) -> set[str] | None:
-    """Bundle IDs des apps qui ont un processus sur l'Apple TV (lecture seule). None si on ne
-    peut pas le savoir (plumesign ancien, TV sans service de liste des processus).
-    Une app laissée en arrière-plan garde son processus : « ouverte » ne veut pas dire « à l'écran »."""
-    async with lock(device["id"]):
-        try:
-            res = await _wireless(device, "processes", "--json", timeout=90, ok_codes=(0, EXIT_UNSUPPORTED))
-        except OldPlumesign:
-            return None
-    if res.code == EXIT_UNSUPPORTED:
-        return None
-    out = set()
-    for line in res.lines():
-        if line.startswith("{"):
-            try:
-                bundle = json.loads(line).get("bundle_id")
-            except json.JSONDecodeError:
-                continue
-            if bundle:
-                out.add(bundle.lower())
-    return out
-
-
-async def app_running(device: dict, bundle_ids: list[str]) -> bool | None:
-    """Une des identités de l'app (bundle ID signé « <original>.<TEAMID> », original) a-t-elle un
-    processus sur l'Apple TV ? None si inconnu."""
-    running = await running_apps(device)
-    if running is None:
-        return None
-    return any(b.lower() in running for b in bundle_ids if b)
-
-
-def _app_label(device: dict, app_name: str | None) -> str:
-    return f"{app_name or 'L’app'} est ouverte sur l'Apple TV « {device['name']} »"
 
 
 async def install(device: dict, ipas: list[Path], on_event=None, wait_cap: float | None = None,

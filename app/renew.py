@@ -364,13 +364,11 @@ async def _renew(app_id: int, trigger: str) -> None:
             device = db.row("SELECT * FROM devices WHERE id = ?", device["id"])
         else:
             await devices.check_reachable(device)
-        if app.get("deferred_reason"):
-            db.update("apps", app_id, deferred_reason=None, deferred_since=None)
 
         updated = await refresh_source(app)
         if trigger == "nouvelle version" and not updated and app["status"] == "ok":
             # téléchargement raté ou version refusée : inutile de re-signer l'ancienne version
-            db.update("apps", app_id, status="ok", last_error=None, deferred_reason=None, deferred_since=None)
+            db.update("apps", app_id, status="ok", last_error=None)
             return
         original = app_dir(app_id) / "original.ipa"
         signed = app_dir(app_id) / "signed.ipa"
@@ -417,8 +415,7 @@ async def _renew(app_id: int, trigger: str) -> None:
         await devices.install(device, [signed], on_event=on_event, wait_cap=wait_cap, app_name=app["name"])
 
         fields = dict(status="ok", signed_at=time.time(), expires_at=expires, next_attempt_at=None,
-                      last_error=None, notified_level=None, cert_serial=_serials(signed),
-                      deferred_reason=None, deferred_since=None)
+                      last_error=None, notified_level=None, cert_serial=_serials(signed))
         cur = db.row("SELECT account_email FROM apps WHERE id = ?", app_id)
         if cur and not cur["account_email"]:
             # fige le compte : un autre compte = autre équipe = autre bundle ID (2e copie).
@@ -532,6 +529,8 @@ async def _check_expired(now: float) -> None:
 def startup() -> None:
     """Au démarrage : rien ne peut être « en cours », et on corrige les dates déjà enregistrées."""
     db.execute("UPDATE apps SET status = 'pending' WHERE status = 'running'")
+    # ancien report « app ouverte » : supprimé, ne plus l'afficher
+    db.execute("UPDATE apps SET deferred_reason = NULL, deferred_since = NULL WHERE deferred_reason IS NOT NULL")
     for app in db.rows("SELECT * FROM apps WHERE status = 'ok' AND signed_at IS NOT NULL"):
         signed = app_dir(app["id"]) / "signed.ipa"
         try:

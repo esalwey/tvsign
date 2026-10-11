@@ -182,7 +182,6 @@ async function busy(b, attr, label, fn) {
 
 // ---------- état d'une app ----------
 // [ton, libellé] ; ton : ok | warn | err | cours | neutre
-const reportee = (a, now) => !a.running && a.deferred_reason === "app_running" && a.next_attempt_at > now;
 function etatApp(a, now, s) {
   const exp = a.expires_at, fenetre = s.renew_before_hours * 3600;
   const expiree = exp ? exp <= now : false;
@@ -196,7 +195,6 @@ function etatApp(a, now, s) {
   if (!a.enabled) return ["neutre", t("st_paused")];
   if (!a.device_id) return ["err", t("st_no_tv")];
   if (exp && expiree) return ["err", t("st_expired")];
-  if (reportee(a, now)) return ["neutre", t("st_deferred")];
   if (a.status === "error") return ["err", exp && exp - now < 24 * 3600 ? t("st_failed_soon") : t("st_failed")];
   if (!exp) return ["warn", t("st_to_install")];
   if (exp - now < fenetre) return ["warn", t("st_to_renew")];
@@ -235,16 +233,13 @@ function jauge(a, now, s, ton) {
     </div>`;
 }
 
-// App ouverte sur l'Apple TV : installation en attente (installd) ou reportée (pas d'interruption).
+// App ouverte sur l'Apple TV : installation en attente (installd tient la mise à jour jusqu'à sa fermeture).
 function noteApp(a, now) {
   const tv = a.device_name || "Apple TV";
   let titre, texte;
   if (a.running && a.phase?.step === "waiting_app") {
     titre = t("wait_app_t", { name: a.name });
     texte = t("wait_app", { tv, when: relatif(a.phase.deadline, now) });
-  } else if (reportee(a, now)) {
-    titre = t("deferred_t", { name: a.name, tv });
-    texte = t("deferred", { when: relatif(a.next_attempt_at, now) });
   } else return "";
   return `<div class="probleme probleme--info" role="status">
       <span class="probleme__ic">${ICONS.tv}</span>

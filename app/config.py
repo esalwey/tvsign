@@ -108,14 +108,8 @@ RELEASE_CHECK_MINUTES = float(_env("TVSIGN_RELEASE_CHECK_MINUTES", "30"))
 LOGIN_TIMEOUT = int(_env("TVSIGN_LOGIN_TIMEOUT", "600"))
 # Max wait for the plumesign lock before giving up ("plumesign busy"), in seconds.
 PLUME_LOCK_TIMEOUT = int(_env("TVSIGN_PLUME_LOCK_TIMEOUT", "900"))
-# App open on the Apple TV: installd holds an update until it is closed.
-# Automatic renewals and new releases are postponed while the app runs (retry period, in minutes)...
-DEFER_RETRY_MINUTES = float(_env("TVSIGN_DEFER_RETRY_MINUTES", "15"))
-# ...unless the profile expires within this many hours...
-DEFER_URGENT_HOURS = float(_env("TVSIGN_DEFER_URGENT_HOURS", "6"))
-# ...or they have been postponed this long already (an app left in the background still has a process).
-DEFER_MAX_HOURS = float(_env("TVSIGN_DEFER_MAX_HOURS", "12"))
-# Max wait for the app to be closed once installd holds the installation, in minutes.
+# App open on the Apple TV: installd holds the installation until the app is closed (a process
+# alone does not mean the app is on screen: tvOS keeps closed apps in memory). Max wait, in minutes.
 APP_WAIT_MINUTES = float(_env("TVSIGN_APP_WAIT_MINUTES", "30"))
 # Max duration of the installation itself (upload + installd), waiting excluded, in seconds.
 INSTALL_TIMEOUT = int(_env("TVSIGN_INSTALL_TIMEOUT", "900"))
