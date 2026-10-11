@@ -4,6 +4,8 @@
 !web/
 !docker/
 !requirements.lock
+!LICENSE
+!THIRD_PARTY_NOTICES.md
 !vendor/Impactor/
 vendor/Impactor/target/
 **/__pycache__/

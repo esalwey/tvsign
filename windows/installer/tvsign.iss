@@ -71,6 +71,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\..\LICENSE"; DestDir: "{app}\licenses"; Flags: ignoreversion
+Source: "..\..\THIRD_PARTY_NOTICES.md"; DestDir: "{app}\licenses"; Flags: ignoreversion
+Source: "..\..\vendor\Impactor\LICENSE"; DestDir: "{app}\licenses"; DestName: "plumesign-LICENSE.txt"; Flags: ignoreversion
 
 [InstallDelete]
 ; a previous version's runtime is replaced as a whole

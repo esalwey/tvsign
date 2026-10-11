@@ -71,6 +71,8 @@ COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/tvsign-entrypoint
 COPY docker/healthcheck.py /usr/local/lib/tvsign/healthcheck.py
 COPY app app
 COPY web web
+COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/tvsign/
+COPY vendor/Impactor/LICENSE /usr/share/doc/tvsign/plumesign-LICENSE
 RUN python -m compileall -q app
 
 # All state (Apple sessions, certificate keys, pairings, IPAs, database) lives in /data:
