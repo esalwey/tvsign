@@ -25,6 +25,23 @@ KEEP_LOCAL = ("admin_password", "setup_done", "session_version", "onboarded", "l
 AUTH_LOCAL = ("admin_password", "setup_done", "session_version")
 
 
+KEEP_ASIDE_DAYS = 30
+
+
+def prune_old(days: float = KEEP_ASIDE_DAYS) -> None:
+    """Supprime les copies mises de côté (avant restauration ou migration) de plus de `days` jours :
+    elles contiennent la session Apple et les clés, elles ne doivent pas traîner indéfiniment."""
+    cutoff = time.time() - days * 86400
+    for base, pattern in ((DATA_DIR, "tvsign.db.pre-restore-*"), (DATA_DIR, "tvsign.db.pre-migrate-*"),
+                          (DATA_DIR, "ipas.pre-restore-*"), (PLUME_HOME, "PlumeImpactor.pre-restore-*")):
+        for p in base.glob(pattern):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    shutil.rmtree(p) if p.is_dir() else p.unlink()
+            except OSError:
+                pass
+
+
 def export(include_uploads: bool = False) -> Path:
     """Builds the archive in TMP_DIR and returns its path (caller deletes it)."""
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -61,7 +78,7 @@ def _safe(name: str) -> PurePosixPath:
 
 def restore(archive: Path) -> dict:
     """Validates then replaces the database and the plumesign store. The previous ones are kept
-    next to them (tvsign.db.pre-restore-<ts>, plume/PlumeImpactor.pre-restore-<ts>)."""
+    next to them (tvsign.db.pre-restore-<ts>, plume/PlumeImpactor.pre-restore-<ts>) for 30 days."""
     try:
         z = zipfile.ZipFile(archive)
     except zipfile.BadZipFile as e:
@@ -141,11 +158,21 @@ def restore(archive: Path) -> dict:
         if v is not None or k in AUTH_LOCAL:
             settings.raw_set(k, v)
     settings.raw_set("onboarded", "1")
+    # Apps importées dont l'IPA n'est pas dans la sauvegarde : inutilisables, on le dit tout de suite
+    # (sinon l'échec n'apparaît qu'à la fenêtre de renouvellement, des jours plus tard).
+    missing = []
+    for a in db.rows("SELECT id, name FROM apps WHERE source_type = 'upload'"):
+        if not (IPA_DIR / str(a["id"]) / "original.ipa").exists():
+            missing.append(a["name"])
+            db.update("apps", a["id"], status="error", next_attempt_at=None,
+                      last_error="IPA d'origine absente : réimporte l'app")
+    prune_old()
     counts = {
         "apps": len(db.rows("SELECT id FROM apps")),
         "devices": len(db.rows("SELECT id FROM devices")),
         "created": manifest.get("created"),
         "tvsign_version": manifest.get("tvsign_version"),
+        "missing_uploads": missing,
     }
     db.log(f"Sauvegarde restaurée ({counts['apps']} app(s), {counts['devices']} Apple TV)")
     return counts

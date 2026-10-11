@@ -1174,6 +1174,10 @@ async function chargerReglages() {
     if (s.locked) label.insertAdjacentHTML("beforeend", `<span class="verrou" title="${esc(t("set_by_env", { env: s.env }))}">${esc(s.env)}</span>`);
   }
   $("#version").textContent = REGLAGES.version;
+  // des apps importées : sans leur .ipa dans la sauvegarde, elles sont à réimporter après une restauration
+  const cb = $("#backup-uploads");
+  cb.checked = (STATE?.apps || []).some((a) => a.source_type === "upload");
+  $("#backup-export").href = "/api/backup/export" + (cb.checked ? "?uploads=true" : "");
   renderSecurite();
 }
 function renderSecurite() {
@@ -1276,7 +1280,9 @@ async function restaurer(file, errEl) {
   fd.append("file", file);
   try {
     const r = await api("/api/backup/import", { method: "POST", body: fd });
-    flash("ok", t("restored_t"), " " + t("restored", { apps: r.apps, tvs: r.devices }));
+    const manquantes = r.missing_uploads || [];
+    if (manquantes.length) flash("warn", t("restored_t"), " " + t("restored_missing", { apps: manquantes.join(", ") }));
+    else flash("ok", t("restored_t"), " " + t("restored", { apps: r.apps, tvs: r.devices }));
     return true;
   } catch (e) {
     if (errEl) errEl.textContent = e.message;

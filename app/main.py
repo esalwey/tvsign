@@ -3,6 +3,7 @@ import asyncio
 import re
 import shutil
 import time
+import zipfile
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -23,6 +24,7 @@ from .proc import SESSIONS
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     db.init()
+    backup.prune_old()
     auth.init()
     renew.startup()            # un renouvellement interrompu ne reste pas « en cours »
     plume.import_existing_store()
@@ -448,7 +450,7 @@ async def device_pair(body: Pair):
 def device_or_404(device_id: int) -> dict:
     d = db.row("SELECT * FROM devices WHERE id = ?", device_id)
     if not d:
-        raise HTTPException(404, "Apple TV inconnue")
+        raise HTTPException(404, "unknown_device")
     return d
 
 
@@ -496,18 +498,24 @@ def presets():
     return ipa.presets()
 
 
-def _check_source(source_type: str, source: str | None) -> str | None:
+async def _check_source(source_type: str, source: str | None) -> str | None:
     source = (source or "").strip() or None
     if source_type == "github" and not re.fullmatch(r"[\w.-]+/[\w.-]+", source or ""):
-        raise HTTPException(400, "dépôt GitHub attendu sous la forme owner/projet")
+        raise HTTPException(400, "invalid_repo")
     if source_type == "url":
         if not (source or "").startswith("https://"):
-            raise HTTPException(400, "seules les adresses https:// sont acceptées")
+            raise HTTPException(400, "https_only")
         try:
-            ipa._check_url(source)
+            # résolution DNS hors de la boucle d'événements : un résolveur lent ne gèle pas l'interface
+            await asyncio.to_thread(ipa._check_url, source)
         except (ValueError, ConnectionError) as e:
             raise HTTPException(400, str(e)) from None
     return source
+
+
+def _abort_add(app_id: int) -> None:
+    db.execute("DELETE FROM apps WHERE id = ?", app_id)
+    shutil.rmtree(renew.app_dir(app_id), ignore_errors=True)
 
 
 @app.post("/api/apps")
@@ -525,7 +533,7 @@ async def app_create(
     if source_type == "preset":
         p = ipa.preset(preset or "")
         if not p:
-            raise HTTPException(400, "préréglage inconnu")
+            raise HTTPException(400, "unknown_preset")
         # préfixes de tag : ceux du canal, relus dans le préréglage à chaque recherche (ipa.release_rule)
         source_type, source, source_filter = "github", p["repo"], None
         asset_name = p.get("asset")
@@ -533,22 +541,23 @@ async def app_create(
     else:
         preset = None
     if source_type not in ("upload", "github", "url"):
-        raise HTTPException(400, "source inconnue")
+        raise HTTPException(400, "unknown_source")
     if source_type == "upload" and not file:
-        raise HTTPException(400, "fichier IPA manquant")
+        raise HTTPException(400, "missing_file")
     if source_type != "upload":
-        source = _check_source(source_type, source)
+        source = await _check_source(source_type, source)
     channel = "beta" if channel == "beta" else "stable"
     if device_id is not None and not db.row("SELECT id FROM devices WHERE id = ?", device_id):
-        raise HTTPException(400, "Apple TV inconnue")
+        raise HTTPException(400, "unknown_device")
 
+    # compte figé dès la création : en changer créerait une 2e copie (autre équipe = autre bundle ID)
+    account = account_email or plume.default_account()
+    # enabled = 0 tant que l'IPA n'est pas validée : la boucle de renouvellement ne voit pas l'app à moitié ajoutée
     app_id = db.execute(
         "INSERT INTO apps (name, source_type, source, source_filter, channel, preset, asset_name, device_id, "
-        "account_email, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "account_email, created_at, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
         file.filename if file else source, source_type, source,
-        (source_filter or "").strip() or None, channel, preset, asset_name, device_id,
-        # compte figé dès la création : en changer créerait une 2e copie (autre équipe = autre bundle ID)
-        account_email or plume.default_account(), time.time())
+        (source_filter or "").strip() or None, channel, preset, asset_name, device_id, account, time.time())
     try:
         dest = renew.app_dir(app_id) / "original.ipa"
         if file:
@@ -557,18 +566,29 @@ async def app_create(
                 while chunk := await file.read(1 << 20):
                     got += len(chunk)
                     if got > limit:
-                        raise ValueError(f"fichier trop gros (> {MAX_UPLOAD_MB} Mo)")
+                        raise HTTPException(413, f"too_large:{MAX_UPLOAD_MB}")
                     f.write(chunk)
         else:
             await renew.refresh_source(db.row("SELECT * FROM apps WHERE id = ?", app_id))
-        info = ipa.app_info(dest)
-        ipa.check_tvos(info)
+        try:
+            info = ipa.app_info(dest)
+        except (zipfile.BadZipFile, ValueError):
+            raise HTTPException(400, "not_an_ipa") from None
+        if info["platform"] != "appletvos":
+            raise HTTPException(400, f"not_tvos:{info['platform'] or 'unknown'}")
+        # même app, même compte : une 2e fiche signerait deux fois et les copies s'écraseraient sur la TV
+        if info["bundle_id"] and db.row(
+                "SELECT id FROM apps WHERE id != ? AND bundle_id = ? AND COALESCE(account_email, '') = ?",
+                app_id, info["bundle_id"], account or ""):
+            raise HTTPException(409, "already_added")
+    except HTTPException:
+        _abort_add(app_id)
+        raise
     except Exception as e:  # noqa: BLE001
-        db.execute("DELETE FROM apps WHERE id = ?", app_id)
-        shutil.rmtree(renew.app_dir(app_id), ignore_errors=True)
+        _abort_add(app_id)
         raise HTTPException(400, str(e))
 
-    db.update("apps", app_id, name=info["name"], bundle_id=info["bundle_id"], version=info["version"])
+    db.update("apps", app_id, name=info["name"], bundle_id=info["bundle_id"], version=info["version"], enabled=1)
     db.log(f"App ajoutée : {info['name']} {info['version']} ({info['bundle_id']})", app_id=app_id)
     renew.spawn(app_id, "ajout")
     return db.row("SELECT * FROM apps WHERE id = ?", app_id)
@@ -586,7 +606,7 @@ class AppPatch(BaseModel):
 def app_or_404(app_id: int) -> dict:
     a = db.row("SELECT * FROM apps WHERE id = ?", app_id)
     if not a:
-        raise HTTPException(404, "app inconnue")
+        raise HTTPException(404, "unknown_app")
     return a
 
 
@@ -594,12 +614,14 @@ def app_or_404(app_id: int) -> dict:
 async def app_patch(app_id: int, body: AppPatch):
     a = app_or_404(app_id)
     fields = body.model_dump(exclude_unset=True)
-    if "enabled" in fields:
+    if fields.get("enabled") is None:
+        fields.pop("enabled", None)          # null n'a pas de sens : ignoré
+    else:
         fields["enabled"] = int(fields["enabled"])
     if "account_email" in fields:
         fields["account_email"] = fields["account_email"] or plume.default_account()
     if "source" in fields:
-        fields["source"] = _check_source(a["source_type"], fields["source"])
+        fields["source"] = await _check_source(a["source_type"], fields["source"])
         if a["preset"] and fields["source"] != a["source"]:
             fields["preset"] = None            # source personnalisée : plus le préréglage
             fields["asset_name"] = None
@@ -607,7 +629,7 @@ async def app_patch(app_id: int, body: AppPatch):
         fields["channel"] = "beta" if fields["channel"] == "beta" else "stable"
     if "device_id" in fields and fields["device_id"] is not None:
         if not db.row("SELECT id FROM devices WHERE id = ?", fields["device_id"]):
-            raise HTTPException(400, "Apple TV inconnue")
+            raise HTTPException(400, "unknown_device")
     source_changed = any(k in fields for k in ("source", "source_filter", "channel"))
     if source_changed:
         fields["source_tag"] = None        # nouvelle source : la prochaine release sera installée
@@ -636,8 +658,16 @@ async def app_renew(app_id: int):
 
 @app.delete("/api/apps/{app_id}")
 def app_delete(app_id: int):
+    if app_id in renew._RUNNING:
+        # un renouvellement en cours referait le dossier, signerait et installerait une app qu'on ne suit plus
+        raise HTTPException(409, "app_busy")
+    a = db.row("SELECT name FROM apps WHERE id = ?", app_id)
     db.execute("DELETE FROM apps WHERE id = ?", app_id)
+    db.execute("DELETE FROM events WHERE app_id = ?", app_id)   # sinon l'identifiant réutilisé hérite de ce journal
     shutil.rmtree(renew.app_dir(app_id), ignore_errors=True)
+    renew.PHASE.pop(app_id, None)
+    if a:
+        db.log(f"App supprimée : {a['name']}")
     return {"ok": True}
 
 
