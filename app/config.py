@@ -121,6 +121,9 @@ APP_WAIT_MINUTES = float(_env("TVSIGN_APP_WAIT_MINUTES", "30"))
 INSTALL_TIMEOUT = int(_env("TVSIGN_INSTALL_TIMEOUT", "900"))
 # Max duration of a full renewal, in minutes (always leaves room for the app wait).
 RENEW_TIMEOUT_MINUTES = max(float(_env("TVSIGN_RENEW_TIMEOUT_MINUTES", "60")), APP_WAIT_MINUTES + 25)
+# On shutdown, how long a renewal in progress may finish before being interrupted, in seconds
+# (keep the container's stop_grace_period above it).
+SHUTDOWN_DRAIN_SECONDS = int(_env("TVSIGN_SHUTDOWN_DRAIN_SECONDS", "240"))
 # How long plumesign looks for an Apple TV on the network, in seconds.
 DEVICE_TIMEOUT = int(_env("TVSIGN_DEVICE_TIMEOUT", "10"))
 # Name presented to the Apple TV when pairing (kept per device afterwards).

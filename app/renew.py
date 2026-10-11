@@ -10,6 +10,9 @@ from . import db, devices, ipa, plume, proc, settings
 from .config import (ACCOUNT_CHECK_HOURS, APP_WAIT_MINUTES, CHECK_INTERVAL, IPA_DIR,
                      RELEASE_CHECK_MINUTES, RENEW_TIMEOUT_MINUTES, RETRY_MINUTES)
 
+# Arrêt du service en cours : plus aucun renouvellement ne démarre, ceux en cours peuvent finir.
+STOPPING = False
+
 _RUNNING: set[int] = set()
 # Étape du renouvellement en cours, par app, pour l'interface :
 # {"step": checking|signing|uploading|installing|waiting_app, "since": ts, ...}
@@ -235,7 +238,7 @@ async def new_release(app: dict) -> bool:
 # ---------- renouvellement ----------
 
 async def renew(app_id: int, trigger: str = "manuel") -> None:
-    if app_id in _RUNNING:
+    if app_id in _RUNNING or STOPPING:
         return
     _RUNNING.add(app_id)
     try:
@@ -260,7 +263,7 @@ async def renew(app_id: int, trigger: str = "manuel") -> None:
 
 def spawn(app_id: int, trigger: str = "manuel") -> bool:
     """Lance un renouvellement en tâche de fond (référence conservée). False si déjà en cours."""
-    if app_id in _RUNNING:
+    if app_id in _RUNNING or STOPPING:
         return False
     proc.spawn(renew(app_id, trigger))
     return True
@@ -315,10 +318,24 @@ def _phase(app_id: int, step: str, **info) -> None:
     PHASE[app_id] = {"step": step, "since": since, **info}
 
 
+async def drain(seconds: float) -> None:
+    """À l'arrêt du service : laisse finir les renouvellements en cours (jusqu'à `seconds`)
+    avant que l'arrêt ne les interrompe. Aucun nouveau renouvellement ne démarre (STOPPING)."""
+    global STOPPING
+    STOPPING = True
+    end = time.monotonic() + seconds
+    if _RUNNING:
+        db.log("Arrêt demandé : fin des renouvellements en cours avant de s'arrêter")
+    while _RUNNING and time.monotonic() < end:
+        await asyncio.sleep(1)
+
+
 async def _renew(app_id: int, trigger: str) -> None:
     app = db.row("SELECT * FROM apps WHERE id = ?", app_id)
     if not app:
         return  # app supprimée entre-temps
+    if trigger == "auto" and not app["enabled"]:
+        return  # mise en pause pendant que la boucle traitait une autre app
     started = time.time()
     db.update("apps", app_id, status="running", last_error=None, last_attempt_at=started,
               last_trigger=trigger)
@@ -415,8 +432,12 @@ async def _renew(app_id: int, trigger: str) -> None:
             await notify(f"{app['name']} : renouvelée, valable jusqu'au {_fmt(expires)}")
     except asyncio.CancelledError:
         # délai dépassé ou arrêt du service : ne pas rester « en cours »
-        db.update("apps", app_id, status="error", last_error="renouvellement interrompu",
-                  next_attempt_at=_retry_at(app, time.time()))
+        if STOPPING:
+            # arrêt normal (redémarrage, mise à jour) : pas une erreur, on reprendra au démarrage
+            db.update("apps", app_id, status="pending", last_error=None, next_attempt_at=None)
+        else:
+            db.update("apps", app_id, status="error", last_error="renouvellement trop long, abandonné",
+                      next_attempt_at=_retry_at(app, time.time()))
         raise
     except Exception as e:  # noqa: BLE001 - l'erreur est remontée dans l'interface
         now = time.time()
@@ -561,7 +582,13 @@ async def loop() -> None:
             if check_releases:
                 last_release_check = HEALTH["last_release_check_at"] = now
             for app in db.rows("SELECT * FROM apps"):
-                now = time.time()
+                if STOPPING:
+                    break
+                # une app précédente a pu durer longtemps : relire la ligne (pause, renouvellement manuel…)
+                app = db.row("SELECT * FROM apps WHERE id = ?", app["id"])
+                if not app:
+                    continue
+                now = HEALTH["last_loop_at"] = time.time()   # la boucle vit tant qu'elle avance d'app en app
                 if due(app, now):
                     await _guarded(f"renouvellement de {app['name']}", renew(app["id"], "auto"))
                 elif check_releases and idle(app, now) and await new_release(app):

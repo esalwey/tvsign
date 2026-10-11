@@ -101,7 +101,7 @@ const CAUSES = [
   [/certificat|certificate/i, "c_cert"],
   [/injoignable|unreachable|no route|connection refused|tunnel|introuvable sur le réseau|NOT_FOUND|discover/i, "c_unreachable"],
   [/interrompu/i, "c_interrupted"],
-  [/délai dépassé|timed? ?out|timeout/i, "c_timeout"],
+  [/délai dépassé|trop long|timed? ?out|timeout/i, "c_timeout"],
   [/plumesign.*(introuvable|not found)|No such file|cannot find the file/i, "c_plumesign"],
   [/aucune IPA|github|HTTP Error 4\d\d|téléchargement|download|pas une app tvOS|IPA|https:\/\/ sont acceptées/i, "c_source"],
 ];

@@ -16,7 +16,7 @@ from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import auth, backup, db, devices, diag, ipa, plume, proc, renew, settings
-from .config import MAX_UPLOAD_MB, ROOT, TMP_DIR, VERSION
+from .config import MAX_UPLOAD_MB, ROOT, SHUTDOWN_DRAIN_SECONDS, TMP_DIR, VERSION
 from .proc import SESSIONS
 
 
@@ -35,6 +35,8 @@ async def lifespan(_: FastAPI):
             f.unlink(missing_ok=True)
     task = asyncio.create_task(renew.loop())
     yield
+    # arrêt : une installation en cours peut finir avant que l'arrêt ne l'interrompe
+    await renew.drain(SHUTDOWN_DRAIN_SECONDS)
     task.cancel()
     for s in SESSIONS.values():
         s.cancel()
