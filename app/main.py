@@ -119,7 +119,7 @@ async def _guarded(request: Request, path: str, call_next):
     response = await call_next(request)
     # cookie glissant : renouvelé au-delà d'un jour d'ancienneté
     data = auth.read_cookie(request.cookies.get(auth.COOKIE))
-    if data and time.time() - data.get("iat", 0) > 86400:
+    if data and not path.startswith("/api/auth/logout") and time.time() - data.get("iat", 0) > 86400:
         response.set_cookie(value=auth.make_cookie(), **auth.cookie_args(request))
     return response
 
@@ -178,20 +178,25 @@ class LoginBody(BaseModel):
     password: str
 
 
+_LOGIN_LOCK = asyncio.Lock()
+
+
 @app.post("/api/auth/login")
 async def auth_login(request: Request, body: LoginBody):
     if not auth.enabled() or not auth.has_password():
         raise HTTPException(400, "no_password")
     ip = _client_ip(request)
-    wait = auth.throttle_wait(ip)
-    if wait > 0:
-        raise HTTPException(429, f"too_many_attempts:{int(wait) + 1}")
-    stored = auth.stored_hash()
-    ok = await asyncio.to_thread(auth.verify_password, body.password, stored)
-    if not ok:
-        auth.record_failure(ip)
-        print(f"[warn] échec de connexion à l'interface depuis {ip}", flush=True)
-        raise HTTPException(401, "bad_password")
+    # un essai à la fois : sinon une rafale passe toute le contrôle avant que le 1er échec soit compté
+    async with _LOGIN_LOCK:
+        wait = auth.throttle_wait(ip)
+        if wait > 0:
+            raise HTTPException(429, f"too_many_attempts:{int(wait) + 1}")
+        stored = auth.stored_hash()
+        ok = await asyncio.to_thread(auth.verify_password, body.password, stored)
+        if not ok:
+            auth.record_failure(ip)
+            print(f"[warn] échec de connexion à l'interface depuis {ip}", flush=True)
+            raise HTTPException(401, "bad_password")
     auth.clear_failures(ip)
     response = UTF8JSON({"ok": True})
     response.set_cookie(value=auth.make_cookie(), **auth.cookie_args(request))
@@ -413,13 +418,22 @@ async def account_check(email: str):
 
 @app.post("/api/accounts/{email}/select")
 async def account_select(email: str):
-    await plume.select(email)
+    try:
+        await plume.select(email)
+    except plume.UnknownAccount:
+        raise HTTPException(404, "unknown_account") from None
     return {"ok": True}
 
 
 @app.delete("/api/accounts/{email}")
 async def account_delete(email: str):
-    await plume.logout(email)
+    try:
+        await plume.logout(email)
+    except plume.UnknownAccount:
+        raise HTTPException(404, "unknown_account") from None
+    except RuntimeError as e:
+        db.log(f"Déconnexion de {email} échouée : {e}", "error")
+        raise HTTPException(502, "logout_failed") from None
     return {"ok": True}
 
 
@@ -485,9 +499,12 @@ def device_patch(device_id: int, body: DevicePatch):
 @app.delete("/api/devices/{device_id}")
 async def device_delete(device_id: int):
     d = device_or_404(device_id)
+    # l'appairage d'abord : s'il reste dans le store, sync_store recrée la TV au prochain démarrage
+    try:
+        await devices.forget(d)
+    except RuntimeError as e:
+        raise HTTPException(502, str(e)) from None
     db.execute("DELETE FROM devices WHERE id = ?", device_id)
-    # sinon sync_store la recrée au prochain démarrage
-    await devices.forget(d)
     return {"ok": True}
 
 

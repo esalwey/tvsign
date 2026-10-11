@@ -135,7 +135,9 @@ def init() -> None:
 def check_setup_code(code: str | None) -> bool:
     if not SETUP_CODE or not code:
         return False
-    return hmac.compare_digest(code.strip().upper().replace("-", "").replace(" ", ""), SETUP_CODE)
+    # en octets : compare_digest lève TypeError sur une chaîne non ASCII (tiret typographique collé…)
+    return hmac.compare_digest(code.strip().upper().replace("-", "").replace(" ", "").encode("utf-8"),
+                               SETUP_CODE.encode("utf-8"))
 
 
 def finish_setup() -> None:
@@ -170,7 +172,7 @@ def read_cookie(value: str | None) -> dict | None:
     if not value or "." not in value:
         return None
     payload, sig = value.rsplit(".", 1)
-    if not hmac.compare_digest(sig, _sign(payload.encode())):
+    if not hmac.compare_digest(sig.encode("utf-8"), _sign(payload.encode()).encode("utf-8")):
         return None
     try:
         data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
@@ -218,7 +220,7 @@ def trusted(request) -> bool:
 
 
 def check_launch_token(token: str | None) -> bool:
-    return bool(LAUNCH_TOKEN) and bool(token) and hmac.compare_digest(token, LAUNCH_TOKEN)
+    return bool(LAUNCH_TOKEN) and bool(token) and hmac.compare_digest(token.encode("utf-8"), LAUNCH_TOKEN.encode("utf-8"))
 
 
 def authenticated(request) -> bool:

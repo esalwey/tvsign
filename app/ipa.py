@@ -12,7 +12,7 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import ALLOW_PRIVATE_URLS, GITHUB_TOKEN, PRESETS_FILE, VERSION
+from .config import ALLOW_PRIVATE_URLS, GITHUB_TOKEN, MAX_UPLOAD_MB, PRESETS_FILE, VERSION
 from .util import replace_retry
 
 
@@ -213,8 +213,13 @@ def download(url: str, dest: Path, sha256: str | None = None, expect_bundle: str
         h = hashlib.sha256()
         with _get(url, timeout=600) as r, open(part, "wb") as f:
             expected = int(r.headers.get("Content-Length") or 0)
+            limit = MAX_UPLOAD_MB * 1024 * 1024    # même plafond que les envois : un lien ne remplit pas le disque
+            if expected > limit:
+                raise SourceRejected(f"fichier trop gros (> {MAX_UPLOAD_MB} Mo)")
             got = 0
             while chunk := r.read(1 << 20):
+                if got + len(chunk) > limit:
+                    raise SourceRejected(f"fichier trop gros (> {MAX_UPLOAD_MB} Mo)")
                 f.write(chunk)
                 h.update(chunk)
                 got += len(chunk)

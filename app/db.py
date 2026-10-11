@@ -160,7 +160,13 @@ def update(table: str, key: int, **fields) -> None:
 
 
 def log(message: str, level: str = "info", app_id: int | None = None) -> None:
-    execute("INSERT INTO events (ts, level, app_id, message) VALUES (?, ?, ?, ?)",
-            time.time(), level, app_id, message)
+    last = row("SELECT id, level, message FROM events WHERE app_id IS ? ORDER BY id DESC LIMIT 1", app_id)
+    if last and level != "info" and last["level"] == level and last["message"] == message:
+        # même avertissement/erreur qu'à l'essai précédent (échec répété) : on rafraîchit l'heure au lieu
+        # de noyer le journal, qui garde 1000 lignes en tout
+        execute("UPDATE events SET ts = ? WHERE id = ?", time.time(), last["id"])
+    else:
+        execute("INSERT INTO events (ts, level, app_id, message) VALUES (?, ?, ?, ?)",
+                time.time(), level, app_id, message)
     execute("DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT 1000)")
     print(f"[{level}] {message}", flush=True)

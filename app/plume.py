@@ -48,7 +48,7 @@ async def _locked():
 def import_existing_store() -> None:
     """Au premier lancement, reprend la session et les appairages plumesign déjà présents sur la
     machine (Plume Impactor, plumesign en ligne de commande). Copie locale seulement.
-    Désactivable : TVSIGN_IMPORT_PLUME=0."""
+    Opt-in : TVSIGN_IMPORT_PLUME=1 (désactivé par défaut)."""
     if not IMPORT_PLUME:
         return
     if os.name == "nt":
@@ -127,9 +127,15 @@ def default_account() -> str | None:
     return sel[0] if sel else (accs[0]["email"] if accs else None)
 
 
+class UnknownAccount(RuntimeError):
+    """Compte absent du store plumesign (déjà retiré, ou interface périmée)."""
+
+
 async def _switch(email: str) -> None:
     if _store().get("selected_account") == email:
         return  # évite une réécriture inutile de accounts.json
+    if email not in (_store().get("accounts") or {}):
+        raise UnknownAccount(f"compte {email} introuvable")
     res = await run(PLUMESIGN, "account", "switch", email, env=env(), timeout=30)
     if not res.ok:
         raise RuntimeError(f"compte {email} introuvable : {res.tail()}")
@@ -256,8 +262,10 @@ def start_login(email: str, password: str) -> Session:
             async with _locked():
                 if session.state == "failed":
                     return  # annulée avant d'avoir démarré
+                prev = _store().get("selected_account")   # une connexion ne change pas le compte par défaut
                 # mot de passe par l'environnement du seul processus enfant : jamais dans argv (ps)
                 e = env()
+                e["RUST_LOG"] = "info"     # l'invite du code 2FA n'est écrite qu'à ce niveau
                 e["PLUMESIGN_PASSWORD"] = password
                 await session.start(PLUMESIGN, "account", "login", "-u", email, env=e, on_exit=done)
                 del e
@@ -277,6 +285,11 @@ def start_login(email: str, password: str) -> Session:
                         await asyncio.wait_for(session._proc.wait(), 10)
                     except TimeoutError:
                         pass
+                if prev and prev != email and prev in (_store().get("accounts") or {}):
+                    try:
+                        await _switch(prev)
+                    except Exception as e:  # noqa: BLE001 - non bloquant
+                        db.log(f"compte par défaut {prev} non rétabli : {e}", "warn")
         except Exception as e:  # noqa: BLE001
             session.lines.append(str(e))
             session.state = "failed"
@@ -289,8 +302,14 @@ def start_login(email: str, password: str) -> Session:
 
 
 async def logout(email: str) -> None:
-    async with _locked(), _as(email):
-        await run(PLUMESIGN, "account", "logout", env=env(), timeout=30)
+    try:
+        async with _locked(), _as(email):
+            res = await run(PLUMESIGN, "account", "logout", env=env(), timeout=30)
+    except UnknownAccount:
+        db.execute("DELETE FROM account_status WHERE email = ?", email)   # déjà retiré du store
+        raise
+    if not res.ok:
+        raise RuntimeError(f"plumesign account logout : {res.tail(2)}")
     db.execute("DELETE FROM account_status WHERE email = ?", email)
 
 

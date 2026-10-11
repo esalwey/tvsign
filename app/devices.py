@@ -116,7 +116,9 @@ async def forget(device: dict) -> None:
     if device.get("pairing_udid"):
         e = plume.env()
         e["RUST_LOG"] = "warn"
-        await run(PLUMESIGN, "pair", "forget", "-u", device["pairing_udid"], env=e, timeout=30, split=True)
+        res = await run(PLUMESIGN, "pair", "forget", "-u", device["pairing_udid"], env=e, timeout=30, split=True)
+        if not res.ok and "No stored pairing" not in res.output:    # déjà absent du store : rien à oublier
+            raise RuntimeError(f"oubli de l'appairage de « {device['name']} » impossible : {res.tail(2)}")
 
 
 # ---------- découverte ----------
