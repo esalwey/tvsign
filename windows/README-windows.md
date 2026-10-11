@@ -8,7 +8,7 @@ Sous Windows, tvsign est une petite application avec sa propre fenêtre et une i
 
 ## 1. Installer
 
-1. Lancez **`tvsign-setup-0.9.0.exe`**.
+1. Lancez **`tvsign-setup-<version>.exe`** (le numéro de version figure dans le nom du fichier téléchargé).
 2. Si Windows affiche **« Windows a protégé votre ordinateur »**, cliquez sur **Informations complémentaires**, puis sur **Exécuter quand même**. Ce message apparaît parce que l'application n'est pas encore signée numériquement (voir la [FAQ](#7-questions-fréquentes)).
 3. Laissez cochée la case **« Démarrer tvsign avec Windows »**. Elle est recommandée, car c'est ce qui permet les renouvellements automatiques.
 4. Cliquez sur **Installer**, puis sur **Terminer**. tvsign s'ouvre.
@@ -28,7 +28,7 @@ Au premier lancement, un assistant en six étapes vous guide.
 | **App** | Choisissez l'app à installer. tvsign la télécharge, la signe et l'installe sur la TV. Les nouvelles versions seront installées automatiquement. |
 | **Terminé** | Tout est prêt. |
 
-Par défaut, l'application ne demande pas de mot de passe, car elle n'est accessible que depuis ce PC. Vous pouvez en définir un dans **Réglages**.
+Par défaut, l'application ne demande pas de mot de passe : elle n'est joignable que depuis ce PC, mais par tous ceux qui l'utilisent (autres comptes Windows, session à distance). Si le PC est partagé, définissez un mot de passe dans **Réglages**.
 
 ## 3. Appairer l'Apple TV
 
@@ -68,7 +68,7 @@ Une app signée avec un compte gratuit expire au bout de **7 jours**. tvsign la 
 Concrètement :
 - tvsign tourne **en arrière-plan**, avec une icône près de l'horloge (dans la flèche ^ si elle est masquée).
 - **Fermer la fenêtre ne quitte pas tvsign** : il continue à veiller sur vos apps.
-- Le PC doit être **allumé (ou simplement en veille) et connecté**, et l'Apple TV **allumée ou en veille** sur le même réseau, au moins une fois pendant cette fenêtre de 60 heures.
+- Le PC doit être **allumé et réveillé** : en veille ou en hibernation, tvsign ne tourne pas et ne renouvelle rien. Il doit aussi être connecté, et l'Apple TV **allumée ou en veille** sur le même réseau, au moins une fois pendant cette fenêtre de 60 heures. Si le PC se met en veille tout seul, réglez *Paramètres Windows > Système > Alimentation > Mise en veille* sur « Jamais » (l'écran peut, lui, s'éteindre).
 - Si le PC reste éteint plus de deux jours et demi d'affilée au mauvais moment, l'app peut expirer sur la TV. Elle ne s'ouvre alors plus. Rallumez le PC : tvsign la renouvelle et la réinstalle à la première occasion.
 - La marge peut être modifiée dans **Réglages > Renouveler avant expiration**.
 
@@ -99,7 +99,7 @@ Dans `%LOCALAPPDATA%\tvsign` : session Apple, appairages, liste des apps et jour
 *Paramètres Windows > Applications > Applications installées > tvsign > Désinstaller.* Vos données sont **conservées** pour une réinstallation, sauf si vous cochez « Supprimer aussi mes données tvsign ».
 
 **J'avais déjà utilisé Plume Impactor sur ce PC.**
-Au premier lancement, tvsign reprend automatiquement votre session Apple et vos appairages existants. En général, vous n'avez rien à refaire.
+tvsign ne reprend pas la session ni les appairages de Plume Impactor : reconnectez votre Apple ID et appairez de nouveau l'Apple TV dans l'assistant. (Option avancée : lancer tvsign avec la variable d'environnement `TVSIGN_IMPORT_PLUME=1` copie au premier lancement la session et les appairages existants. Ne le faites pas si Plume Impactor ou un autre tvsign utilise encore le même Apple ID.)
 
 **Combien d'apps puis-je installer ?**
 Avec un Apple ID gratuit : 3 apps actives au plus, et 10 nouveaux identifiants d'app par semaine. Ce sont des limites d'Apple.

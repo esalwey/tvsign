@@ -46,6 +46,7 @@ if (-not (Test-Path $py)) {
 Step 'Installing dependencies'
 & $py -m pip install --disable-pip-version-check -q --upgrade pip; Check 'pip upgrade'
 & $py -m pip install --disable-pip-version-check -q -r (Join-Path $root 'requirements.txt') -r (Join-Path $here 'requirements-windows.txt'); Check 'pip install'
+# record of what this build used (output only: nothing reads it back)
 & $py -m pip freeze --disable-pip-version-check | Set-Content -Encoding utf8 (Join-Path $here 'requirements-lock.txt')
 
 # ---------- icons ----------

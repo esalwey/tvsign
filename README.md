@@ -128,8 +128,8 @@ docker compose pull && docker compose up -d
 
 Tags: `:1` (recommended, stays on major version 1), `:1.2`, `:1.2.3`, `:latest`, `:edge` (main
 branch, for testers). The database is copied before any schema change. Avoid updating during a
-renewal; `stop_grace_period: 60s` lets an install in progress finish. Watchtower or Diun work but
-are optional.
+renewal: `stop_grace_period: 5m` and `TVSIGN_SHUTDOWN_DRAIN_SECONDS` (240) let an install in
+progress finish before the container stops. Watchtower or Diun work but are optional.
 
 ### Security
 
@@ -141,7 +141,11 @@ are optional.
 - `TVSIGN_AUTH=none` disables the password: only behind an authenticating proxy or VPN, and only
   with `TVSIGN_ALLOWED_HOSTS` set.
 - Behind a reverse proxy on the same host: `TVSIGN_HOST=127.0.0.1`, `TVSIGN_TRUSTED_PROXIES=127.0.0.1`,
-  HTTPS, and an upload limit of at least 1 GB (IPAs).
+  HTTPS, and an upload limit of at least 1 GB (IPAs). The proxy must pass the original `Host`
+  header: with nginx add `proxy_set_header Host $host;` (plus `X-Forwarded-For` and
+  `X-Forwarded-Proto`) and `client_max_body_size 2g;`. Otherwise every login and write is refused
+  with "unexpected origin" (Caddy and Traefik keep `Host` by default). If a page answers
+  `host_not_allowed`, add the address you type in the browser to `TVSIGN_ALLOWED_HOSTS`.
 - Use a dedicated Apple ID. The Apple password is passed to `plumesign` through its environment,
   never on a command line, and is not stored.
 
@@ -152,12 +156,20 @@ Everything is optional. The main variables: `TZ`, `PUID`, `PGID`, `TVSIGN_PORT` 
 `TVSIGN_RENEW_BEFORE_HOURS` (60), `TVSIGN_ANISETTE_URL`, `TVSIGN_GITHUB_TOKEN`, `TVSIGN_LANGUAGE`.
 Settings set in the web UI are stored in the database; an environment variable always wins.
 
-App open on the Apple TV: the Apple TV holds an update until the app is closed. Automatic renewals
-and new releases are postponed while the app has a process on the TV (retry every
-`TVSIGN_DEFER_RETRY_MINUTES`, 15), unless the profile expires within `TVSIGN_DEFER_URGENT_HOURS` (6)
-or they were postponed for `TVSIGN_DEFER_MAX_HOURS` (12): an app left in the background keeps its
-process. Once an installation is on hold, the app card asks to close the app; tvsign gives up after
-`TVSIGN_APP_WAIT_MINUTES` (30) and retries later.
+App open on the Apple TV: tvsign installs on schedule and never tries to guess whether the app is
+open (tvOS keeps closed apps in memory, so a running process says nothing). When the app really is
+on screen, the Apple TV itself holds the update until it is closed: the app card then asks to close
+the app, and tvsign gives up after `TVSIGN_APP_WAIT_MINUTES` (30) and retries later.
+
+Followed sources: a GitHub release is reinstalled when its tag changes or when its `.ipa` is
+replaced under the same tag (new checksum). A direct link is checked at each renewal (ETag,
+`Last-Modified` and size sent by the server) and downloaded again when the file changed; a server
+that sends none of them cannot be followed: the first download is kept. Shutdown: a renewal in
+progress may finish for up to `TVSIGN_SHUTDOWN_DRAIN_SECONDS` (240) before it is interrupted.
+
+Notifications (ntfy): the topic name acts as a password on the public ntfy.sh, and messages name
+your Apple ID and your apps: pick a long random topic, or use a self-hosted ntfy. A protected
+server can be reached with `https://user:password@host/topic` (sent as Basic authentication).
 
 Building from source: see [docs/building.md](docs/building.md).
 
@@ -282,8 +294,9 @@ docker compose pull && docker compose up -d
 
 Tags : `:1` (conseillé, reste en version majeure 1), `:1.2`, `:1.2.3`, `:latest`, `:edge` (branche
 main, pour les testeurs). La base est copiée avant tout changement de schéma. Éviter de mettre à jour
-pendant un renouvellement ; `stop_grace_period: 60s` laisse finir une installation en cours.
-Watchtower ou Diun fonctionnent mais restent facultatifs.
+pendant un renouvellement : `stop_grace_period: 5m` et `TVSIGN_SHUTDOWN_DRAIN_SECONDS` (240) laissent
+finir une installation en cours avant l'arrêt du conteneur. Watchtower ou Diun fonctionnent mais
+restent facultatifs.
 
 ### Sécurité
 
@@ -295,7 +308,11 @@ Watchtower ou Diun fonctionnent mais restent facultatifs.
 - `TVSIGN_AUTH=none` désactive le mot de passe : uniquement derrière un proxy authentifiant ou un
   VPN, et avec `TVSIGN_ALLOWED_HOSTS` défini.
 - Derrière un reverse proxy sur le même hôte : `TVSIGN_HOST=127.0.0.1`,
-  `TVSIGN_TRUSTED_PROXIES=127.0.0.1`, HTTPS, et une limite d'envoi d'au moins 1 Go (IPA).
+  `TVSIGN_TRUSTED_PROXIES=127.0.0.1`, HTTPS, et une limite d'envoi d'au moins 1 Go (IPA). Le proxy
+  doit transmettre l'en-tête `Host` d'origine : avec nginx, ajouter `proxy_set_header Host $host;`
+  (et `X-Forwarded-For`, `X-Forwarded-Proto`) et `client_max_body_size 2g;`. Sinon chaque connexion
+  et chaque écriture est refusée (« origine inattendue ») ; Caddy et Traefik gardent `Host`. Si une
+  page répond `host_not_allowed`, ajouter l'adresse saisie dans le navigateur à `TVSIGN_ALLOWED_HOSTS`.
 - Utiliser un Apple ID dédié. Le mot de passe Apple est transmis à `plumesign` par son
   environnement, jamais en ligne de commande, et n'est pas enregistré.
 
@@ -307,13 +324,22 @@ Tout est facultatif. Variables principales : `TZ`, `PUID`, `PGID`, `TVSIGN_PORT`
 Les réglages faits dans l'interface sont enregistrés en base ; une variable d'environnement a
 toujours la priorité.
 
-App ouverte sur l'Apple TV : l'Apple TV garde une mise à jour en attente tant que l'app est ouverte.
-Les renouvellements automatiques et les nouvelles versions sont reportés tant que l'app a un
-processus sur la TV (nouvel essai toutes les `TVSIGN_DEFER_RETRY_MINUTES`, 15), sauf si le profil
-expire dans moins de `TVSIGN_DEFER_URGENT_HOURS` (6) ou après `TVSIGN_DEFER_MAX_HOURS` (12) de
-report : une app laissée en arrière-plan garde son processus. Quand une installation est en attente,
-la carte de l'app demande de fermer l'app ; tvsign abandonne au bout de `TVSIGN_APP_WAIT_MINUTES`
-(30) et réessaie plus tard.
+App ouverte sur l'Apple TV : tvsign installe à l'heure prévue et ne cherche pas à deviner si l'app
+est ouverte (tvOS garde en mémoire les apps quittées : un processus ne prouve rien). Quand l'app est
+vraiment à l'écran, c'est l'Apple TV elle-même qui garde la mise à jour en attente jusqu'à sa
+fermeture : la carte de l'app demande alors de la fermer, et tvsign abandonne au bout de
+`TVSIGN_APP_WAIT_MINUTES` (30) et réessaie plus tard.
+
+Sources suivies : une release GitHub est réinstallée quand son tag change ou quand son `.ipa` est
+remplacé sous le même tag (nouvelle empreinte). Un lien direct est vérifié à chaque renouvellement
+(ETag, `Last-Modified` et taille envoyés par le serveur) et retéléchargé si le fichier a changé ; un
+serveur qui n'envoie rien de tout cela ne peut pas être suivi : le premier téléchargement est
+conservé. À l'arrêt, un renouvellement en cours peut finir pendant `TVSIGN_SHUTDOWN_DRAIN_SECONDS`
+(240) avant d'être interrompu.
+
+Notifications (ntfy) : sur ntfy.sh public, le nom du sujet fait office de mot de passe, et les messages
+citent votre Apple ID et vos apps : choisir un sujet long et aléatoire, ou un ntfy auto-hébergé. Un
+serveur protégé s'utilise avec `https://utilisateur:motdepasse@hôte/sujet` (envoyé en authentification Basic).
 
 Compiler soi-même : voir [docs/building.md](docs/building.md).
 
