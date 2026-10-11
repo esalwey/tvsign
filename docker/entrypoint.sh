@@ -22,9 +22,16 @@ if [ "$(id -u)" = 0 ]; then
     if [ "$(stat -c %u:%g "$DATA")" != "$PUID:$PGID" ] || \
        [ -n "$(find "$DATA" \( ! -user "$PUID" -o ! -group "$PGID" \) -print -quit 2>/dev/null)" ]; then
         echo "tvsign: giving $DATA to $PUID:$PGID"
-        chown -R "$PUID:$PGID" "$DATA"
+        if ! chown -R "$PUID:$PGID" "$DATA"; then
+            # NFS root_squash, SMB, ACL-only volumes: fine as long as that user can already write there
+            if ! setpriv --reuid="$PUID" --regid="$PGID" --clear-groups test -w "$DATA"; then
+                echo "tvsign: $DATA is not writable by $PUID:$PGID; change the owner of the host folder or set PUID/PGID to match it" >&2
+                exit 1
+            fi
+            echo "tvsign: could not change the owner of $DATA, but $PUID:$PGID can write there: continuing" >&2
+        fi
     fi
-    chmod 700 "$DATA"
+    chmod 700 "$DATA" 2>/dev/null || true
     exec setpriv --reuid="$PUID" --regid="$PGID" --clear-groups --inh-caps=-all --bounding-set=-all \
         "$@"
 fi

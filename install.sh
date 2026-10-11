@@ -158,6 +158,9 @@ OWNER_GID=${SUDO_GID:-$(id -g)}
 $SUDO mkdir -p "$DIR/tvsign-data" || exit 1
 if [ -f "$DIR/docker-compose.yml" ]; then
     echo "keeping existing $DIR/docker-compose.yml"
+    # the port that counts is the one in that file, not --port
+    FILE_PORT=$($SUDO sed -n 's/^[[:space:]]*TVSIGN_PORT:[[:space:]]*"\{0,1\}\([0-9]\{1,5\}\).*/\1/p' "$DIR/docker-compose.yml" | head -n 1)
+    PORT=${FILE_PORT:-8765}
 else
     $SUDO tee "$DIR/docker-compose.yml" >/dev/null <<EOF
 # tvsign (written by install.sh). Never expose it to the Internet.
@@ -169,7 +172,7 @@ services:
     network_mode: host
     security_opt:
       - no-new-privileges:true
-    stop_grace_period: 60s
+    stop_grace_period: 5m
     environment:
       TZ: $TZ_VALUE
       PUID: "$OWNER_UID"
@@ -183,12 +186,23 @@ fi
 cd "$DIR" || exit 1
 $SUDO $COMPOSE pull && $SUDO $COMPOSE up -d || { echo "docker compose failed" >&2; exit 1; }
 
+probe() {
+    if have curl; then curl -fs -o /dev/null "http://127.0.0.1:$PORT/api/livez" 2>/dev/null
+    elif have wget; then wget -q -O /dev/null "http://127.0.0.1:$PORT/api/livez" 2>/dev/null
+    else (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null
+    fi
+}
 printf "waiting for tvsign"
 i=0
-until curl -fs -o /dev/null "http://127.0.0.1:$PORT/api/livez" 2>/dev/null || [ $i -ge 60 ]; do
+until probe || [ $i -ge 60 ]; do
     printf "."; sleep 2; i=$((i + 1))
 done
 echo
+if ! probe; then
+    echo "tvsign did not answer on port $PORT after 2 minutes. Look at the logs:" >&2
+    echo "  cd $DIR && $COMPOSE logs tvsign" >&2
+    exit 1
+fi
 CODE=$($SUDO cat "$DIR/tvsign-data/setup-code.txt" 2>/dev/null | tr -d '[:space:]')
 printf "\n${B}tvsign is running:${N} http://%s:%s\n" "${LAN_IP:-<this-host>}" "$PORT"
 if [ -n "$CODE" ]; then
