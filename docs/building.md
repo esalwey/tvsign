@@ -62,10 +62,20 @@ for the image. After editing `requirements.txt`:
 uv pip compile requirements.txt --universal --python-version 3.13 --generate-hashes --no-header -o requirements.lock
 ```
 
-## 5. CI
+## 5. Logic tests
+
+No Docker, plumesign or Apple TV needed (renewal decisions, notifications, API validation):
+
+```sh
+pip install -r requirements.txt httpx
+python -m unittest discover -s tests
+```
+
+## 6. CI
 
 - `.github/workflows/docker.yml`: native amd64 and arm64 runners (no QEMU), push by digest to GHCR,
   manifest merge with semver / `latest` / `edge` tags, GitHub Actions cache per architecture,
-  smoke test of each architecture and of the merged tag, `plumesign-linux-<arch>` artifacts.
+  smoke test of each architecture and of the merged tag (pulled without credentials on `v*` tags,
+  so a private GHCR package fails the release), `plumesign-linux-<arch>` artifacts.
 - `.github/workflows/windows.yml`: builds `plumesign.exe` and runs `windows/build.ps1` on
   `windows-latest`, uploads the installer with SHA-256 sums.
