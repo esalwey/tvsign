@@ -611,7 +611,9 @@ async def app_patch(app_id: int, body: AppPatch):
     source_changed = any(k in fields for k in ("source", "source_filter", "channel"))
     if source_changed:
         fields["source_tag"] = None        # nouvelle source : la prochaine release sera installée
+        fields["source_key"] = None
         fields["bad_tag"] = None
+        fields["bad_key"] = None
     dest_changed = "device_id" in fields or "account_email" in fields
     if dest_changed:
         # autre appareil/compte : la signature déjà prête ne convient plus

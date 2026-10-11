@@ -164,7 +164,7 @@ def _sha256_of(rel: dict, asset: dict) -> str | None:
 
 def latest_github(repo: str, tag_prefixes: list[str] | str | None, prereleases: bool = False,
                   asset_name: str | None = None) -> dict | None:
-    """Release la plus récente qui correspond : {tag, url, sha256, prerelease, asset}.
+    """Release la plus récente qui correspond : {tag, url, sha256, key, prerelease, asset}.
     tag_prefixes : le tag doit commencer par l'un d'eux (aucun : tous les tags).
     prereleases : False (canal stable) les ignore, True (canal beta) les inclut."""
     if isinstance(tag_prefixes, str):
@@ -172,7 +172,7 @@ def latest_github(repo: str, tag_prefixes: list[str] | str | None, prereleases: 
     tag_prefixes = [p for p in (tag_prefixes or []) if p]
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo or ""):
         raise SourceRejected("dépôt GitHub attendu sous la forme owner/projet")
-    releases = _get_json(f"https://api.github.com/repos/{repo}/releases?per_page=30")
+    releases = _get_json(f"https://api.github.com/repos/{repo}/releases?per_page=100")
     # L'API ne renvoie pas toujours la plus récente en premier : on trie par date de publication.
     releases = sorted(releases, key=lambda r: r.get("published_at") or r.get("created_at") or "", reverse=True)
     for rel in releases:
@@ -187,10 +187,22 @@ def latest_github(repo: str, tag_prefixes: list[str] | str | None, prereleases: 
         # plusieurs IPA (iOS + tvOS) : on préfère celle qui annonce tvOS dans son nom
         ipas.sort(key=lambda a: not re.search(r"tv", a["name"], re.I))
         if ipas:
+            sha256 = _sha256_of(rel, ipas[0])
+            # identité du contenu : un tag fixe (nightly, latest) dont l'IPA est remplacée change de clé
+            key = sha256 or f"{ipas[0].get('id')}:{ipas[0].get('updated_at')}:{ipas[0].get('size')}"
             return {"tag": rel["tag_name"], "url": ipas[0]["browser_download_url"],
-                    "sha256": _sha256_of(rel, ipas[0]), "prerelease": bool(rel.get("prerelease")),
+                    "sha256": sha256, "key": key, "prerelease": bool(rel.get("prerelease")),
                     "asset": ipas[0]["name"], "notes": (rel.get("body") or "")[:4000]}
     return None
+
+
+def url_key(url: str) -> str | None:
+    """Identité du fichier d'un lien (ETag, date de modification, taille), lue dans les en-têtes
+    sans télécharger le corps. None si le serveur n'en donne aucun : on ne peut alors pas savoir
+    si le fichier a changé."""
+    with _get(url, timeout=30, headers={"Accept": "*/*"}) as r:
+        parts = [r.headers.get(h) for h in ("ETag", "Last-Modified", "Content-Length")]
+    return "|".join(p or "" for p in parts) if any(parts) else None
 
 
 def download(url: str, dest: Path, sha256: str | None = None, expect_bundle: str | None = None) -> dict:

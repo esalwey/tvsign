@@ -14,6 +14,8 @@ _RUNNING: set[int] = set()
 PHASE: dict[int, dict] = {}
 _RERUN: set[int] = set()                # destination changée pendant un renouvellement : on relance après
 _ACC_ALERTED: set[str] = set()          # comptes déjà signalés déconnectés (une alerte par épisode)
+_EXPIRED_LOGGED: set[int] = set()       # apps dont l'expiration est déjà au journal (une fois par épisode)
+_NO_MATCH_LOGGED: set[int] = set()      # apps dont l'absence de release correspondante est déjà au journal
 
 # État de la boucle, exposé dans /api/state pour l'interface.
 HEALTH: dict = {
@@ -101,13 +103,25 @@ async def alert(app: dict, reason: str, now: float) -> None:
 
 # ---------- source ----------
 
+def _unchanged(app: dict, tag: str, key: str | None) -> bool:
+    """La source publie-t-elle exactement ce qui est déjà téléchargé ? Le tag seul ne suffit pas :
+    un tag fixe (nightly, latest), un lien dont le fichier est remplacé ou une IPA republiée sous le
+    même tag changent de clé (empreinte, ETag…). Sans clé connue, seul le tag compte."""
+    return tag == app["source_tag"] and (key is None or app.get("source_key") in (None, key))
+
+
+def _rejected(app: dict, tag: str, key: str | None) -> bool:
+    """Cette release (ce contenu) a-t-elle déjà été refusée ?"""
+    return tag == app.get("bad_tag") and (key is None or app.get("bad_key") in (None, key))
+
+
 async def refresh_source(app: dict) -> bool:
     """Télécharge une nouvelle version si la source en publie une ; True si l'IPA a changé.
     Si une IPA utilisable existe déjà, un problème de source ne bloque pas le renouvellement."""
     if app["source_type"] == "upload":
         return False
     dest = app_dir(app["id"]) / "original.ipa"
-    tag, sha256 = None, None
+    tag, key, sha256 = None, None, None
     try:
         if app["source_type"] == "github":
             found = await asyncio.to_thread(_latest, app)
@@ -116,14 +130,29 @@ async def refresh_source(app: dict) -> bool:
                     channel = "stable" if app.get("channel") != "beta" else "beta"
                     prefixes, _ = ipa.release_rule(app)
                     which = f", tags {' / '.join(x + '*' for x in prefixes)}" if prefixes else ""
-                    raise RuntimeError(f"aucune IPA trouvée dans les releases ({channel}{which}) de {app['source']}")
+                    hint = await _beta_hint(app) if channel == "stable" else ""
+                    raise RuntimeError(f"aucune IPA trouvée dans les releases ({channel}{which}) de "
+                                       f"{app['source']}{hint}")
+                if app["id"] not in _NO_MATCH_LOGGED:
+                    _NO_MATCH_LOGGED.add(app["id"])
+                    db.log(f"{app['name']} : aucune release ne correspond plus dans {app['source']} "
+                           "(tags renommés, IPA absente ou release trop ancienne ?), version actuelle conservée",
+                           "warn", app_id=app["id"])
                 return False
-            tag, url, sha256 = found["tag"], found["url"], found["sha256"]
+            _NO_MATCH_LOGGED.discard(app["id"])
+            tag, url, sha256, key = found["tag"], found["url"], found["sha256"], found.get("key")
         else:
-            tag, url = app["source"], app["source"]
-        if dest.exists() and tag in (app["source_tag"], app.get("bad_tag")):
-            return False
+            tag = url = app["source"]
+            key = await asyncio.to_thread(ipa.url_key, url)
+        if dest.exists():
+            if _rejected(app, tag, key):
+                return False
+            if _unchanged(app, tag, key):
+                if key and app.get("source_key") is None:
+                    db.update("apps", app["id"], source_key=key)   # première lecture de la clé (ancienne base)
+                return False
         db.log(f"{app['name']} : téléchargement de {tag}"
+               + (" (fichier mis à jour sous le même nom)" if tag == app["source_tag"] and dest.exists() else "")
                + (" (empreinte SHA-256 vérifiée)" if sha256 else ""), app_id=app["id"])
         # dest remplacé seulement si valide ; un bundle ID différent de l'app suivie est refusé
         expect = app.get("bundle_id") if dest.exists() else None
@@ -135,7 +164,7 @@ async def refresh_source(app: dict) -> bool:
         if tag and isinstance(e, ValueError) and not isinstance(e, json.JSONDecodeError):
             # IPA invalide (pas une IPA, pas tvOS) : ne pas la retélécharger à chaque essai.
             # Le reste (coupure, réponse tronquée, JSON GitHub illisible) est passager : on réessaiera.
-            db.update("apps", app["id"], bad_tag=tag)
+            db.update("apps", app["id"], bad_tag=tag, bad_key=key)
             db.log(f"{app['name']} : version {tag} inutilisable ({e}), version précédente conservée",
                    "warn", app_id=app["id"])
             await notify(f"{app['name']} : nouvelle version {tag} inutilisable ({e}), version précédente conservée")
@@ -143,9 +172,20 @@ async def refresh_source(app: dict) -> bool:
             db.log(f"{app['name']} : source indisponible ({e}), version précédente conservée",
                    "warn", app_id=app["id"])
         return False
-    db.update("apps", app["id"], source_tag=tag, version=info["version"], bundle_id=info["bundle_id"],
-              bad_tag=None, source_sha256=info.get("sha256"))
+    db.update("apps", app["id"], source_tag=tag, source_key=key, version=info["version"],
+              bundle_id=info["bundle_id"], bad_tag=None, bad_key=None, source_sha256=info.get("sha256"))
     return True
+
+
+async def _beta_hint(app: dict) -> str:
+    """Canal stable sans release : indique si le canal beta, lui, en a une."""
+    try:
+        prefixes, prereleases = ipa.release_rule({**app, "channel": "beta"})
+        found = await asyncio.to_thread(ipa.latest_github, app["source"], prefixes, prereleases,
+                                        app.get("asset_name"))
+    except Exception:  # noqa: BLE001 - simple indication
+        return ""
+    return f" ; une version beta existe ({found['tag']}) : choisis le canal Beta" if found else ""
 
 
 def _latest(app: dict) -> dict | None:
@@ -154,14 +194,23 @@ def _latest(app: dict) -> dict | None:
 
 
 async def new_release(app: dict) -> bool:
-    """Vrai si la source GitHub publie un tag différent de celui installé (et pas déjà refusé)."""
+    """Vrai si la source GitHub publie une version différente de celle installée (autre tag, ou
+    même tag dont l'IPA a été remplacée) et pas déjà refusée. Les liens ne sont relus qu'au
+    renouvellement (refresh_source)."""
     if app["source_type"] != "github":
         return False
     try:
         found = await asyncio.to_thread(_latest, app)
     except Exception:  # noqa: BLE001 - GitHub indisponible : on réessaiera
         return False
-    return bool(found) and found["tag"] not in (app["source_tag"], app.get("bad_tag"))
+    if not found:
+        return False
+    tag, key = found["tag"], found.get("key")
+    if _rejected(app, tag, key):
+        return False
+    if tag != app["source_tag"]:
+        return True
+    return bool(key) and app.get("source_key") not in (None, key)
 
 
 # ---------- renouvellement ----------

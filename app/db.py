@@ -97,8 +97,10 @@ MIGRATIONS = [
     ("apps", "preset", "TEXT"),              # identifiant du préréglage (presets.json)
     ("apps", "asset_name", "TEXT"),          # nom exact de l'asset IPA (préréglage)
     ("apps", "source_sha256", "TEXT"),       # empreinte vérifiée de l'IPA téléchargée
-    ("apps", "deferred_reason", "TEXT"),     # installation reportée : app_running (app ouverte sur la TV)
-    ("apps", "deferred_since", "REAL"),      # début du report en cours
+    ("apps", "deferred_reason", "TEXT"),     # ancien report « app ouverte » (plus utilisé, colonne conservée)
+    ("apps", "deferred_since", "REAL"),      # idem
+    ("apps", "source_key", "TEXT"),          # identité du contenu téléchargé (empreinte, ETag…) : tag fixe, IPA remplacée
+    ("apps", "bad_key", "TEXT"),             # identité de la release refusée (avec bad_tag)
 ]
 
 
