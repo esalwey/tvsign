@@ -92,7 +92,7 @@ const CAUSES = [
   [/anisette/i, "c_anisette"],
   [/reconnexion|-22406|HTTP Some\(401\)|unauthori[sz]ed|session .*(expir|invalid)|not logged|log ?in required/i, "c_session"],
   [/plumesign occupé/i, "c_busy"],
-  [/est ouverte sur l'Apple TV|app ouverte sur la TV/i, "c_app_open"],
+  [/ouverte sur l'Apple TV|app ouverte sur la TV|installd ne progresse plus/i, "c_app_open"],
   [/plumesign trop ancien/i, "c_plumesign_old"],
   [/réseau ou Apple injoignable/i, "c_apple_net"],
   [/maximum (number )?of (apps|app ids)|too many|app id limit|limit of \d+/i, "c_limit"],

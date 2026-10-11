@@ -211,8 +211,10 @@ def _failure(email: str, what: str, res: Result) -> RuntimeError:
 
 
 def _why(res: Result) -> str:
-    if re.search(r"anisette|panicked", res.output, re.I):
+    if re.search(r"anisette", res.output, re.I):
         return f"serveur anisette indisponible : {res.tail(2)}"
+    if re.search(r"panicked", res.output, re.I):
+        return f"plumesign a planté (réponse inattendue d'Apple ?) : {res.tail(2)}"
     if _TRANSIENT.search(res.output):
         return f"réseau ou Apple injoignable : {res.tail(2)}"
     return f"vérification impossible : {res.tail(2)}"
@@ -350,8 +352,10 @@ async def issued_cert_serials(email: str) -> set[str] | None:
     if not res.ok:
         return None
     found = re.findall(r'serial_number:\s*"([0-9A-Fa-f]+)",\s*status:\s*"([^"]*)"', res.output)
-    if not found and "serial_number" not in res.output and "[]" not in res.output:
-        return None  # format inattendu : on ne conclut rien
+    if not found and ("serial_number" in res.output or "[]" not in res.output):
+        return None  # format inattendu ou illisible : on ne conclut rien (seule une liste vide explicite compte)
+    if len(found) < res.output.count("serial_number"):
+        return None  # certaines entrées n'ont pas été lues : un certificat valide pourrait manquer
     return {serial.upper().lstrip("0") for serial, status in found if status.lower() == "issued"}
 
 

@@ -189,7 +189,10 @@ def start_pairing(identifier: str | None, ip: str, port: int, name: str) -> Sess
 # ---------- commandes sans fil ----------
 
 def _failed(device: dict, message: str, lost: bool = False) -> None:
-    db.update("devices", device["id"], last_error=message, last_error_at=time.time(), pairing_lost=int(lost))
+    fields = dict(last_error=message, last_error_at=time.time())
+    if lost:
+        fields["pairing_lost"] = 1     # ne se retire qu'au succès ou après un nouvel appairage, pas à une autre panne
+    db.update("devices", device["id"], **fields)
 
 
 def _target(device: dict) -> list[str]:
@@ -360,8 +363,9 @@ async def install(device: dict, ipas: list[Path], on_event=None, wait_cap: float
                     waited = max(time.time() - st["waiting_since"], int(parts[2]))
                     if wait_cap and waited >= wait_cap:
                         raise AppInUse(
-                            f"{_app_label(device, app_name)} : installation en attente depuis "
-                            f"{waited / 60:.0f} min, abandonnée. Ferme l'app pour terminer la mise à jour")
+                            f"installd ne progresse plus depuis {waited / 60:.0f} min sur « {device['name']} », "
+                            f"installation abandonnée : {app_name or 'l’app'} est probablement ouverte sur l'Apple TV "
+                            "(ferme-la pour terminer la mise à jour), sinon vérifie l'espace de stockage")
 
             def on_timeout() -> str:
                 if st["waiting_since"]:

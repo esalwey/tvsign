@@ -1,7 +1,9 @@
 """Renouvellement : mise à jour de la source, signature, installation, et boucle de planification."""
 import asyncio
+import base64
 import json
 import time
+import urllib.parse
 import urllib.request
 
 from . import db, devices, ipa, plume, proc, settings
@@ -42,8 +44,16 @@ def _fmt(ts: float) -> str:
 # ---------- notifications ----------
 
 def _send(message: str, priority: str, url: str | None = None) -> None:
-    req = urllib.request.Request(url or settings.ntfy_url(), data=message.encode("utf-8"),
-                                 headers={"Title": "tvsign", "Priority": priority})
+    url = url or settings.ntfy_url()
+    headers = {"Title": "tvsign", "Priority": priority}
+    parts = urllib.parse.urlsplit(url)
+    if parts.username is not None:
+        # https://user:pass@hôte/sujet : urllib n'en fait pas d'authentification, on l'envoie en Basic
+        cred = f"{urllib.parse.unquote(parts.username)}:{urllib.parse.unquote(parts.password or '')}"
+        headers["Authorization"] = "Basic " + base64.b64encode(cred.encode("utf-8")).decode()
+        host = parts.hostname + (f":{parts.port}" if parts.port else "")
+        url = urllib.parse.urlunsplit(parts._replace(netloc=host))
+    req = urllib.request.Request(url, data=message.encode("utf-8"), headers=headers)
     urllib.request.urlopen(req, timeout=10).close()
 
 
@@ -56,17 +66,20 @@ async def notify_test(url: str | None = None) -> None:
     HEALTH["notify_error"] = None
 
 
-async def notify(message: str, priority: str = "default") -> None:
-    """Envoi ntfy hors de la boucle d'événements ; un échec est journalisé une fois."""
+async def notify(message: str, priority: str = "default") -> bool:
+    """Envoi ntfy hors de la boucle d'événements ; un échec est journalisé une fois.
+    True si la notification est partie : l'appelant ne doit la considérer envoyée qu'alors."""
     if not settings.ntfy_url():
-        return
+        return False
     try:
         await asyncio.to_thread(_send, message, priority)
         HEALTH["notify_error"] = None
+        return True
     except Exception as e:  # noqa: BLE001 - la notification est accessoire
         if HEALTH["notify_error"] is None:
             db.log(f"notification ntfy échouée : {e}", "warn")
         HEALTH["notify_error"] = str(e)
+        return False
 
 
 # Niveaux d'alerte croissants : on ne renotifie que si la situation s'aggrave.
@@ -87,18 +100,24 @@ def _level(app: dict, now: float) -> str:
     return "fail"
 
 
-async def alert(app: dict, reason: str, now: float) -> None:
+async def alert(app: dict, reason: str, now: float, quiet_fail: bool = False) -> None:
+    """quiet_fail : pas de notification au niveau « fail » (panne banale, ex. TV en veille) ;
+    les niveaux 24h / 6h / expired restent notifiés."""
     lvl = _level(app, now)
     prev = app.get("notified_level")
     if prev in _LEVELS and _LEVELS.index(lvl) <= _LEVELS.index(prev):
         return  # déjà notifié à ce niveau
-    db.update("apps", app["id"], notified_level=lvl)
+    if lvl == "fail" and quiet_fail:
+        return
     if lvl == "fail":
-        await notify(f"{app['name']} : renouvellement échoué, {reason}")
+        sent = await notify(f"{app['name']} : renouvellement échoué, {reason}")
     elif lvl == "expired":
-        await notify(f"{app['name']} : profil EXPIRÉ, l'app ne se lance plus. {reason}", "urgent")
+        sent = await notify(f"{app['name']} : profil EXPIRÉ, l'app ne se lance plus. {reason}", "urgent")
     else:
-        await notify(f"{app['name']} expire dans moins de {lvl[:-1]} h et le renouvellement échoue : {reason}", "high")
+        sent = await notify(f"{app['name']} expire dans moins de {lvl[:-1]} h et le renouvellement échoue : {reason}", "high")
+    if sent:
+        # niveau mémorisé seulement si la notification est partie : sinon on réessaiera au prochain échec
+        db.update("apps", app["id"], notified_level=lvl)
 
 
 # ---------- source ----------
@@ -355,6 +374,9 @@ async def _renew(app_id: int, trigger: str) -> None:
                        "les autres apps sideloadées avec ce compte (iPhone…) vont cesser de fonctionner")
                 db.log(msg, "warn", app_id=app_id)
                 await notify(msg)
+                # les autres apps tvsign du compte, signées avec le certificat révoqué, sont à refaire
+                # tout de suite plutôt qu'au prochain contrôle périodique
+                await _guarded("contrôle des certificats", _check_certificates(email))
             expires = ipa.profile_expiry(signed) or time.time() + 7 * 86400
 
         # 3. Installation. Si l'app est ouverte sur la TV, installd attend qu'elle soit fermée :
@@ -398,11 +420,18 @@ async def _renew(app_id: int, trigger: str) -> None:
         raise
     except Exception as e:  # noqa: BLE001 - l'erreur est remontée dans l'interface
         now = time.time()
-        transient = isinstance(e, (plume.Transient, devices.AppInUse))
+        unreachable = isinstance(e, devices.Unreachable)
+        transient = isinstance(e, (plume.Transient, devices.AppInUse)) or unreachable
+        if unreachable and trigger == "nouvelle version" and app["status"] == "ok":
+            # TV en veille : l'app installée reste valable, la mise à jour attend simplement la TV
+            db.update("apps", app_id, status="ok", last_error=None, next_attempt_at=_retry_at(app, now, True))
+            db.log(f"{app['name']} : mise à jour en attente, {e}", "warn", app_id=app_id)
+            return
         db.update("apps", app_id, status="error", last_error=str(e),
                   next_attempt_at=_retry_at(app, now, transient))
         db.log(f"{app['name']} : échec, {e}", "error", app_id=app_id)
-        await alert(db.row("SELECT * FROM apps WHERE id = ?", app_id) or app, str(e), now)
+        # une TV en veille loin de l'expiration est banale : pas de notification avant le niveau 24h
+        await alert(db.row("SELECT * FROM apps WHERE id = ?", app_id) or app, str(e), now, quiet_fail=unreachable)
 
 
 def due(app: dict, now: float) -> bool:
@@ -441,7 +470,11 @@ async def _check_certificates(email: str) -> None:
             continue
         if not {s.lstrip("0") for s in serials.split(",")} & issued:
             signed.unlink(missing_ok=True)   # ne pas réutiliser une signature révoquée
-            db.update("apps", app["id"], expires_at=0, next_attempt_at=None)
+            # L'app ne se lance plus : elle compte comme expirée (une seconde de retard), ce qui la
+            # rend due tout de suite et garde les alertes 6h / expirée, /api/health et l'interface
+            # actifs si la re-signature échoue. (Un 0 effaçait toute échéance.)
+            db.update("apps", app["id"], expires_at=time.time() - 1, next_attempt_at=None,
+                      notified_level=None)
             db.log(f"{app['name']} : certificat révoqué, nouvelle signature", "error", app_id=app["id"])
             await notify(f"{app['name']} : certificat Apple révoqué (autre outil sur le même compte), "
                          "re-signature en cours", "high")
@@ -465,9 +498,13 @@ async def _check_accounts() -> None:
 
 async def _check_expired(now: float) -> None:
     """Signale une expiration même si aucun essai n'est en cours."""
-    for app in db.rows("SELECT * FROM apps WHERE enabled = 1 AND expires_at > 0 AND expires_at < ?", now):
+    expired = db.rows("SELECT * FROM apps WHERE enabled = 1 AND expires_at > 0 AND expires_at < ?", now)
+    _EXPIRED_LOGGED.intersection_update(a["id"] for a in expired)   # renouvelée depuis : épisode terminé
+    for app in expired:
         if app["notified_level"] != "expired":
-            db.log(f"{app['name']} : profil expiré le {_fmt(app['expires_at'])}", "error", app_id=app["id"])
+            if app["id"] not in _EXPIRED_LOGGED:
+                _EXPIRED_LOGGED.add(app["id"])
+                db.log(f"{app['name']} : profil expiré le {_fmt(app['expires_at'])}", "error", app_id=app["id"])
             await alert(app, app["last_error"] or "renouvellement pas encore réussi", now)
 
 
