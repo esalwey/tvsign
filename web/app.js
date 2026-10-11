@@ -83,6 +83,7 @@ function relatif(ts, now) {
 const CAUSES = [
   [/ntfy/i, "c_ntfy"],
   [/8220|no devices from which/i, "c_8220"],
+  [/NO_TEAM|MULTIPLE_TEAMS/, "c_team"],
   [/ancienne version de tvsign/i, "c_legacy"],
   [/appairage perdu|PAIRING_LOST|pairing record|not paired|No stored pairing/i, "c_lost"],
   [/aucune Apple TV/i, "c_no_tv"],
@@ -95,7 +96,7 @@ const CAUSES = [
   [/ouverte sur l'Apple TV|app ouverte sur la TV|installd ne progresse plus/i, "c_app_open"],
   [/plumesign trop ancien/i, "c_plumesign_old"],
   [/réseau ou Apple injoignable/i, "c_apple_net"],
-  [/maximum (number )?of (apps|app ids)|too many|app id limit|limit of \d+/i, "c_limit"],
+  [/maximum (number )?of (apps|app ids)|too many (apps|app ids)|app id limit|limit of \d+ (apps|app ids)/i, "c_limit"],
   [/identifiant d'app changé/i, "c_bundle"],
   [/empreinte SHA-256/i, "c_digest"],
   [/certificat|certificate/i, "c_cert"],
@@ -103,7 +104,8 @@ const CAUSES = [
   [/interrompu/i, "c_interrupted"],
   [/délai dépassé|trop long|timed? ?out|timeout/i, "c_timeout"],
   [/plumesign.*(introuvable|not found)|No such file|cannot find the file/i, "c_plumesign"],
-  [/aucune IPA|github|HTTP Error 4\d\d|téléchargement|download|pas une app tvOS|IPA|https:\/\/ sont acceptées/i, "c_source"],
+  [/IPA d'origine absente/, "c_ipa_missing"],
+  [/aucune IPA|HTTP Error 4\d\d|téléchargement|download|pas une app tvOS|IPA|https:\/\/ sont acceptées/, "c_source"],
 ];
 function nettoyer(msg) {
   return String(msg || "")
@@ -332,7 +334,8 @@ function synthese(s, now) {
   if (cours.length) return ["cours", t("st_renewing"), t("sum_running", { names: cours.map((a) => a.name).join(", ") })];
   if (!s.apps.length) return ["neutre", t("sum_empty_t"), t("sum_empty")];
   const prochaine = actives.filter((a) => a.expires_at).sort((x, y) => x.expires_at - y.expires_at)[0];
-  if (!prochaine) return ["ok", t("sum_ok_t"), ""];
+  // aucune app active avec un profil valide (toutes en pause, ou pas encore installées) : pas de « à jour » vert
+  if (!prochaine) return ["neutre", t("sum_idle_t"), t("sum_idle")];
   const quand = Math.max(now, prochaine.renew_at ?? prochaine.expires_at - s.renew_before_hours * 3600);
   return ["ok", t("sum_ok_t"), t("sum_next", { when: quand <= now + 60 ? t("now") : relatif(quand, now) })];
 }
