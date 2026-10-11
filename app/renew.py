@@ -5,17 +5,13 @@ import time
 import urllib.request
 
 from . import db, devices, ipa, plume, proc, settings
-from .config import (ACCOUNT_CHECK_HOURS, APP_WAIT_MINUTES, CHECK_INTERVAL, DEFER_MAX_HOURS,
-                     DEFER_RETRY_MINUTES, DEFER_URGENT_HOURS, IPA_DIR, RELEASE_CHECK_MINUTES,
-                     RENEW_TIMEOUT_MINUTES, RETRY_MINUTES)
+from .config import (ACCOUNT_CHECK_HOURS, APP_WAIT_MINUTES, CHECK_INTERVAL, IPA_DIR,
+                     RELEASE_CHECK_MINUTES, RENEW_TIMEOUT_MINUTES, RETRY_MINUTES)
 
 _RUNNING: set[int] = set()
 # Étape du renouvellement en cours, par app, pour l'interface :
 # {"step": checking|signing|uploading|installing|waiting_app, "since": ts, ...}
 PHASE: dict[int, dict] = {}
-# Déclencheurs qui peuvent attendre que l'app soit fermée sur la TV (personne devant l'écran à
-# interrompre) ; les autres (manuel, ajout…) installent tout de suite et attendent installd.
-DEFERRABLE = ("auto", "nouvelle version")
 _RERUN: set[int] = set()                # destination changée pendant un renouvellement : on relance après
 _ACC_ALERTED: set[str] = set()          # comptes déjà signalés déconnectés (une alerte par épisode)
 
@@ -251,58 +247,6 @@ def _phase(app_id: int, step: str, **info) -> None:
     PHASE[app_id] = {"step": step, "since": since, **info}
 
 
-def _identities(app: dict, email: str) -> list[str]:
-    """Bundle IDs possibles de l'app sur la TV : plumesign signe « <original>.<TEAMID> »."""
-    bundle = app.get("bundle_id")
-    if not bundle:
-        return []
-    team = next((a["team_id"] for a in plume.accounts() if a["email"] == email and a.get("team_id")), None)
-    return [f"{bundle}.{team}", bundle] if team else [bundle]
-
-
-async def _app_open(app: dict, device: dict, email: str) -> bool | None:
-    """L'app a-t-elle un processus sur la TV ? None si on ne peut pas le savoir (sans bloquer)."""
-    ids = _identities(app, email)
-    if not ids:
-        return None
-    try:
-        return await devices.app_running(device, ids)
-    except (devices.PairingLost, devices.Unreachable):
-        raise
-    except Exception as e:  # noqa: BLE001 - la vérification est une précaution, pas un préalable
-        db.log(f"{app['name']} : impossible de savoir si l'app est ouverte sur la TV ({e})", "warn", app_id=app["id"])
-        return None
-
-
-def _may_defer(app: dict, trigger: str, now: float) -> bool:
-    """Report possible : renouvellement automatique ou nouvelle version, profil pas proche de
-    l'expiration, et report en cours pas trop ancien (une app laissée en arrière-plan garde son
-    processus : au-delà, on tente l'installation, installd attendra si quelqu'un regarde)."""
-    if trigger not in DEFERRABLE:
-        return False
-    exp = app["expires_at"]
-    if not exp or exp - now < DEFER_URGENT_HOURS * 3600:
-        return False
-    since = app.get("deferred_since")
-    return not (since and now - since > DEFER_MAX_HOURS * 3600)
-
-
-async def _defer(app: dict, device: dict, trigger: str, now: float) -> None:
-    """App ouverte sur la TV : on n'installe pas maintenant, nouvel essai plus tard.
-    L'état d'avant (ok, erreur…) est conservé : ce n'est pas un échec."""
-    retry = now + DEFER_RETRY_MINUTES * 60
-    if app["expires_at"]:
-        retry = min(retry, max(now + 60, app["expires_at"] - DEFER_URGENT_HOURS * 3600))
-    first = not app.get("deferred_since")
-    db.update("apps", app["id"], status=app["status"] if app["status"] != "running" else "pending",
-              last_error=app["last_error"], deferred_reason="app_running",
-              deferred_since=app.get("deferred_since") or now, next_attempt_at=retry)
-    if first:
-        what = "mise à jour" if trigger == "nouvelle version" else "renouvellement"
-        db.log(f"{app['name']} est ouverte sur l'Apple TV « {device['name']} » : {what} reporté pour ne pas "
-               f"interrompre la lecture (nouvel essai toutes les {DEFER_RETRY_MINUTES:.0f} min)", app_id=app["id"])
-
-
 async def _renew(app_id: int, trigger: str) -> None:
     app = db.row("SELECT * FROM apps WHERE id = ?", app_id)
     if not app:
@@ -325,27 +269,18 @@ async def _renew(app_id: int, trigger: str) -> None:
             # session déjà connue comme expirée : inutile de solliciter Apple
             raise plume.SessionExpired(f"session Apple de {email} expirée : reconnecte-le (bouton Reconnecter)")
 
-        # 1. Apple TV joignable ? On échoue vite, avant tout appel à Apple ; et l'app y est-elle
-        # ouverte ? Vérifié avant le téléchargement : une nouvelle version reportée reste « nouvelle ».
+        # 1. Apple TV joignable ? On échoue vite, avant tout appel à Apple.
+        # Pas de report sur la seule présence d'un processus : tvOS garde en mémoire les apps
+        # quittées, une app « avec processus » n'est donc pas forcément à l'écran. Seul installd
+        # sait si l'app est réellement utilisée : il met alors l'installation en attente (étape 3).
         _phase(app_id, "checking")
         if not device["udid"]:
             await devices.refresh_info(device["id"])
             device = db.row("SELECT * FROM devices WHERE id = ?", device["id"])
         else:
             await devices.check_reachable(device)
-        now = time.time()
-        if _may_defer(app, trigger, now):
-            if await _app_open(app, device, email):
-                await _defer(app, device, trigger, now)
-                return
-        elif trigger in DEFERRABLE and app.get("deferred_reason"):
-            # fin du report (expiration proche, ou report trop long) : signalé une fois
-            db.update("apps", app_id, deferred_reason=None)
-            urgent = app["expires_at"] and app["expires_at"] - now < DEFER_URGENT_HOURS * 3600
-            db.log(f"{app['name']} : installation tentée même si l'app est ouverte sur la TV ("
-                   + ("expiration proche" if urgent else
-                      f"reportée depuis {(now - (app['deferred_since'] or now)) / 3600:.0f} h")
-                   + ") ; installd attendra sa fermeture", "warn", app_id=app_id)
+        if app.get("deferred_reason"):
+            db.update("apps", app_id, deferred_reason=None, deferred_since=None)
 
         updated = await refresh_source(app)
         if trigger == "nouvelle version" and not updated and app["status"] == "ok":
