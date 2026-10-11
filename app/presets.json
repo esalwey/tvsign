@@ -15,7 +15,7 @@
           "prereleases": true
         }
       },
-      "default_channel": "beta",
+      "default_channel": "stable",
       "description": {
         "en": "Nuvio, made for Apple TV. Builds from github.com/esalwey/NuvioTV.",
         "fr": "Nuvio pour Apple TV. Builds publiées sur github.com/esalwey/NuvioTV."
