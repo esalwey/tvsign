@@ -59,6 +59,13 @@ pub async fn locate(
         .iter()
         .find(|record| record.udid.eq_ignore_ascii_case(identifier))
         .map(|record| record.udid.clone());
+    let wanted_name = records
+        .iter()
+        .find(|record| record.udid.eq_ignore_ascii_case(identifier))
+        .map(|record| record.name.clone());
+    // A device with our device's name whose tag none of our keys produce: probably our device,
+    // which forgot this host. Only reported if the real one never shows up before the deadline.
+    let mut seen_forgotten = false;
 
     let daemon = ServiceDaemon::new()?;
     let browse = daemon.browse(ServiceKind::RemotePairing.service_type())?;
@@ -112,8 +119,17 @@ pub async fn locate(
                 result = Err(Error::PairingNotAccepted);
                 break;
             }
+            None => {
+                if let (Some(wanted), Some(name)) = (&wanted_name, &device.name) {
+                    seen_forgotten |= wanted.eq_ignore_ascii_case(name);
+                }
+            }
             _ => {}
         }
+    }
+
+    if seen_forgotten && matches!(result, Err(Error::DeviceNotFound(_))) {
+        result = Err(Error::PairingNotAccepted);
     }
 
     if let Err(e) = daemon.shutdown() {

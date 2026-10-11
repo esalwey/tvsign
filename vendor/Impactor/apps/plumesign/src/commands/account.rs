@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
 use anyhow::{Ok, Result};
@@ -343,7 +343,31 @@ async fn register_device(args: RegisterDeviceArgs) -> Result<()> {
 pub async fn teams(session: &DeveloperSession) -> Result<String> {
     let teams = session.qh_list_teams().await?.teams;
 
+    if teams.is_empty() {
+        anyhow::bail!(
+            "NO_TEAM: this Apple ID has no developer team (sign in at developer.apple.com and accept the agreement, then retry)"
+        );
+    }
+
     if teams.len() == 1 {
+        return Ok(teams[0].team_id.clone());
+    }
+
+    // Several teams (personal + invited): PLUMESIGN_TEAM_ID picks one.
+    if let Some(wanted) = std::env::var("PLUMESIGN_TEAM_ID").ok() {
+        if let Some(t) = teams.iter().find(|t| t.team_id == wanted.trim()) {
+            return Ok(t.team_id.clone());
+        }
+    }
+
+    // No terminal (service, tvsign): never wait for a choice that nobody can make.
+    if !std::io::stdin().is_terminal() {
+        log::warn!(
+            "MULTIPLE_TEAMS: {} teams, using {} ({}); set PLUMESIGN_TEAM_ID to choose another",
+            teams.len(),
+            teams[0].name,
+            teams[0].team_id
+        );
         return Ok(teams[0].team_id.clone());
     }
 

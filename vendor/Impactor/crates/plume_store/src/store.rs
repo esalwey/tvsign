@@ -56,7 +56,10 @@ impl AccountStore {
                 tokio::fs::create_dir_all(parent).await?;
             }
 
-            tokio::fs::write(path, serde_json::to_string_pretty(self)?).await?;
+            // write then rename: a kill in the middle never leaves a truncated accounts.json
+            let tmp = tmp_path(path);
+            tokio::fs::write(&tmp, serde_json::to_string_pretty(self)?).await?;
+            tokio::fs::rename(&tmp, path).await?;
         }
         Ok(())
     }
@@ -67,7 +70,9 @@ impl AccountStore {
                 std::fs::create_dir_all(parent)?;
             }
 
-            std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+            let tmp = tmp_path(path);
+            std::fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
+            std::fs::rename(&tmp, path)?;
         }
         Ok(())
     }
@@ -224,4 +229,10 @@ impl AccountStore {
         self.refreshes.remove(udid);
         self.save_sync()
     }
+}
+
+fn tmp_path(path: &std::path::Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    path.with_file_name(name)
 }
