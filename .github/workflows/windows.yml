@@ -97,9 +97,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          Copy-Item vendor/Impactor/target/release/plumesign.exe windows/dist/installer/plumesign-windows-x64.exe
-          $h = (Get-FileHash windows/dist/installer/plumesign-windows-x64.exe -Algorithm SHA256).Hash.ToLower()
-          "$h  plumesign-windows-x64.exe" | Add-Content windows/dist/installer/SHA256SUMS.txt
           $tag = "${{ github.ref_name }}"
           $flags = @('--title', "tvsign $($tag.Substring(1))", '--generate-notes',
                      '--notes', "Docker (NAS / Raspberry Pi): ``ghcr.io/${{ github.repository_owner }}/tvsign:$($tag.Substring(1))``")
