@@ -43,7 +43,8 @@ host or distribute any app content.
   you need an mDNS reflector (UniFi "Multicast DNS", `avahi-daemon` with `enable-reflector=yes`).
 - `network_mode: host` (multicast does not reach a bridge network).
 - Outgoing Internet access: Apple (`gsa.apple.com`, `developerservices2.apple.com`), the anisette
-  server (`ani.sidestore.app` by default, changeable in Settings), `api.github.com` for releases.
+  server (`ani.jkcoxson.com` by default, `ani2.stikstore.app` as automatic fallback, changeable in
+  Settings), `api.github.com` for releases.
 - A correct clock (NTP).
 - Not supported: Docker Desktop on Windows/macOS (use the Windows edition), 32-bit ARM, TrueNAS CORE.
 
@@ -153,7 +154,8 @@ progress finish before the container stops. Watchtower or Diun work but are opti
 
 Everything is optional. The main variables: `TZ`, `PUID`, `PGID`, `TVSIGN_PORT` (8765),
 `TVSIGN_HOST` (0.0.0.0), `TVSIGN_PASSWORD_FILE`, `TVSIGN_ALLOWED_HOSTS`, `TVSIGN_NTFY_URL`,
-`TVSIGN_RENEW_BEFORE_HOURS` (60), `TVSIGN_ANISETTE_URL`, `TVSIGN_GITHUB_TOKEN`, `TVSIGN_LANGUAGE`.
+`TVSIGN_RENEW_BEFORE_HOURS` (60), `TVSIGN_ANISETTE_URL` (empty: `ani.jkcoxson.com`, fallback
+`ani2.stikstore.app`), `TVSIGN_GITHUB_TOKEN`, `TVSIGN_LANGUAGE`.
 Settings set in the web UI are stored in the database; an environment variable always wins.
 
 App open on the Apple TV: tvsign installs on schedule and never tries to guess whether the app is
@@ -170,6 +172,39 @@ progress may finish for up to `TVSIGN_SHUTDOWN_DRAIN_SECONDS` (240) before it is
 Notifications (ntfy): the topic name acts as a password on the public ntfy.sh, and messages name
 your Apple ID and your apps: pick a long random topic, or use a self-hosted ntfy. A protected
 server can be reached with `https://user:password@host/topic` (sent as Basic authentication).
+
+### Signing in to Apple: the anisette server
+
+Signing in to Apple needs "anisette" data, produced by an anisette-v3 server. Since 12 October 2026
+Apple refuses the data of the servers that generate it as Android (error `-80045` at sign-in, then
+`HTTP 503` pages), which includes the old default `ani.sidestore.app`. From version 1.0.1:
+
+- tvsign uses `https://ani.jkcoxson.com`, which serves Windows anisette, and switches to
+  `https://ani2.stikstore.app` by itself when it does not answer. **Leave the Settings field empty**
+  for that. The client info and user agent sent to Apple are the ones the server announces.
+- A server you choose yourself (Settings, or `TVSIGN_ANISETTE_URL`) is used alone, without fallback,
+  and must serve Windows data too. A setting that names one of the old Android servers
+  (`ani.sidestore.app`, `ani.stikstore.app`, `anisette.crystall1ne.dev`, `ani3server.fly.dev`,
+  `ani.jaydenha.uk`, `omni.ethxn.xyz`) is replaced by the default, with a line in the log; the same
+  value in an environment variable is ignored.
+- The anisette identity is created again by itself (the old one, `state.plist` in the `PlumeImpactor`
+  folder, is deleted) and provisioned again whenever the server or Apple says it is not valid.
+- Accounts that were already connected keep renewing as long as Apple accepts their session. If it
+  does not, the account turns to "Signed out" with the reason, with a single notification: sign it in
+  again (password, then the two-factor code of a trusted Apple device).
+
+If signing in still fails:
+
+- **Two-factor code**: Apple often pushes the code to your trusted devices before asking for it; just
+  type it. Codes by text message are refused by Apple for now (HTTP 403): use a trusted Apple device.
+- **`-22411`**: this Apple ID has never signed in on an Apple device. Sign it in once on an iPhone,
+  iPad, Mac or Apple TV, then try again.
+- **`-80045`** with the default server: Apple refuses this account or this connection. It is not a
+  tvsign problem and retrying makes it worse (Apple limits the attempts): wait several hours, from
+  another network if you can, then sign in once. Apps already installed keep working until they expire.
+- **HTTP 503**: Apple's servers are busy (tvsign retries by itself a few times), or the anisette
+  server is not accepted: check that the Settings field is empty. Settings › Diagnostics tells whether
+  the anisette server answers and serves Windows data.
 
 Building from source: see [docs/building.md](docs/building.md).
 
@@ -205,7 +240,8 @@ n'héberge ni ne distribue aucun contenu.
   il faut un réflecteur mDNS (UniFi « Multicast DNS », `avahi-daemon` avec `enable-reflector=yes`).
 - `network_mode: host` (le multicast n'atteint pas un réseau bridge).
 - Accès Internet sortant : Apple (`gsa.apple.com`, `developerservices2.apple.com`), le serveur
-  anisette (`ani.sidestore.app` par défaut, modifiable dans les Réglages), `api.github.com`.
+  anisette (`ani.jkcoxson.com` par défaut, `ani2.stikstore.app` en repli automatique, modifiable dans
+  les Réglages), `api.github.com`.
 - Une horloge à l'heure (NTP).
 - Non pris en charge : Docker Desktop sous Windows/macOS (prendre l'édition Windows), ARM 32 bits,
   TrueNAS CORE.
@@ -320,7 +356,8 @@ restent facultatifs.
 
 Tout est facultatif. Variables principales : `TZ`, `PUID`, `PGID`, `TVSIGN_PORT` (8765),
 `TVSIGN_HOST` (0.0.0.0), `TVSIGN_PASSWORD_FILE`, `TVSIGN_ALLOWED_HOSTS`, `TVSIGN_NTFY_URL`,
-`TVSIGN_RENEW_BEFORE_HOURS` (60), `TVSIGN_ANISETTE_URL`, `TVSIGN_GITHUB_TOKEN`, `TVSIGN_LANGUAGE`.
+`TVSIGN_RENEW_BEFORE_HOURS` (60), `TVSIGN_ANISETTE_URL` (vide : `ani.jkcoxson.com`, repli
+`ani2.stikstore.app`), `TVSIGN_GITHUB_TOKEN`, `TVSIGN_LANGUAGE`.
 Les réglages faits dans l'interface sont enregistrés en base ; une variable d'environnement a
 toujours la priorité.
 
@@ -340,6 +377,43 @@ conservé. À l'arrêt, un renouvellement en cours peut finir pendant `TVSIGN_SH
 Notifications (ntfy) : sur ntfy.sh public, le nom du sujet fait office de mot de passe, et les messages
 citent votre Apple ID et vos apps : choisir un sujet long et aléatoire, ou un ntfy auto-hébergé. Un
 serveur protégé s'utilise avec `https://utilisateur:motdepasse@hôte/sujet` (envoyé en authentification Basic).
+
+### Connexion à Apple : le serveur anisette
+
+La connexion à Apple a besoin de données « anisette », produites par un serveur anisette-v3. Depuis le
+12 octobre 2026, Apple refuse les données des serveurs qui les génèrent comme Android (erreur `-80045`
+à la connexion, puis pages `HTTP 503`), dont l'ancien serveur par défaut `ani.sidestore.app`. À partir
+de la version 1.0.1 :
+
+- tvsign utilise `https://ani.jkcoxson.com`, qui fournit des données anisette Windows, et bascule tout
+  seul sur `https://ani2.stikstore.app` quand il ne répond pas. **Laissez le champ des Réglages vide**
+  pour cela. Le client info et le user agent envoyés à Apple sont ceux que le serveur annonce.
+- Un serveur choisi par vos soins (Réglages, ou `TVSIGN_ANISETTE_URL`) est utilisé seul, sans repli, et
+  doit lui aussi fournir des données Windows. Un réglage qui désigne l'un des anciens serveurs Android
+  (`ani.sidestore.app`, `ani.stikstore.app`, `anisette.crystall1ne.dev`, `ani3server.fly.dev`,
+  `ani.jaydenha.uk`, `omni.ethxn.xyz`) est remplacé par le serveur par défaut, avec une ligne dans le
+  journal ; la même valeur dans une variable d'environnement est ignorée.
+- L'identité anisette est recréée toute seule (l'ancienne, `state.plist` dans le dossier
+  `PlumeImpactor`, est supprimée) et provisionnée de nouveau chaque fois que le serveur ou Apple dit
+  qu'elle n'est plus valide.
+- Les comptes déjà connectés continuent d'être renouvelés tant qu'Apple accepte leur session. Sinon le
+  compte passe à « Déconnecté » avec la raison, et une seule notification part : reconnectez-le (mot de
+  passe, puis code à deux facteurs d'un appareil Apple de confiance).
+
+Si la connexion échoue encore :
+
+- **Code à deux facteurs** : Apple envoie souvent le code à vos appareils de confiance avant de le
+  demander ; saisissez-le simplement. Les codes par SMS sont pour l'instant refusés par Apple (HTTP
+  403) : utilisez un appareil Apple de confiance.
+- **`-22411`** : cet Apple ID n'a jamais été connecté sur un appareil Apple. Connectez-le une fois sur
+  un iPhone, un iPad, un Mac ou une Apple TV, puis réessayez.
+- **`-80045`** avec le serveur par défaut : Apple refuse ce compte ou cette connexion. Ce n'est pas un
+  problème de tvsign et insister l'aggrave (Apple limite les essais) : attendez plusieurs heures, depuis
+  un autre réseau si possible, puis connectez-vous une seule fois. Les apps déjà installées continuent
+  de fonctionner jusqu'à leur expiration.
+- **HTTP 503** : les serveurs d'Apple sont chargés (tvsign réessaie seul quelques fois), ou le serveur
+  anisette n'est pas accepté : vérifiez que le champ des Réglages est vide. Réglages › Diagnostic
+  indique si le serveur anisette répond et fournit des données Windows.
 
 Compiler soi-même : voir [docs/building.md](docs/building.md).
 

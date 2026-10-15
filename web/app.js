@@ -90,6 +90,12 @@ const CAUSES = [
   [/aucun compte Apple/i, "c_no_account"],
   [/compte .*déconnecté|reconnecte-le/i, "c_disconnected"],
   [/compte .*(introuvable|retiré)|account .*not found/i, "c_account_missing"],
+  // refus d'Apple et problèmes d'anisette précis : avant les règles générales (anisette, session)
+  [/-80045|cannot be completed at this time/i, "c_apple_blocked"],
+  [/(GrandSlam|GSA) (answered|returned) HTTP (429|50[234])|Apple answered HTTP (429|50[234]) to the anisette|Apple répond HTTP (429|50[234])|50[234] Service Temporarily Unavailable/i, "c_gsa_503"],
+  [/SMS 2FA refused|Access to this Apple Developer Service was denied|refuse les codes par SMS/i, "c_sms_denied"],
+  [/-22411\b/, "c_never_signed_in"],
+  [/-22421\b|-22409\b|-80009\b|MID is invalid|-45061|not provisioned/i, "c_anisette_refused"],
   [/anisette/i, "c_anisette"],
   [/reconnexion|-22406|HTTP Some\(401\)|unauthori[sz]ed|session .*(expir|invalid)|not logged|log ?in required/i, "c_session"],
   [/plumesign occupé/i, "c_busy"],
@@ -107,6 +113,10 @@ const CAUSES = [
   [/IPA d'origine absente/, "c_ipa_missing"],
   [/aucune IPA|HTTP Error 4\d\d|téléchargement|download|pas une app tvOS|IPA|https:\/\/ sont acceptées/, "c_source"],
 ];
+// Lignes de journal de plumesign (« [2026-10-15T19:40:36Z WARN  omnisette::… ] … »), qui racontent un repli ou un
+// nouvel essai : seule l'erreur finale dit pourquoi la connexion a échoué.
+const LIGNE_JOURNAL = /^\[\d{4}-\d\d-\d\dT[\d:.]+Z\s+(INFO|WARN|DEBUG|TRACE)\b/;
+const erreursSeules = (log) => String(log || "").split("\n").filter((l) => !LIGNE_JOURNAL.test(l)).join("\n").trim();
 function nettoyer(msg) {
   return String(msg || "")
     .replace(/^[^:]{1,60} : échec, /, "")
@@ -438,7 +448,7 @@ function renderAccounts(s, now) {
       : a.ok === 0 ? `<span class="etat etat--err">${t("acc_off")}</span>`
       : a.checked_at ? `<span class="etat etat--neutre">${t("acc_unknown")}</span>` : `<span class="etat etat--neutre">${t("acc_unchecked")}</span>`;
     const note = a.ok == null && a.checked_at && a.message ? `<p class="row__sub">${esc(t("acc_retry_later", { why: enClair(a.message).titre }))}</p>`
-      : a.ok === 0 && a.message ? `<p class="row__sub texte-err">${esc(nettoyer(a.message))}</p>` : "";
+      : a.ok === 0 ? `<p class="row__sub texte-err">${esc(t("acc_reauth_reason"))}</p>` : "";
     return `<div class="row">
       <span class="row__icon row__icon--${a.ok === 0 ? "red" : a.ok === 1 ? "blue" : "gray"}">${ICONS.user}</span>
       <div class="row__label">
@@ -801,6 +811,7 @@ function annulerSession(cle) {
 function invite(sess) {
   if (sess.kind === "pair") return "";
   const p = String(sess.prompt || "").replace(/^\[[^\]]*\]\s*/, "").trim();
+  if (/SMS refused/i.test(p)) return t("prompt_device_sms_denied");
   if (/via SMS/i.test(p)) return t("prompt_sms");
   if (/type 'sms'/i.test(p)) return t("prompt_device_or_sms");
   if (/2FA|code/i.test(p)) return t("prompt_device");
@@ -857,7 +868,7 @@ function watchSession(sess, box, { cle, label, doneText, numerique, onEnd }) {
     if (sess.state === "done") { statut(`<span class="etat etat--ok">${esc(doneText)}</span>`); return fin(true); }
     if (sess.state === "failed") {
       const log = (sess.log || []).join("\n");
-      const e = enClair(log);
+      const e = enClair(erreursSeules(log) || log);
       box.innerHTML = `<p class="statut"><span class="etat etat--err">${t("failed")}</span></p>
         ${e.connu ? `<p class="code__invite"><strong>${esc(e.titre)}.</strong> ${esc(e.conseil)}</p>` : ""}
         <pre class="log">${esc(log)}</pre>`;

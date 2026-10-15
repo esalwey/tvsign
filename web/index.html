@@ -141,9 +141,9 @@
       <section class="group">
         <h2 class="group__header" data-i18n="signing_service">Signing service</h2>
         <div class="list">
-          <label class="field"><span data-i18n="anisette_server">Anisette server</span><input name="anisette_url" type="url" placeholder="https://ani.sidestore.app" autocomplete="off" spellcheck="false"></label>
+          <label class="field"><span data-i18n="anisette_server">Anisette server</span><input name="anisette_url" type="url" placeholder="https://ani.jkcoxson.com" autocomplete="off" spellcheck="false"></label>
         </div>
-        <p class="group__footer" data-i18n="anisette_note">Used to sign in to Apple. Leave empty for the default server, or point to your own anisette-v3 server.</p>
+        <p class="group__footer" data-i18n="anisette_note">Used to sign in to Apple. Leave empty: tvsign uses ani.jkcoxson.com and switches to ani2.stikstore.app if it doesn't answer. A custom server must provide Windows anisette-v3 data (Apple refuses Android servers).</p>
       </section>
       <p class="erreur" id="reglages-error" role="alert"></p>
       <div class="actions-form"><button class="btn btn--primary" id="reglages-submit" data-i18n="save">Save</button></div>

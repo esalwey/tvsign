@@ -17,6 +17,10 @@ scripts\vendor-impactor.ps1 [-ImpactorDir path] [-Ref ref]   # Windows
 Only committed files are copied (`git archive`), never `target/` or local edits. The source commit
 is recorded in `vendor/Impactor/VENDORED.txt`.
 
+Some changes were made in place, not in the fork (for instance the Windows anisette of 1.0.1):
+[`vendor/Impactor/PATCHES.md`](../vendor/Impactor/PATCHES.md) lists them. Port them to the fork before
+the next run of the script, otherwise the script overwrites them.
+
 ## 2. Docker image
 
 ```sh
@@ -64,12 +68,25 @@ uv pip compile requirements.txt --universal --python-version 3.13 --generate-has
 
 ## 5. Logic tests
 
-No Docker, plumesign or Apple TV needed (renewal decisions, notifications, API validation):
+No Docker, plumesign or Apple TV needed (renewal decisions, notifications, API validation, the
+classification of Apple's errors, the anisette server setting):
 
 ```sh
 pip install -r requirements.txt httpx
 python -m unittest discover -s tests
 ```
+
+The Rust side of the sign-in (anisette servers, GrandSlam answers, two-factor decisions) has unit tests
+that need no network either:
+
+```sh
+cd vendor/Impactor
+cargo test -p plume_core
+cargo test -p omnisette -p plumesign -- --skip fetch_anisette_remote_v3 --skip fetch_anisette_ssc_async
+```
+
+The two skipped tests of `omnisette` talk to the Internet / need Android libraries. They are older than
+tvsign and were already failing without them.
 
 ## 6. CI
 

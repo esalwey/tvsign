@@ -9,6 +9,7 @@
 accounts.json
 accounts.json.bak
 state.plist
+anisette-state-*.plist
 remotepairing/
 setup-code.txt
 secret.key
