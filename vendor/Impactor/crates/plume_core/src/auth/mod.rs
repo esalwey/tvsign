@@ -1,5 +1,6 @@
 pub mod account;
 pub mod anisette_data;
+pub mod probe;
 
 use omnisette::AnisetteConfiguration;
 use reqwest::Client;

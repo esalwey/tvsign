@@ -4,6 +4,7 @@ pub mod account;
 pub mod device;
 pub mod macho;
 pub mod pair;
+pub mod probe;
 pub mod sign;
 
 #[derive(Debug, Parser)]
@@ -32,4 +33,7 @@ pub enum Commands {
     Device(device::DeviceArgs),
     /// Pair with a device over the network
     Pair(pair::PairArgs),
+    /// Send the SRP init request of GrandSlam for a throwaway Apple ID and print the answer (diagnostic)
+    #[command(hide = true)]
+    ProbeGsa(probe::ProbeArgs),
 }

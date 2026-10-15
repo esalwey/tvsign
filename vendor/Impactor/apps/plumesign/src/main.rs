@@ -20,6 +20,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Account(args) => commands::account::execute(args).await?,
         Commands::Device(args) => commands::device::execute(args).await?,
         Commands::Pair(args) => commands::pair::execute(args).await?,
+        Commands::ProbeGsa(args) => commands::probe::execute(args).await?,
     }
 
     Ok(())

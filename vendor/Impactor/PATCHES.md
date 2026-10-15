@@ -128,3 +128,14 @@ Reference implementation (MIT): [isideload](https://github.com/nab138/isideload)
 `Authentication SRP error -22411: ...`, `-22421` / `-22409` / `-80009`, `Anisette not provisioned!`,
 `Anisette error: ...`, and the prompt `Enter 2FA code from a trusted Apple device (SMS refused by Apple):`.
 Changing one of these strings means changing `tests/test_hotfix.py` and `web/app.js` (`CAUSES`).
+
+## Diagnostic: `plumesign probe-gsa` (hidden)
+
+`crates/plume_core/src/auth/probe.rs`, `apps/plumesign/src/commands/probe.rs`
+
+Sends the SRP `init` request of GrandSlam for a throwaway Apple ID (`tvsign-probe-...@example.com`, no
+password, no `complete` step) with the anisette data of `--server` (used as given: no Android
+replacement, no fallback; `--legacy-user-agent` sends the fixed macOS user agent of tvsign 1.0.0) and
+prints the headers, `ec`/`em`/`hsc` and the HTTP status. A first answer hsc 434 is followed once (new
+identity). At most two requests to Apple per run, no retry. An account-level answer (-20970, salt and
+B...) means the configuration is accepted; -80045 or an HTML 503 means it is refused.
