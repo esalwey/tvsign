@@ -171,6 +171,67 @@ Notifications (ntfy): the topic name acts as a password on the public ntfy.sh, a
 your Apple ID and your apps: pick a long random topic, or use a self-hosted ntfy. A protected
 server can be reached with `https://user:password@host/topic` (sent as Basic authentication).
 
+### How renewals behave
+
+- Renewals run side by side: an app waiting for the Apple TV (or for you to close it) never delays
+  the others, the expiry alerts or the account checks. The most urgent app is always started first.
+- After a failure tvsign retries with a growing delay (10, 20, 40 min… up to `TVSIGN_RETRY_MINUTES`,
+  45 by default; 5 to 15 min when the cause is passing, such as the TV asleep or the anisette server
+  down; 10 min at most in the last 12 hours). A failure only you can fix (Apple session expired,
+  pairing lost, free-account limit, no Apple TV or `.ipa`) shows **Action needed** on the card and
+  is not retried blindly; reconnecting the account, pairing again, editing the app or pressing
+  **Renew** resumes it at once.
+- A session marked expired is checked again with Apple before an app is refused, and a failed
+  check is not final: one passing network or anisette error cannot lock renewals for hours.
+- The card shows the version actually installed on the Apple TV ("1.0 installed · 1.1 pending")
+  until the new one is installed.
+- **Renewal time window** (Settings): restrict non-urgent renewals and updates to certain hours,
+  e.g. 02:00 to 06:00 (`TVSIGN_RENEW_WINDOW_START` / `TVSIGN_RENEW_WINDOW_END`, local time).
+  It never applies in the last 24 hours before expiry, nor to a manual renewal.
+- Loop and limits for tuning: `TVSIGN_CHECK_INTERVAL` (600 s, at least 30), `TVSIGN_RETRY_MINUTES`
+  (45, at least 5), `TVSIGN_ACCOUNT_CHECK_HOURS` (6, at least 1). An unreadable or out-of-range value
+  is replaced by the default (or clamped) with a warning in the log.
+
+### Free Apple ID limits
+
+A free account allows **3 active apps per Apple TV** and **10 App IDs per 7 days** (each extension,
+such as a TopShelf extension, uses one more). Apps installed with other tools (SideStore, AltStore,
+Xcode) count too. tvsign shows "active apps 2/3" per Apple TV on the account card and warns when
+you add a fourth. When Apple or the Apple TV refuses ("maximum number of installed apps…"), the
+app shows **Action needed** with the explanation and tvsign waits 24 hours instead of using up more
+App IDs. Free a slot (**Pause** an app, or remove it from the Apple TV) then press **Renew**.
+
+### Several anisette servers
+
+`TVSIGN_ANISETTE_URL` (or Settings › Signing service) accepts several addresses separated by spaces:
+if the first server is down, the next one takes over and is tried first from then on. Diagnostics
+lists each server with its response time. To run your own, `docker compose --profile anisette up -d`
+starts a local anisette-v3 server (`dadoum/anisette-v3-server`) on `127.0.0.1:6969`; put
+`http://127.0.0.1:6969` in the setting (host network: tvsign reaches it on loopback).
+
+### Forgot the admin password
+
+Run on the host that runs tvsign, as the data owner (not root):
+
+```sh
+docker exec -it -u 1000:1000 tvsign python -m app reset-password     # your PUID:PGID
+```
+
+It asks for a new password and signs every browser out. (The Windows edition's own window is trusted:
+Settings › Security changes the password without asking for the old one.) If the password comes from
+`TVSIGN_PASSWORD` or `TVSIGN_PASSWORD_FILE`, change that value and restart instead. A
+`TVSIGN_PASSWORD_FILE` that cannot be read (wrong path, a root-only secret while tvsign runs as
+`PUID`) is reported in the log and in Diagnostics: the preset password is **not** applied then.
+
+Sign out only ends the session of the browser you click it in (a copied cookie stops working);
+**Sign out everywhere** also ends all the others. Backups no longer contain the admin password hash.
+
+### Pairing identity
+
+Each installation presents its own host name to the Apple TV when pairing (`tvsign-xxxx`, picked once
+and kept with the database and backups) so that two instances do not share one identity; override
+with `TVSIGN_PAIR_HOST`. Apple TVs already paired keep the name they were paired with.
+
 Building from source: see [docs/building.md](docs/building.md).
 
 ---
@@ -340,6 +401,76 @@ conservé. À l'arrêt, un renouvellement en cours peut finir pendant `TVSIGN_SH
 Notifications (ntfy) : sur ntfy.sh public, le nom du sujet fait office de mot de passe, et les messages
 citent votre Apple ID et vos apps : choisir un sujet long et aléatoire, ou un ntfy auto-hébergé. Un
 serveur protégé s'utilise avec `https://utilisateur:motdepasse@hôte/sujet` (envoyé en authentification Basic).
+
+### Comportement des renouvellements
+
+- Les renouvellements tournent en parallèle : une app qui attend l'Apple TV (ou que vous la fermiez)
+  ne retarde jamais les autres, les alertes d'expiration ni les contrôles de compte. L'app la plus
+  proche de l'expiration démarre toujours en premier.
+- Après un échec, tvsign réessaie avec un délai croissant (10, 20, 40 min… jusqu'à
+  `TVSIGN_RETRY_MINUTES`, 45 par défaut ; 5 à 15 min quand la cause est passagère, comme une TV en
+  veille ou un serveur anisette en panne ; 10 min au plus pendant les 12 dernières heures). Un échec
+  que vous seul pouvez régler (session Apple expirée, appairage perdu, limite du compte gratuit,
+  pas d'Apple TV ni d'`.ipa`) affiche **Action requise** sur la carte et n'est pas réessayé à
+  l'aveugle ; reconnecter le compte, réappairer, modifier l'app ou toucher **Renouveler** le relance
+  aussitôt.
+- Une session marquée expirée est revérifiée auprès d'Apple avant de refuser une app, et une
+  vérification ratée n'est pas définitive : une panne passagère du réseau ou de l'anisette ne peut
+  plus bloquer les renouvellements pendant des heures.
+- La carte affiche la version réellement installée sur l'Apple TV (« 1.0 installée · 1.1 en
+  attente ») tant que la nouvelle n'est pas installée.
+- **Plage horaire des renouvellements** (Réglages) : limite les renouvellements et mises à jour non
+  urgents à certaines heures, par exemple de 2 h à 6 h (`TVSIGN_RENEW_WINDOW_START` /
+  `TVSIGN_RENEW_WINDOW_END`, heure locale). Elle ne s'applique jamais dans les 24 dernières heures
+  avant l'expiration, ni à un renouvellement manuel.
+- Réglages de la boucle : `TVSIGN_CHECK_INTERVAL` (600 s, au moins 30), `TVSIGN_RETRY_MINUTES` (45,
+  au moins 5), `TVSIGN_ACCOUNT_CHECK_HOURS` (6, au moins 1). Une valeur illisible ou hors limites est
+  remplacée par le défaut (ou ramenée à la limite) avec un avertissement dans le journal.
+
+### Limites d'un Apple ID gratuit
+
+Un compte gratuit permet **3 apps actives par Apple TV** et **10 App ID par 7 jours** (chaque
+extension, comme une extension TopShelf, en consomme un de plus). Les apps installées avec d'autres
+outils (SideStore, AltStore, Xcode) comptent aussi. tvsign affiche « apps actives 2/3 » par Apple TV
+sur la carte du compte et prévient à l'ajout d'une quatrième. Quand Apple ou l'Apple TV refuse
+(« maximum number of installed apps… »), l'app affiche **Action requise** avec l'explication et
+tvsign attend 24 heures au lieu d'épuiser d'autres App ID. Libérez une place (**Pause** d'une app,
+ou suppression sur l'Apple TV) puis touchez **Renouveler**.
+
+### Plusieurs serveurs anisette
+
+`TVSIGN_ANISETTE_URL` (ou Réglages › Service de signature) accepte plusieurs adresses séparées par
+des espaces : si le premier serveur tombe, le suivant prend le relais et passe en premier ensuite. Le
+diagnostic liste chaque serveur avec son temps de réponse. Pour héberger le vôtre,
+`docker compose --profile anisette up -d` lance un serveur anisette-v3 local
+(`dadoum/anisette-v3-server`) sur `127.0.0.1:6969` ; indiquer `http://127.0.0.1:6969` dans le réglage
+(réseau hôte : tvsign l'atteint en boucle locale).
+
+### Mot de passe administrateur oublié
+
+À lancer sur la machine qui héberge tvsign, avec l'utilisateur propriétaire des données (pas root) :
+
+```sh
+docker exec -it -u 1000:1000 tvsign python -m app reset-password     # vos PUID:PGID
+```
+
+La commande demande un nouveau mot de passe et déconnecte tous les navigateurs. (La fenêtre de
+l'édition Windows est de confiance : Réglages › Sécurité change le mot de passe sans demander
+l'ancien.) Si le mot de passe vient de `TVSIGN_PASSWORD` ou `TVSIGN_PASSWORD_FILE`, modifier cette valeur et redémarrer.
+Un `TVSIGN_PASSWORD_FILE` illisible (mauvais chemin, secret réservé à root alors que tvsign tourne
+en `PUID`) est signalé dans le journal et dans le diagnostic : le mot de passe prévu n'est alors
+**pas** appliqué.
+
+« Se déconnecter » ne ferme que la session du navigateur utilisé (un cookie copié cesse de
+fonctionner) ; **Se déconnecter partout** ferme aussi toutes les autres. Les sauvegardes ne
+contiennent plus l'empreinte du mot de passe administrateur.
+
+### Identité d'appairage
+
+Chaque installation présente son propre nom d'hôte à l'Apple TV lors de l'appairage (`tvsign-xxxx`,
+choisi une fois et conservé avec la base et les sauvegardes) pour que deux instances ne partagent pas
+la même identité ; `TVSIGN_PAIR_HOST` le remplace. Les Apple TV déjà appairées gardent le nom avec
+lequel elles l'ont été.
 
 Compiler soi-même : voir [docs/building.md](docs/building.md).
 
