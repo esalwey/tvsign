@@ -11,8 +11,8 @@ from . import db
 
 
 class Spec:
-    def __init__(self, default, kind, envs, check=None):
-        self.default, self.kind, self.envs, self.check = default, kind, envs, check
+    def __init__(self, default, kind, envs, check=None, norm=None):
+        self.default, self.kind, self.envs, self.check, self.norm = default, kind, envs, check, norm
 
 
 def _url(value: str) -> None:
@@ -31,12 +31,27 @@ def _language(value: str) -> None:
         raise ValueError("auto, en ou fr")
 
 
+_ON = ("on", "1", "true", "yes")
+_OFF = ("off", "0", "false", "no")
+
+
+def _onoff(value: str) -> None:
+    if value.lower() not in _ON + _OFF:
+        raise ValueError("on ou off")
+
+
+def _onoff_norm(value: str) -> str:
+    return "on" if value.lower() in _ON else "off"
+
+
 PUBLIC: dict[str, Spec] = {
     "language": Spec("auto", str, ["TVSIGN_LANGUAGE"], _language),
     "ntfy_url": Spec("", str, ["TVSIGN_NTFY_URL"], _url),
     "renew_before_hours": Spec(60.0, float, ["TVSIGN_RENEW_BEFORE_HOURS"], _hours),
     # vide = serveur par défaut de plumesign (https://ani.sidestore.app)
     "anisette_url": Spec("", str, ["TVSIGN_ANISETTE_URL", "PLUMESIGN_ANISETTE_URL", "ANISETTE_URL_V3"], _url),
+    # annonce d'une nouvelle version de tvsign (une requête GET vers api.github.com toutes les 6 h)
+    "update_check": Spec("on", str, ["TVSIGN_UPDATE_CHECK"], _onoff, _onoff_norm),
 }
 
 
@@ -70,7 +85,7 @@ def _convert(spec: Spec, raw):
         value = str(raw if raw is not None else "").strip()
     if spec.check:
         spec.check(value)
-    return value
+    return spec.norm(value) if spec.norm else value
 
 
 # ---------- internal key/value ----------
@@ -154,3 +169,7 @@ def ntfy_url() -> str:
 
 def anisette_url() -> str:
     return get("anisette_url")
+
+
+def update_check_enabled() -> bool:
+    return get("update_check") == "on"

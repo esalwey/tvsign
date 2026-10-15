@@ -7,13 +7,17 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
+from . import winjob
+
 # Windows : pas de fenêtre console qui clignote à chaque appel de plumesign (app lancée depuis le tray).
 _FLAGS = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 
 
 async def _exec(*args, **kw) -> asyncio.subprocess.Process:
     try:
-        return await asyncio.create_subprocess_exec(*map(str, args), **kw, **_FLAGS)
+        child = await asyncio.create_subprocess_exec(*map(str, args), **kw, **_FLAGS)
+        winjob.adopt(child.pid)        # Windows : l'enfant ne survit pas à tvsign (Job « kill on close »)
+        return child
     except NotImplementedError:
         # SelectorEventLoop sous Windows (uvicorn --reload/--workers) : pas de sous-processus
         raise RuntimeError("boucle asyncio sans sous-processus : lancer tvsign avec « python -m app »") from None

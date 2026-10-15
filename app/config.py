@@ -123,5 +123,9 @@ DEVICE_TIMEOUT = int(_env("TVSIGN_DEVICE_TIMEOUT", "10"))
 # Name presented to the Apple TV when pairing (kept per device afterwards).
 PAIR_HOST = _env("TVSIGN_PAIR_HOST", "tvsign")
 
+# ---------- update check ----------
+# GitHub repository whose latest release is compared with VERSION (setting "update_check" turns it off).
+UPDATE_REPO = _env("TVSIGN_UPDATE_REPO", "esalwey/tvsign")
+
 for d in (DATA_DIR, IPA_DIR, PLUME_HOME, TMP_DIR):
     d.mkdir(parents=True, exist_ok=True)

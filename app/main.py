@@ -16,8 +16,8 @@ from pydantic import BaseModel
 from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import auth, backup, db, devices, diag, ipa, plume, proc, renew, settings
-from .config import MAX_UPLOAD_MB, ROOT, SHUTDOWN_DRAIN_SECONDS, TMP_DIR, VERSION
+from . import auth, backup, db, devices, diag, ipa, plume, proc, renew, settings, updates
+from .config import MAX_UPLOAD_MB, ROOT, SHUTDOWN_DRAIN_SECONDS, TMP_DIR, VERSION, WINDOWS
 from .proc import SESSIONS
 
 
@@ -167,6 +167,7 @@ def auth_status(request: Request):
         "authenticated": auth.authenticated(request),
         "onboarded": settings.raw_get("onboarded") == "1",
         "language": settings.get("language"),
+        "edition": "windows" if WINDOWS else "docker",
     }
 
 
@@ -324,6 +325,8 @@ def state():
         # moment où la boucle lancera le renouvellement automatique (None : dès que possible)
         a["renew_at"] = exp - before * 3600 if exp else None
         a["effective_account"] = a["account_email"] or default
+        # niveau d'alerte (fail | 24h | 6h | expired | None), même règle que ntfy : voir renew.alert_state
+        a["alert"] = renew.alert_state(a, now)
     health = renew.health(now)
     return {
         "now": now,
@@ -361,6 +364,12 @@ def api_health(request: Request):
     if not auth.authenticated(request):
         return UTF8JSON({"ok": not problems, "count": len(problems)}, status_code=code)
     return UTF8JSON({"ok": not problems, "count": len(problems), "problems": problems, **h}, status_code=code)
+
+
+@app.get("/api/update")
+async def update_status(refresh: bool = False):
+    """Nouvelle version de tvsign publiée sur GitHub ? Mise en cache 6 h ; jamais d'erreur HTTP."""
+    return await updates.check(force=refresh)
 
 
 # ---------- sessions interactives ----------

@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import json
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -101,6 +102,30 @@ def _level(app: dict, now: float) -> str:
     if left < 24 * 3600:
         return "24h"
     return "fail"
+
+
+# Message d'une TV injoignable (devices.Unreachable), relu depuis apps.last_error : « Apple TV « x » introuvable
+# sur le réseau… » ou « Apple TV « x » : délai dépassé… ». Sert à rester aussi discret que ntfy pour une TV en veille.
+_UNREACHABLE = re.compile(r"^Apple TV « .+ » (introuvable sur le réseau|: )")
+
+
+def unreachable_error(text: str | None) -> bool:
+    return bool(text and _UNREACHABLE.match(text))
+
+
+def alert_state(app: dict, now: float) -> str | None:
+    """Niveau d'alerte à montrer à l'utilisateur (fail, 24h, 6h, expired) ou None. Même règle que les
+    notifications ntfy : un échec « TV injoignable » loin de l'expiration n'est pas une alerte. Exposé dans
+    /api/state pour les notifications de l'icône Windows, qui ne doivent pas être plus bavardes que ntfy."""
+    exp = app.get("expires_at")
+    if exp and exp <= now:
+        return "expired"
+    if app.get("status") != "error":
+        return None
+    lvl = _level(app, now)
+    if lvl == "fail" and unreachable_error(app.get("last_error")):
+        return None
+    return lvl
 
 
 async def alert(app: dict, reason: str, now: float, quiet_fail: bool = False) -> None:
@@ -557,6 +582,25 @@ def health(now: float | None = None) -> dict:
             "release_check_minutes": RELEASE_CHECK_MINUTES, "account_check_hours": ACCOUNT_CHECK_HOURS}
 
 
+def suspended_for(expected_at: float | None, now: float, tolerance: float = 180.0) -> float:
+    """Secondes de retard d'un passage de la boucle sur l'heure prévue (0 si dans la tolérance) : l'horloge murale
+    a avancé sans que la boucle tourne, donc le PC était en veille ou hibernation, ou le processus arrêté."""
+    if not expected_at:
+        return 0.0
+    late = now - expected_at
+    return late if late > tolerance else 0.0
+
+
+def _duration(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 48:
+        return f"{hours} h {minutes:02d} min"
+    return f"{hours // 24} j {hours % 24} h"
+
+
 async def _guarded(what: str, coro) -> None:
     try:
         await coro
@@ -567,8 +611,14 @@ async def _guarded(what: str, coro) -> None:
 
 async def loop() -> None:
     last_account_check = last_release_check = 0.0
+    expected_at = None
     while True:
         now = time.time()
+        late = suspended_for(expected_at, now)
+        if late:
+            # PC en veille pendant la fenêtre de renouvellement : le journal l'explique, et les apps dues partent aussitôt
+            db.log(f"Aucune vérification depuis {_duration(late + CHECK_INTERVAL)} : le PC était sans doute en "
+                   "veille ; reprise des renouvellements", "warn")
         HEALTH["last_loop_at"] = now
         HEALTH["next_check_at"] = now + CHECK_INTERVAL
         HEALTH["loop_error"] = None
@@ -596,5 +646,5 @@ async def loop() -> None:
         except Exception as e:  # noqa: BLE001 - la boucle ne doit jamais s'arrêter
             HEALTH["loop_error"] = str(e)
             db.log(f"boucle de renouvellement : {e}", "error")
-        HEALTH["next_check_at"] = time.time() + CHECK_INTERVAL
+        expected_at = HEALTH["next_check_at"] = time.time() + CHECK_INTERVAL
         await asyncio.sleep(CHECK_INTERVAL)
