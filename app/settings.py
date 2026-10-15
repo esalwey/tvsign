@@ -1,5 +1,8 @@
 """User settings: environment variable > value stored in the database > default.
 
+Validation errors are stable codes (invalid_url, hours_range, language_value, number_expected,
+unknown_setting, locked_by_env:NAME) that the web interface translates (err_* in web/i18n.js).
+
 A setting fixed by the environment is shown read-only in the UI ("set by TVSIGN_...").
 The same table also holds internal values (admin password hash, onboarding flag...),
 which are never exposed through /api/settings.
@@ -17,18 +20,18 @@ class Spec:
 
 def _url(value: str) -> None:
     if value and not re.match(r"^https?://[^\s/]+", value):
-        raise ValueError("adresse http(s):// attendue")
+        raise ValueError("invalid_url")
 
 
 def _hours(value: float) -> None:
     # profil gratuit = 7 jours (168 h) ; garder au moins 12 h de marge et un renouvellement possible
     if not 12 <= value <= 150:
-        raise ValueError("entre 12 et 150 heures")
+        raise ValueError("hours_range")
 
 
 def _language(value: str) -> None:
     if value not in ("auto", "en", "fr"):
-        raise ValueError("auto, en ou fr")
+        raise ValueError("language_value")
 
 
 PUBLIC: dict[str, Spec] = {
@@ -65,7 +68,7 @@ def _convert(spec: Spec, raw):
         try:
             value = float(raw)
         except (TypeError, ValueError):
-            raise ValueError("nombre attendu") from None
+            raise ValueError("number_expected") from None
     else:
         value = str(raw if raw is not None else "").strip()
     if spec.check:
@@ -125,10 +128,10 @@ def update(values: dict) -> dict:
     for key, raw in values.items():
         spec = PUBLIC.get(key)
         if not spec:
-            errors[key] = "réglage inconnu"
+            errors[key] = "unknown_setting"
             continue
         if _env(spec):
-            errors[key] = f"défini par {_env(spec)[0]}"
+            errors[key] = f"locked_by_env:{_env(spec)[0]}"
             continue
         if raw is None or raw == "":
             todo[key] = None

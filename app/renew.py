@@ -186,7 +186,7 @@ async def refresh_source(app: dict) -> bool:
         if tag and isinstance(e, ValueError) and not isinstance(e, json.JSONDecodeError):
             # IPA invalide (pas une IPA, pas tvOS) : ne pas la retélécharger à chaque essai.
             # Le reste (coupure, réponse tronquée, JSON GitHub illisible) est passager : on réessaiera.
-            db.update("apps", app["id"], bad_tag=tag, bad_key=key)
+            db.update("apps", app["id"], bad_tag=tag, bad_key=key, bad_reason=str(e)[:500])
             db.log(f"{app['name']} : version {tag} inutilisable ({e}), version précédente conservée",
                    "warn", app_id=app["id"])
             await notify(f"{app['name']} : nouvelle version {tag} inutilisable ({e}), version précédente conservée")
@@ -195,7 +195,8 @@ async def refresh_source(app: dict) -> bool:
                    "warn", app_id=app["id"])
         return False
     db.update("apps", app["id"], source_tag=tag, source_key=key, version=info["version"],
-              bundle_id=info["bundle_id"], bad_tag=None, bad_key=None, source_sha256=info.get("sha256"))
+              bundle_id=info["bundle_id"], bad_tag=None, bad_key=None, bad_reason=None,
+              source_sha256=info.get("sha256"))
     return True
 
 

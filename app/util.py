@@ -1,5 +1,6 @@
 """Small file helpers shared by the backend."""
 import os
+import re
 import time
 from pathlib import Path
 
@@ -32,3 +33,17 @@ def write_private(path: Path, data: bytes | str) -> None:
         os.chmod(path, 0o600)
     except OSError:
         pass
+
+
+_REPO_URL = re.compile(r"^(?:https?://(?:www\.)?github\.com/|git@github\.com:)([\w.-]+)/([\w.-]+?)(?:\.git)?(?:/.*)?(?:[?#].*)?$", re.I)
+
+
+def normalize_repo(value: str | None) -> str:
+    """Dépôt GitHub collé depuis le navigateur (https://github.com/owner/projet, .git, /releases…)
+    ramené à owner/projet. Une saisie déjà au bon format n'est pas modifiée."""
+    v = (value or "").strip()
+    m = _REPO_URL.match(v)
+    if m:
+        return f"{m[1]}/{m[2]}"
+    v = v.rstrip("/")
+    return v[:-4] if v.lower().endswith(".git") else v

@@ -101,6 +101,9 @@ MIGRATIONS = [
     ("apps", "deferred_since", "REAL"),      # idem
     ("apps", "source_key", "TEXT"),          # identité du contenu téléchargé (empreinte, ETag…) : tag fixe, IPA remplacée
     ("apps", "bad_key", "TEXT"),             # identité de la release refusée (avec bad_tag)
+    ("apps", "bad_reason", "TEXT"),          # pourquoi cette release est refusée (affiché sur la carte)
+    ("apps", "on_tv", "INTEGER"),            # app trouvée (1) ou non (0) sur l'Apple TV à la dernière vérification
+    ("apps", "on_tv_checked_at", "REAL"),    # date de cette vérification
 ]
 
 

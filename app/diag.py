@@ -1,7 +1,8 @@
 """Environment diagnostics (onboarding and Settings › Diagnostics).
 
 Read-only checks: no Apple sign-in, no pairing, no connection to an Apple TV.
-Each check returns {id, status: ok|warn|error, detail, value}; the UI translates ids.
+Each check returns {id, status: ok|warn|error, detail, value, code}; the UI translates ids, and the
+codes of the checks whose detail sentence is in French (the detail stays as a fallback).
 """
 import asyncio
 import email.utils
@@ -19,8 +20,8 @@ from .config import DATA_DIR, PLUMESIGN, VERSION, WINDOWS
 DEFAULT_ANISETTE = "https://ani.sidestore.app"
 
 
-def _check(id_: str, status: str, detail: str = "", value=None) -> dict:
-    return {"id": id_, "status": status, "detail": detail, "value": value}
+def _check(id_: str, status: str, detail: str = "", value=None, code: str | None = None) -> dict:
+    return {"id": id_, "status": status, "detail": detail, "value": value, "code": code}
 
 
 def _head(url: str) -> tuple[int | None, float | None, str]:
@@ -40,10 +41,10 @@ def _head(url: str) -> tuple[int | None, float | None, str]:
 
 async def _plumesign() -> dict:
     if not PLUMESIGN.exists() and not shutil.which(str(PLUMESIGN)):
-        return _check("plumesign", "error", f"introuvable : {PLUMESIGN} (TVSIGN_PLUMESIGN)")
+        return _check("plumesign", "error", f"introuvable : {PLUMESIGN} (TVSIGN_PLUMESIGN)", code="missing")
     v = await plume.version()
     if not v:
-        return _check("plumesign", "error", f"{PLUMESIGN} ne répond pas à --version")
+        return _check("plumesign", "error", f"{PLUMESIGN} ne répond pas à --version", code="no_answer")
     return _check("plumesign", "ok", str(PLUMESIGN), v)
 
 
@@ -55,7 +56,8 @@ async def _mdns() -> dict:
     ours = sum(1 for d in found if d.get("udid"))
     pairable = sum(1 for d in found if d["kind"] == "pairable")
     detail = f"{len(found)} annonce(s), {ours} appairée(s) avec tvsign, {pairable} en attente d'appairage"
-    return _check("mdns", "ok" if found else "warn", detail, {"total": len(found), "ours": ours, "pairable": pairable})
+    return _check("mdns", "ok" if found else "warn", detail, {"total": len(found), "ours": ours, "pairable": pairable},
+                  code="found" if found else "none")
 
 
 def _tcp(host: str, port: int = 443) -> str:
@@ -89,7 +91,7 @@ def _disk() -> dict:
     free = shutil.disk_usage(DATA_DIR).free
     gb = free / 1e9
     status = "ok" if gb >= 1 else "warn" if gb >= 0.2 else "error"
-    return _check("disk", status, f"{gb:.1f} Go libres dans {DATA_DIR}", round(gb, 2))
+    return _check("disk", status, f"{gb:.1f} Go libres dans {DATA_DIR}", round(gb, 2), code="free")
 
 
 def _loop() -> dict:
@@ -98,7 +100,8 @@ def _loop() -> dict:
     name = type(asyncio.get_running_loop()).__name__
     ok = "Proactor" in name
     return _check("event_loop", "ok" if ok else "error",
-                  name + ("" if ok else " : sous-processus impossibles, lancer avec « python -m app »"))
+                  name + ("" if ok else " : sous-processus impossibles, lancer avec « python -m app »"),
+                  code=None if ok else "no_subprocess")
 
 
 async def run_all() -> dict:
@@ -113,11 +116,11 @@ async def run_all() -> dict:
     plumesign_, mdns, (apple, apple_date), (anis, _), (github, gh_date) = results
     server_date = apple_date or gh_date
     if server_date is None:
-        clock = _check("clock", "warn", "aucune date serveur disponible pour comparer")
+        clock = _check("clock", "warn", "aucune date serveur disponible pour comparer", code="no_date")
     else:
         skew = time.time() - server_date
         status = "ok" if abs(skew) < 120 else "error"
-        clock = _check("clock", status, f"écart {skew:+.0f} s avec l'heure d'Apple", round(skew))
+        clock = _check("clock", status, f"écart {skew:+.0f} s avec l'heure d'Apple", round(skew), code="skew")
     checks = [plumesign_, mdns, apple, anis, github, clock, _disk(), _loop()]
     return {
         "checks": checks,
