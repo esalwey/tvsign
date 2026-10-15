@@ -98,6 +98,8 @@ class WakeUp(unittest.TestCase):
         self.assertEqual(root.find("t:Actions/t:Exec/t:Command", ns).text, r"C:\Users\A & B\tvsign.exe")
         self.assertEqual(root.find("t:Actions/t:Exec/t:Arguments", ns).text, "--tray")
         self.assertEqual(root.find("t:Principals/t:Principal/t:RunLevel", ns).text, "LeastPrivilege")   # no admin
+        # no time limit: the instance started by the task may be the one real tvsign, never killed after minutes
+        self.assertEqual(root.find("t:Settings/t:ExecutionTimeLimit", ns).text, "PT0S")
         self.assertEqual(datetime.fromtimestamp(when).strftime("%Y-%m-%dT%H:%M:%S"), "2031-03-04T02:55:10")
 
     def test_task_xml_without_arguments(self):

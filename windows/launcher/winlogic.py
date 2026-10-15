@@ -70,7 +70,9 @@ def next_wake_at(apps: list[dict], now: float) -> float | None:
 
 def wake_task_xml(when: float, command: str, arguments: str = "", description: str = "") -> str:
     """One-shot scheduled task that wakes the PC (WakeToRun) and starts tvsign in the tray (no effect when it
-    already runs). Local time, current user, no administrator rights."""
+    already runs). Local time, current user, no administrator rights. No execution time limit (PT0S): when tvsign
+    was not running, the instance started by the task is the real one and must not be killed after a few minutes;
+    when it already runs, the second instance exits at once on the mutex."""
     start = datetime.fromtimestamp(when).strftime("%Y-%m-%dT%H:%M:%S")
     args = f"\n      <Arguments>{escape(arguments)}</Arguments>" if arguments else ""
     return f"""<?xml version="1.0" encoding="UTF-16"?>
@@ -98,7 +100,7 @@ def wake_task_xml(when: float, command: str, arguments: str = "", description: s
     <StartWhenAvailable>true</StartWhenAvailable>
     <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
     <WakeToRun>true</WakeToRun>
-    <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <Enabled>true</Enabled>
   </Settings>
   <Actions Context="Author">

@@ -83,7 +83,10 @@ try {
     if ($LASTEXITCODE -ne 0) { Fail 'could not generate the task XML' }
     schtasks /Create /TN 'tvsign wake smoke' /XML $xml /F | Out-Host
     if ($LASTEXITCODE -ne 0) { Fail 'schtasks rejected the wake-up task' }
-    schtasks /Query /TN 'tvsign wake smoke' /XML | Select-String 'WakeToRun>true' | Out-Null
+    $q = schtasks /Query /TN 'tvsign wake smoke' /XML | Out-String
+    if ($q -notmatch 'WakeToRun>true') { Fail 'the wake-up task does not wake the PC' }
+    # no execution time limit: the instance started by the task may be the one real tvsign
+    if ($q -notmatch 'ExecutionTimeLimit>PT0S<') { Fail 'the wake-up task has an execution time limit' }
     schtasks /Delete /TN 'tvsign wake smoke' /F | Out-Null
 
     Step 'tvsign.exe --quit'
