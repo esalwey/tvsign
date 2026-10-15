@@ -4,3 +4,4 @@ branch: tvsign
 date:   2026-10-06T22:55:00Z
 paths:  Cargo.toml Cargo.lock LICENSE README.md rustfmt.toml apps crates 3rdparty locales
 Regenerate with scripts/vendor-impactor.sh (or .ps1). Do not edit files here by hand.
+Exception for the tvsign 1.0.x fixes: PATCHES.md lists the in-place changes still to be ported to the fork.
