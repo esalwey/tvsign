@@ -435,6 +435,17 @@ class DueAndPresence(unittest.TestCase):
         asyncio.run(renew.presence_check())
         self.assertEqual(self.spawned, [])
 
+    def test_phone_with_a_lost_pairing_is_not_chased(self):
+        dev = add_device(udid="PRESENT-0007", pairing_lost=1)
+        a = self.app(dev, status="error", next_attempt_at=time.time() + 3000)
+        renew._ABSENT.add(a)
+
+        async def discover(seconds=6):
+            raise AssertionError("un appairage perdu ne se règle pas en réessayant")
+        plume.discover = discover
+        asyncio.run(renew.presence_check())
+        self.assertEqual(self.spawned, [])
+
     def test_recent_attempt_is_not_repeated(self):
         dev = add_device(udid="PRESENT-0005")
         a = self.app(dev, status="error", next_attempt_at=time.time() + 3000, last_attempt_at=time.time() - 60)

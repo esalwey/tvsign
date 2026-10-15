@@ -264,8 +264,10 @@ async def _beta_hint(app: dict) -> str:
     """Canal stable sans release : indique si le canal beta, lui, en a une."""
     try:
         prefixes, prereleases = ipa.release_rule({**app, "channel": "beta"})
+        device = _device_of(app)
+        kw = {"family": device["family"]} if device and device.get("family") not in (None, "tvos") else {}
         found = await asyncio.to_thread(ipa.latest_github, app["source"], prefixes, prereleases,
-                                        app.get("asset_name"))
+                                        app.get("asset_name"), **kw)
     except Exception:  # noqa: BLE001 - simple indication
         return ""
     return f" ; une version beta existe ({found['tag']}) : choisis le canal Beta" if found else ""
@@ -676,7 +678,8 @@ async def presence_check() -> None:
     now = time.time()
     todo = []
     for app in db.rows("SELECT a.* FROM apps a JOIN devices d ON d.id = a.device_id "
-                       "WHERE a.enabled = 1 AND d.family IN ('ios', 'ipados')"):
+                       "WHERE a.enabled = 1 AND d.family IN ('ios', 'ipados') "
+                       "AND d.pairing_lost = 0 AND d.legacy_pairing = 0"):
         if not due(app, now, ignore_retry=True):
             continue
         waiting = app["next_attempt_at"] and app["next_attempt_at"] > now

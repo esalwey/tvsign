@@ -4,3 +4,6 @@ branch: tvsign
 date:   2026-10-06T22:55:00Z
 paths:  Cargo.toml Cargo.lock LICENSE README.md rustfmt.toml apps crates 3rdparty locales
 Regenerate with scripts/vendor-impactor.sh (or .ps1). Do not edit files here by hand.
+local patch (tvsign, iPhone/iPad): apps/plumesign/src/commands/pair.rs (pair usb|import|devmode, DeviceFamily), commands/account.rs (--platform),
+  crates/plume_core/src/developer/platform.rs (DeveloperPlatform::from_name), crates/plume_utils/src/wireless/usb.rs.
+  Port the same changes to the fork's tvsign branch before the next scripts/vendor-impactor run, or they are overwritten.
