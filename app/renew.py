@@ -585,7 +585,55 @@ async def _loop_app(app_id: int, check_releases: bool) -> None:
         await _guarded(f"renouvellement de {app['name']}", renew(app["id"], "nouvelle version"))
 
 
+# Une file par Apple TV (id de l'appareil, ou None pour une app sans TV). Une file encore en cours
+# au passage suivant n'est pas relancée : elle continue, les autres TV avancent.
+_QUEUES: dict = {}
+_RELEASES_MISSED: set = set()     # TV dont la vérification des nouvelles versions est tombée sur une file occupée
+QUEUE_GRACE_SECONDS = 120          # attente max. des files avant les contrôles de fin de passage
+
+
+async def _run_queue(ids: list[int], check_releases: bool) -> None:
+    try:
+        for app_id in ids:
+            if STOPPING:
+                break
+            await _loop_app(app_id, check_releases)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001 - une file qui plante ne doit pas affecter les autres TV
+        HEALTH["loop_error"] = f"file d'installation : {e}"
+        db.log(f"file d'installation : {e}", "error")
+
+
+def start_queues(check_releases: bool) -> list:
+    """Lance la file de chaque Apple TV dont la précédente est terminée ; renvoie les tâches en cours."""
+    queues: dict = {}
+    for app in db.rows("SELECT id, device_id FROM apps ORDER BY id"):
+        queues.setdefault(app["device_id"], []).append(app["id"])
+    for key in [k for k, t in _QUEUES.items() if t.done() and k not in queues]:
+        del _QUEUES[key]
+        _RELEASES_MISSED.discard(key)
+    for key, ids in queues.items():
+        task = _QUEUES.get(key)
+        if task is not None and not task.done():
+            if check_releases:
+                _RELEASES_MISSED.add(key)        # à refaire dès que cette TV est libre
+            continue
+        releases = check_releases or key in _RELEASES_MISSED
+        _RELEASES_MISSED.discard(key)
+        _QUEUES[key] = asyncio.create_task(_run_queue(ids, releases))
+    return [t for t in _QUEUES.values() if not t.done()]
+
+
 async def loop() -> None:
+    try:
+        await _loop()
+    finally:                      # arrêt : ne laisser aucune file orpheline
+        for t in _QUEUES.values():
+            t.cancel()
+
+
+async def _loop() -> None:
     last_account_check = last_release_check = 0.0
     while True:
         now = time.time()
@@ -601,19 +649,11 @@ async def loop() -> None:
             if check_releases:
                 last_release_check = HEALTH["last_release_check_at"] = now
             await _guarded("appairages des Apple TV", devices.check_store())
-            # une file par Apple TV, en parallèle : une installation qui attend sur une TV (app ouverte,
-            # jusqu'à 30 min) ne retarde plus les renouvellements des autres
-            queues: dict = {}
-            for app in db.rows("SELECT id, device_id FROM apps ORDER BY id"):
-                queues.setdefault(app["device_id"], []).append(app["id"])
-
-            async def run_queue(ids: list[int]) -> None:
-                for app_id in ids:
-                    if STOPPING:
-                        break
-                    await _loop_app(app_id, check_releases)
-
-            await asyncio.gather(*(run_queue(ids) for ids in queues.values()))
+            # une file par Apple TV, en parallèle et d'un passage à l'autre : une installation qui attend
+            # sur une TV (app ouverte, jusqu'à 30 min) ne retarde ni les autres TV ni les contrôles
+            running = start_queues(check_releases)
+            if running:
+                await asyncio.wait(running, timeout=QUEUE_GRACE_SECONDS)   # les cas courants finissent ici
             await _check_expired(time.time())
             await _guarded("vérification des apps installées", devices.audit_installed())
         except Exception as e:  # noqa: BLE001 - la boucle ne doit jamais s'arrêter
