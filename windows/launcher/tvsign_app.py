@@ -7,7 +7,10 @@
 The backend (app.main) runs in a background thread on 127.0.0.1, port 8765 when free, otherwise a
 random free port. The window signs in with a per-launch token (TVSIGN_LAUNCH_TOKEN); requests
 from loopback are trusted (TVSIGN_TRUST_LOOPBACK) until the user sets a password.
-Closing the window hides it; "Quit" in the tray menu stops everything.
+Closing the window hides it; "Quit" in the tray menu stops everything (a renewal in progress gets
+SHUTDOWN_DRAIN_SECONDS to finish). While a renewal runs or is about to, the PC is kept awake
+(SetThreadExecutionState); an opt-in tray option also schedules a wake-up for the next renewal.
+Pure decisions (when to stay awake, which toasts, log rotation...) live in winlogic.py.
 """
 from __future__ import annotations
 
@@ -20,19 +23,26 @@ import os
 import re
 import secrets
 import socket
+import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+import webbrowser
 from ctypes import wintypes
 from pathlib import Path
+
+import winlogic
 
 APP_NAME = "tvsign"
 MUTEX_NAME = "tvsign-desktop-instance"        # also AppMutex in the Inno Setup script
 SHOW_EVENT = "tvsign-desktop-show"
 QUIT_EVENT = "tvsign-desktop-quit"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+APPROVED_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+WEBVIEW2_URL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"    # Evergreen bootstrapper
+STARTUP_SETTINGS = "ms-settings:startupapps"
 DEFAULT_PORT = 8765
 FROZEN = bool(getattr(sys, "frozen", False))
 BUNDLE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -44,6 +54,12 @@ kernel32.CreateMutexW.restype = wintypes.HANDLE
 kernel32.CreateEventW.restype = wintypes.HANDLE
 kernel32.OpenEventW.restype = wintypes.HANDLE
 kernel32.OpenMutexW.restype = wintypes.HANDLE
+kernel32.SetThreadExecutionState.argtypes = [wintypes.DWORD]
+kernel32.SetThreadExecutionState.restype = wintypes.DWORD
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+SM_SHUTTINGDOWN = 0x2000
+CLOSE_REASON_WINDOWS_SHUTDOWN = 1       # System.Windows.Forms.CloseReason
 ERROR_ALREADY_EXISTS = 183
 EVENT_MODIFY_STATE = 0x0002
 SYNCHRONIZE = 0x00100000
@@ -65,12 +81,8 @@ def setup_logging(folder: Path) -> Path:
     logs = folder / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     log = logs / "tvsign.log"
-    try:
-        if log.exists() and log.stat().st_size > 2 * 1024 * 1024:
-            os.replace(log, logs / "tvsign.log.1")
-    except OSError:
-        pass
-    stream = open(log, "a", encoding="utf-8", buffering=1, errors="replace")
+    # 2 MB per file, tvsign.log.1 and .2 kept: the app runs for weeks without a restart
+    stream = winlogic.RotatingLog(log)
     if FROZEN or sys.stdout is None:
         sys.stdout = sys.stderr = stream
     return log
@@ -131,7 +143,31 @@ def watch_event(name: str, callback) -> None:
 
 
 def message_box(text: str, title: str = APP_NAME) -> None:
+    say(f"dialog: {text}")
+    if os.environ.get("TVSIGN_NO_DIALOGS"):        # CI: never block on a dialog
+        return
     user32.MessageBoxW(None, text, title, 0x10)   # MB_ICONERROR
+
+
+def ask_yes_no(text: str, title: str = APP_NAME) -> bool:
+    say(f"question: {text}")
+    if os.environ.get("TVSIGN_NO_DIALOGS"):
+        return False
+    return user32.MessageBoxW(None, text, title, 0x24) == 6   # MB_YESNO | MB_ICONQUESTION -> IDYES
+
+
+def keep_awake(on: bool) -> None:
+    """Called from one dedicated thread only: the execution state belongs to the calling thread."""
+    flags = ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if on else 0)
+    if not kernel32.SetThreadExecutionState(flags):
+        say("SetThreadExecutionState failed")
+
+
+def system_shutting_down() -> bool:
+    try:
+        return bool(user32.GetSystemMetrics(SM_SHUTTINGDOWN))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # ---------- autostart (HKCU Run) ----------
@@ -143,7 +179,7 @@ def autostart_command() -> str:
     return f'"{pyw if pyw.exists() else sys.executable}" "{Path(__file__).resolve()}" --tray'
 
 
-def autostart_enabled() -> bool:
+def _run_value_exists() -> bool:
     import winreg
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
@@ -153,11 +189,37 @@ def autostart_enabled() -> bool:
         return False
 
 
+def _approved_blob() -> bytes | None:
+    """The enabled/disabled flag Task Manager and Windows Settings set on a startup entry (no flag: enabled)."""
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, APPROVED_KEY) as k:
+            blob, kind = winreg.QueryValueEx(k, APP_NAME)
+            return bytes(blob) if kind == winreg.REG_BINARY else None
+    except OSError:
+        return None
+
+
+def autostart_enabled() -> bool:
+    return _run_value_exists() and winlogic.startup_approved(_approved_blob())
+
+
+def autostart_blocked() -> bool:
+    """The entry exists but the user switched it off in Windows: nothing starts at the next sign-in."""
+    return _run_value_exists() and not winlogic.startup_approved(_approved_blob())
+
+
 def set_autostart(enable: bool) -> None:
     import winreg
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
         if enable:
             winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, autostart_command())
+            # a "disabled" flag left by Windows Settings survives the removal of the Run value
+            try:
+                with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, APPROVED_KEY, 0, winreg.KEY_SET_VALUE) as a:
+                    winreg.SetValueEx(a, APP_NAME, 0, winreg.REG_BINARY, b"\x02" + b"\x00" * 11)
+            except OSError:
+                pass
         else:
             try:
                 winreg.DeleteValue(k, APP_NAME)
@@ -170,8 +232,12 @@ def set_autostart(enable: bool) -> None:
 LABELS = {
     "fr": {
         "open": "Ouvrir",
+        "browser": "Ouvrir dans le navigateur",
         "renew": "Renouveler maintenant",
         "autostart": "Démarrer avec Windows",
+        "autostart_blocked": "Démarrage désactivé dans Windows (ouvrir les réglages)",
+        "wake": "Réveiller le PC pour les renouvellements",
+        "update": "Nouvelle version {version} : télécharger",
         "quit": "Quitter",
         "tooltip": "tvsign",
         "hidden": "tvsign continue en arrière-plan pour renouveler vos apps. "
@@ -180,14 +246,28 @@ LABELS = {
         "renew_none": "Aucune app à renouveler.",
         "renew_failed": "Impossible de lancer le renouvellement : {err}",
         "app_failed": "{name} : le renouvellement a échoué.",
+        "app_expiring": "{name} : le profil expire bientôt et le renouvellement échoue. Ouvrez tvsign.",
         "app_expired": "{name} : le profil a expiré. Ouvrez tvsign.",
+        "app_recovered": "{name} : renouvelée.",
         "account_lost": "Compte Apple {email} : reconnexion nécessaire.",
+        "update_toast": "tvsign {version} est disponible. Clic droit sur l'icône pour la télécharger.",
+        "quitting_wait": "tvsign termine le renouvellement en cours avant de s'arrêter…",
+        "wake_failed": "Impossible de programmer le réveil du PC : {err}",
         "start_failed": "tvsign n'a pas pu démarrer son serveur local.\n\n{err}\n\nJournal : {log}",
+        "webview_missing": "tvsign a besoin de Microsoft Edge WebView2 pour afficher sa fenêtre, mais il est "
+                           "introuvable ou ne démarre pas.\n\n{err}\n\nOuvrir la page de téléchargement ?\n\n"
+                           "Dans tous les cas, tvsign reste actif près de l'horloge : clic droit sur l'icône, "
+                           "puis « Ouvrir dans le navigateur ».",
+        "webview_missing_toast": "WebView2 est introuvable. Clic droit sur l'icône, puis « Ouvrir dans le navigateur ».",
     },
     "en": {
         "open": "Open",
+        "browser": "Open in browser",
         "renew": "Renew now",
         "autostart": "Start with Windows",
+        "autostart_blocked": "Startup disabled in Windows (open settings)",
+        "wake": "Wake the PC for renewals",
+        "update": "New version {version}: download",
         "quit": "Quit",
         "tooltip": "tvsign",
         "hidden": "tvsign keeps running in the background to renew your apps. "
@@ -196,9 +276,19 @@ LABELS = {
         "renew_none": "No app to renew.",
         "renew_failed": "Could not start the renewal: {err}",
         "app_failed": "{name}: renewal failed.",
+        "app_expiring": "{name}: the profile expires soon and renewal is failing. Open tvsign.",
         "app_expired": "{name}: the profile has expired. Open tvsign.",
+        "app_recovered": "{name}: renewed.",
         "account_lost": "Apple account {email}: sign in again.",
+        "update_toast": "tvsign {version} is available. Right-click the icon to download it.",
+        "quitting_wait": "tvsign is finishing the renewal in progress before it stops…",
+        "wake_failed": "Could not schedule the PC wake-up: {err}",
         "start_failed": "tvsign could not start its local server.\n\n{err}\n\nLog: {log}",
+        "webview_missing": "tvsign needs Microsoft Edge WebView2 to show its window, but it is missing or "
+                           "does not start.\n\n{err}\n\nOpen the download page?\n\n"
+                           "Either way tvsign keeps running next to the clock: right-click the icon, then "
+                           "\"Open in browser\".",
+        "webview_missing_toast": "WebView2 is missing. Right-click the icon, then \"Open in browser\".",
     },
 }
 
@@ -220,6 +310,46 @@ class _RedactToken(logging.Filter):
         return True
 
 
+class _QuietPolling(logging.Filter):
+    """The launcher polls the API every minute (and an open window every few seconds): successful polls
+    stay out of the access log, which would otherwise fill up over weeks."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        a = record.args
+        if isinstance(a, tuple) and len(a) >= 5 and isinstance(a[2], str) and isinstance(a[4], int):
+            return not (a[4] < 400 and winlogic.quiet_access_path(a[2]))
+        return True
+
+
+# ---------- Task Scheduler (opt-in wake-up) ----------
+
+def wake_command() -> tuple[str, str]:
+    """What the scheduled task runs: tvsign in the tray (no effect when it already runs)."""
+    if FROZEN:
+        return sys.executable, "--tray"
+    pyw = Path(sys.executable).with_name("pythonw.exe")
+    return str(pyw if pyw.exists() else sys.executable), f'"{Path(__file__).resolve()}" --tray'
+
+
+def _schtasks(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["schtasks", *args], capture_output=True, text=True, timeout=30,
+                          creationflags=subprocess.CREATE_NO_WINDOW)
+
+
+def create_wake_task(when: float, folder: Path) -> None:
+    command, arguments = wake_command()
+    xml = winlogic.wake_task_xml(when, command, arguments)
+    path = folder / "wake-task.xml"
+    path.write_bytes(xml.encode("utf-16"))          # BOM + UTF-16, as the XML declaration says
+    r = _schtasks("/Create", "/TN", winlogic.WAKE_TASK, "/XML", str(path), "/F")
+    if r.returncode != 0:
+        raise OSError((r.stderr or r.stdout or f"schtasks exit {r.returncode}").strip())
+
+
+def delete_wake_task() -> None:
+    _schtasks("/Delete", "/TN", winlogic.WAKE_TASK, "/F")
+
+
 # ---------- the desktop application ----------
 
 class Desktop:
@@ -232,14 +362,21 @@ class Desktop:
         self.start_hidden = start_hidden
         self.lang = windows_language()
         self.quitting = False
+        self.session_ending = False    # Windows is shutting down / signing out: let the window close
+        self.fallback = False          # no WebView2: tray only, the UI opens in the default browser
         self.window = None
         self.icon = None
         self.server = None
         self.server_thread = None
         self.loaded = False            # window navigated to the launch URL yet
         self.ready = threading.Event()
+        self.stop = threading.Event()        # set by quit(): the main thread waits on it when there is no window
+        self.finished = threading.Event()    # set when everything is stopped (ends the keep-awake thread)
         self.prefs_path = data / "desktop.json"
         self.prefs = self._read_prefs()
+        self.apps: list[dict] = []           # apps of the last /api/state (keep-awake and wake-up decisions)
+        self.update: dict | None = None      # last /api/update answer when a newer version exists
+        self._wake_retry_at = 0.0
         self._lock = threading.Lock()
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -284,7 +421,9 @@ class Desktop:
             proxy_headers=False, server_header=False, log_level=os.environ.get("TVSIGN_LOG_LEVEL", "info"),
         )
         self.server = uvicorn.Server(config)
-        logging.getLogger("uvicorn.access").addFilter(_RedactToken())
+        access = logging.getLogger("uvicorn.access")
+        access.addFilter(_RedactToken())
+        access.addFilter(_QuietPolling())
 
         def run():
             try:
@@ -314,13 +453,25 @@ class Desktop:
         return False
 
     # ----- window -----
+    def launch_url(self) -> str:
+        return f"{self.base}/auth/launch?token={self.token}"
+
+    def open_browser(self) -> None:
+        """The UI in the default browser (loopback only): works without WebView2."""
+        self.ready.wait(60)
+        webbrowser.open(self.launch_url())
+
     def show(self) -> None:
-        if self.quitting or self.window is None:
+        if self.quitting:
+            return
+        if self.window is None:
+            if self.fallback:
+                self.open_browser()
             return
         with self._lock:
             if not self.loaded:
                 self.ready.wait(60)
-                self.window.load_url(f"{self.base}/auth/launch?token={self.token}")
+                self.window.load_url(self.launch_url())
                 self.loaded = True
         self.window.show()
         self.window.restore()
@@ -331,10 +482,25 @@ class Desktop:
             pass
 
     def on_closing(self):
-        if self.quitting:
+        if self.quitting or self.session_ending or system_shutting_down():
             return True
         threading.Thread(target=self._hide, daemon=True).start()
         return False                     # cancel the close: hide to the tray instead
+
+    def hook_form(self) -> None:
+        """Runs before the form is shown. pywebview's closing callback knows no close reason, so a Windows
+        shutdown or sign-out would be cancelled like a click on the X, and Windows would report that tvsign
+        prevents the shutdown. The WinForms event carries the reason: accept the close for a shutdown."""
+        try:
+            def form_closing(sender, args):
+                if int(args.CloseReason) == CLOSE_REASON_WINDOWS_SHUTDOWN:
+                    self.session_ending = True
+                    args.Cancel = False
+                    say("Windows is ending the session: closing")
+
+            self.window.native.FormClosing += form_closing
+        except Exception as e:  # noqa: BLE001 - the SM_SHUTTINGDOWN check in on_closing remains
+            say(f"close-reason hook unavailable: {e}")
 
     def _hide(self) -> None:
         self.window.hide()
@@ -358,11 +524,29 @@ class Desktop:
 
     def toggle_autostart(self) -> None:
         try:
+            if autostart_blocked():
+                os.startfile(STARTUP_SETTINGS)       # Windows owns that switch: send the user there
+                return
             set_autostart(not autostart_enabled())
         except OSError as e:
             say(f"autostart: {e}")
         if self.icon is not None:
             self.icon.update_menu()
+
+    def toggle_wake(self) -> None:
+        self.prefs["wake_pc"] = not self.prefs.get("wake_pc")
+        self._write_prefs()
+        if self.prefs["wake_pc"]:
+            self._sync_wake()
+        else:
+            self._clear_wake()
+        if self.icon is not None:
+            self.icon.update_menu()
+
+    def open_update(self) -> None:
+        url = (self.update or {}).get("url")
+        if url and url.startswith("https://"):
+            webbrowser.open(url)
 
     def quit(self) -> None:
         if self.quitting:
@@ -374,6 +558,53 @@ class Desktop:
                 self.window.destroy()    # webview.start() returns on the main thread
         except Exception as e:  # noqa: BLE001
             say(f"destroy: {e}")
+        self.stop.set()
+
+    # ----- keep awake / wake-up -----
+    def awake_loop(self) -> None:
+        """One thread owns the execution state (it is per thread). The PC stays awake while a renewal runs
+        or is about to start, and may sleep again afterwards. A sleep the user asks for (menu, lid, power
+        button) still wins: Windows does not let an application block those."""
+        on = None
+        while not self.finished.is_set():
+            need = winlogic.keep_awake_needed(self.apps, time.time())
+            if need != on:
+                say("keeping the PC awake" if need else "the PC may sleep again")
+                on = need
+            keep_awake(need)
+            self.finished.wait(15)
+        keep_awake(False)
+
+    def _clear_wake(self) -> None:
+        if self.prefs.pop("wake_at", None):
+            self._write_prefs()
+        try:
+            delete_wake_task()
+        except Exception as e:  # noqa: BLE001
+            say(f"wake task: {e}")
+
+    def _sync_wake(self) -> None:
+        """Keep one scheduled task, set a few minutes before the next renewal, in line with the apps."""
+        if not self.prefs.get("wake_pc"):
+            return
+        now = time.time()
+        want = winlogic.next_wake_at(self.apps, now)
+        have = self.prefs.get("wake_at")
+        if want is None:
+            if have:
+                self._clear_wake()
+            return
+        if (have and have > now and abs(want - have) < 300) or now < self._wake_retry_at:
+            return
+        try:
+            create_wake_task(want, self.data)
+            self.prefs["wake_at"] = want
+            self._write_prefs()
+            say("wake-up scheduled for " + time.strftime("%Y-%m-%d %H:%M", time.localtime(want)))
+        except Exception as e:  # noqa: BLE001
+            self._wake_retry_at = now + 600
+            say(f"wake task failed: {e}")
+            self.notify(self.t("wake_failed", err=e))
 
     # ----- tray icon -----
     def start_tray(self) -> None:
@@ -388,19 +619,29 @@ class Desktop:
         except Exception:  # noqa: BLE001
             image = Image.new("RGBA", (32, 32), (30, 30, 34, 255))
 
+        def autostart_label(_):
+            return self.t("autostart_blocked" if autostart_blocked() else "autostart")
+
+        def later(fn):
+            return lambda: threading.Thread(target=fn, daemon=True).start()
+
         item = pystray.MenuItem
         menu = pystray.Menu(
-            item(lambda _: self.t("open"), lambda: threading.Thread(target=self.show, daemon=True).start(),
-                 default=True),
-            item(lambda _: self.t("renew"), lambda: threading.Thread(target=self.renew_now, daemon=True).start()),
-            item(lambda _: self.t("autostart"), self.toggle_autostart, checked=lambda _: autostart_enabled()),
+            item(lambda _: self.t("open"), later(self.show), default=True),
+            item(lambda _: self.t("browser"), later(self.open_browser)),
+            item(lambda _: self.t("renew"), later(self.renew_now)),
+            item(lambda _: self.t("update", version=str((self.update or {}).get("latest", "")).lstrip("v")),
+                 self.open_update, visible=lambda _: bool(self.update)),
+            pystray.Menu.SEPARATOR,
+            item(autostart_label, self.toggle_autostart, checked=lambda _: autostart_enabled()),
+            item(lambda _: self.t("wake"), self.toggle_wake, checked=lambda _: bool(self.prefs.get("wake_pc"))),
             pystray.Menu.SEPARATOR,
             item(lambda _: self.t("quit"), self.quit),
         )
         self.icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
         threading.Thread(target=self.icon.run, name="tray", daemon=True).start()
 
-    # ----- background watcher: language + failure notifications -----
+    # ----- background watcher: language, notifications, wake-up, update check -----
     def watch(self) -> None:
         known: dict | None = None
         while not self.quitting:
@@ -413,29 +654,38 @@ class Desktop:
                     if self.icon is not None:
                         self.icon.update_menu()
                 state = self.api("GET", "/api/state")
-                snapshot = {}
-                for a in state.get("apps", []):
-                    snapshot[f"app:{a['id']}"] = ("expired" if a.get("expired") else a.get("status"), a["name"])
-                for acc in state.get("accounts", []):
-                    snapshot[f"acc:{acc['email']}"] = ("lost" if acc.get("ok") == 0 else "ok", acc["email"])
-                if known is not None:
-                    for key, (status, name) in snapshot.items():
-                        before = known.get(key, (None, None))[0]
-                        if status == before:
-                            continue
-                        if status == "error":
-                            self.notify(self.t("app_failed", name=name))
-                        elif status == "expired":
-                            self.notify(self.t("app_expired", name=name))
-                        elif status == "lost":
-                            self.notify(self.t("account_lost", email=name))
+                self.apps = state.get("apps", [])
+                snapshot = winlogic.snapshot(state)
+                # the alert level comes from the backend (same rule as ntfy): an Apple TV that is merely
+                # asleep does not raise a toast, and successive retries do not repeat it
+                for label, name in winlogic.toasts(known, snapshot):
+                    self.notify(self.t(label, name=name, email=name))
                 known = snapshot
+                self._sync_wake()
             except Exception as e:  # noqa: BLE001
                 say(f"watch: {e}")
+            self._check_update()
             for _ in range(60):
                 if self.quitting:
                     return
                 time.sleep(1)
+
+    def _check_update(self) -> None:
+        """New tvsign version (GitHub releases, cached by the backend): one toast per version, then a menu item."""
+        try:
+            u = self.api("GET", "/api/update", timeout=45)
+        except Exception as e:  # noqa: BLE001
+            say(f"update check: {e}")
+            return
+        newer = bool(u and u.get("newer"))
+        was = bool(self.update)
+        self.update = u if newer else None
+        if newer and self.prefs.get("update_notified") != u.get("latest"):
+            self.prefs["update_notified"] = u.get("latest")
+            self._write_prefs()
+            self.notify(self.t("update_toast", version=str(u.get("latest", "")).lstrip("v")))
+        if self.icon is not None and was != newer:
+            self.icon.update_menu()
 
     # ----- main -----
     def run(self) -> int:
@@ -443,6 +693,7 @@ class Desktop:
 
         self.start_server()
         threading.Thread(target=self._boot, daemon=True).start()
+        threading.Thread(target=self.awake_loop, name="awake", daemon=True).start()
         self.start_tray()
         watch_event(SHOW_EVENT, lambda: threading.Thread(target=self.show, daemon=True).start())
         watch_event(QUIT_EVENT, self.quit)
@@ -455,23 +706,52 @@ class Desktop:
             text_select=True,
         )
         self.window.events.closing += self.on_closing
+        self.window.events.before_show += self.hook_form
         storage = self.data / "webview"
         storage.mkdir(parents=True, exist_ok=True)
-        webview.start(func=None, gui="edgechromium", private_mode=False, storage_path=str(storage),
-                      debug=bool(os.environ.get("TVSIGN_WEBVIEW_DEBUG")))
-        # window destroyed: stop everything
+        try:
+            webview.start(func=None, gui="edgechromium", private_mode=False, storage_path=str(storage),
+                          debug=bool(os.environ.get("TVSIGN_WEBVIEW_DEBUG")))
+        except Exception as e:  # noqa: BLE001 - typically: the WebView2 runtime is missing
+            if self.quitting:
+                raise
+            self.no_webview(e)
+        # window destroyed (or Quit chosen without a window): stop everything
         self.quitting = True
         say("window closed, stopping")
         if self.server is not None:
             self.server.should_exit = True
         if self.server_thread is not None:
-            self.server_thread.join(timeout=15)
+            # a renewal in progress gets the backend's drain time (SHUTDOWN_DRAIN_SECONDS), not a few seconds
+            threading.Thread(target=self._announce_drain, daemon=True).start()
+            self.server_thread.join(timeout=winlogic.drain_wait_seconds())
+        self.finished.set()
+        if self.prefs.get("wake_at"):
+            self._clear_wake()                # a tvsign that was quit must not be restarted by its own wake-up
         if self.icon is not None:
             try:
                 self.icon.stop()
             except Exception:  # noqa: BLE001
                 pass
         return 0
+
+    def _announce_drain(self) -> None:
+        time.sleep(3)
+        if self.server_thread is not None and self.server_thread.is_alive() and not self.session_ending:
+            self.notify(self.t("quitting_wait"))
+
+    def no_webview(self, err: Exception) -> None:
+        """The window cannot be created: stay alive in the tray, UI in the default browser, until Quit."""
+        say(f"webview unavailable: {err!r}")
+        self.window = None
+        self.fallback = True
+        if self.start_hidden:
+            self.notify(self.t("webview_missing_toast"))
+        else:
+            if ask_yes_no(self.t("webview_missing", err=err)):
+                webbrowser.open(WEBVIEW2_URL)
+            threading.Thread(target=self.open_browser, daemon=True).start()
+        self.stop.wait()
 
     def _boot(self) -> None:
         if not self.wait_ready():
@@ -503,7 +783,8 @@ def main() -> int:
 
     if args.quit:
         if signal_event(QUIT_EVENT):
-            for _ in range(100):
+            # a renewal in progress may take the drain time to finish
+            for _ in range(int((winlogic.drain_wait_seconds() + 15) / 0.2)):
                 if not instance_running():
                     break
                 time.sleep(0.2)
