@@ -4,8 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#0063CC">
   <title>tvsign</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23007AFF' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><rect x='2.5' y='4' width='19' height='12.5' rx='2'/><path d='M8 20h8M12 16.5V20'/></svg>">
+  <link rel="manifest" href="/static/manifest.json">
+  <link rel="apple-touch-icon" href="/static/icon-180.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="tvsign">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -34,6 +39,7 @@
             <input name="confirm" type="password" autocomplete="new-password"></label>
         </div>
         <p class="group__footer" id="auth-note"></p>
+        <p class="avis" id="http-avis-auth" role="note" hidden data-i18n="http_warning"></p>
         <p class="erreur" id="auth-error" role="alert"></p>
         <button class="btn btn--primary btn--large" id="auth-submit"></button>
       </form>
@@ -60,10 +66,11 @@
     <header class="entete">
       <div class="entete__texte">
         <h1 class="page__title"><span class="point point--attente" id="etat-global" role="img" aria-label="…"></span>tvsign</h1>
-        <p class="page__sub" id="resume" data-i18n="loading_state">Loading…</p>
+        <p class="page__sub" id="resume"></p>
       </div>
       <div class="entete__actions">
         <a class="btn btn--icone" href="#/settings" id="lien-reglages" data-i18n-aria="settings" data-i18n-title="settings"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg></a>
+        <button class="btn" id="renew-all" data-renew-all="1" hidden data-i18n="renew_all_btn">Renew all</button>
         <button class="btn btn--primary" data-open="dlg-app" data-i18n="add_app">Add app</button>
       </div>
     </header>
@@ -136,6 +143,17 @@
           <label class="field"><span>ntfy</span><input name="ntfy_url" type="url" placeholder="https://ntfy.sh/…" autocomplete="off" spellcheck="false"></label>
         </div>
         <p class="group__footer"><span data-i18n="ntfy_note">Alerts when a renewal fails or an app is about to expire. Use a hard-to-guess topic.</span> <button class="lien lien--inline" type="button" id="ntfy-test" data-i18n="send_test">Send a test</button></p>
+        <details class="details ntfy-aide" id="ntfy-etapes">
+          <summary data-i18n="ntfy_help_t">What is ntfy?</summary>
+          <p data-i18n="ntfy_help_intro"></p>
+          <ol>
+            <li data-i18n="ntfy_step1"></li>
+            <li><span data-i18n="ntfy_step2"></span> <button class="lien lien--inline" type="button" id="ntfy-generate" data-i18n="ntfy_generate">Generate a private topic</button> <code class="mono" id="ntfy-sujet"></code></li>
+            <li data-i18n="ntfy_step3"></li>
+            <li data-i18n="ntfy_step4"></li>
+          </ol>
+          <p data-i18n="ntfy_help_health"></p>
+        </details>
       </section>
 
       <section class="group">
@@ -163,7 +181,7 @@
             <p class="row__sub" data-i18n="backup_export_sub">Database, Apple sessions, certificate keys and Apple TV pairings.</p>
             <label class="case"><input type="checkbox" id="backup-uploads"> <span data-i18n="backup_uploads">Include uploaded .ipa files</span></label>
           </div>
-          <div class="row__buttons"><a class="row__action row__action--go" id="backup-export" href="/api/backup/export" download data-i18n="export">Export</a></div>
+          <div class="row__buttons"><button class="row__action row__action--go" id="backup-export" type="button" data-i18n="export">Export</button></div>
         </div>
         <div class="row">
           <div class="row__label">
@@ -173,6 +191,7 @@
           <div class="row__buttons"><label class="row__action fichier"><input type="file" id="backup-file" accept=".tvsign-backup,.zip"><span data-i18n="choose_file">Choose file…</span></label></div>
         </div>
       </div>
+      <p class="erreur" id="backup-error" role="alert"></p>
       <p class="group__footer" data-i18n="backup_warning">A backup contains secrets: anyone holding it can use your Apple ID session. Keep it private, and never run two tvsign instances with the same Apple ID.</p>
     </section>
 
@@ -246,6 +265,7 @@
           <label class="field"><span>Apple TV</span><select name="device_id"></select></label>
           <label class="field"><span data-i18n="account">Account</span><select name="account_email"></select></label>
         </div>
+        <p class="group__footer" id="app-note" role="status"></p>
         <p class="erreur" id="app-error" role="alert"></p>
       </div>
     </form>
@@ -282,6 +302,15 @@
             <label class="field"><span data-i18n="address">Address</span><input name="source_url" type="url" autocomplete="off" spellcheck="false"></label>
           </div>
         </div>
+        <div data-for="upload">
+          <p class="group__header espace" data-i18n="ipa_file">.ipa file</p>
+          <div class="list">
+            <div class="row">
+              <div class="row__label"><p class="row__title" data-i18n="replace_file_t">New build</p><p class="row__sub" data-i18n="replace_file_sub"></p></div>
+              <div class="row__buttons"><label class="row__action fichier" id="edit-replace-label"><input type="file" id="edit-replace" accept=".ipa"><span data-i18n="replace_file">Replace the file…</span></label></div>
+            </div>
+          </div>
+        </div>
         <p class="erreur" id="edit-error" role="alert"></p>
       </div>
     </form>
@@ -307,16 +336,18 @@
   <dialog class="sheet" id="dlg-login" aria-labelledby="t-login">
     <form id="form-login" method="dialog">
       <header class="sheet__bar">
-        <button class="sheet__link" type="button" data-close data-i18n="cancel">Cancel</button>
+        <button class="sheet__link" type="button" id="login-cancel" data-close data-i18n="cancel">Cancel</button>
         <h2 id="t-login" data-i18n="apple_account">Apple account</h2>
         <button class="sheet__link sheet__link--done" id="login-submit" value="ok" data-i18n="sign_in">Sign in</button>
       </header>
       <div class="sheet__body">
         <div class="list">
-          <label class="field"><span>Apple ID</span><input name="email" type="email" required autocomplete="username" placeholder="name@example.com"></label>
+          <label class="field"><span>Apple ID</span><input name="email" type="text" inputmode="email" required autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="name@example.com"></label>
           <label class="field"><span data-i18n="password">Password</span><input name="password" type="password" required autocomplete="current-password"></label>
         </div>
         <p class="group__footer" data-i18n="login_note">Preferably use a dedicated Apple ID. The password is not stored: only the session token is.</p>
+        <p class="avis avis--revoque" role="note"><strong data-i18n="login_revoke_t"></strong> <span data-i18n="login_revoke"></span></p>
+        <p class="avis" id="http-avis-login" role="note" hidden data-i18n="http_warning"></p>
         <div id="login-session" aria-live="polite"></div>
         <p class="erreur" id="login-error" role="alert"></p>
       </div>
@@ -326,6 +357,7 @@
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
   <script src="/static/i18n.js"></script>
+  <script src="/static/errors.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

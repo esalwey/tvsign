@@ -12,6 +12,9 @@ let FLASH = null;          // message éphémère (retour d'action)
 let DECALAGE = 0;          // horloge serveur - horloge locale (s)
 let ECHECS = 0, DEPUIS = null;   // polls /api/state ratés d'affilée
 let VUE = null;            // auth | onboarding | main | settings | diagnostics
+let VERSION_CHARGEE = null; // version de tvsign au chargement de la page (le JS en mémoire est de cette version)
+// http:// sur le réseau (pas en local) : mots de passe et codes circulent en clair
+const NON_CHIFFREE = () => location.protocol === "http:" && !["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
 const BUSY = new Map();    // "attr=val" -> libellé pendant une action longue
 
 const ICONS = {
@@ -25,16 +28,6 @@ const ICONS = {
   ok: '<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>',
 };
 
-// ---------- erreurs de l'API ----------
-// Codes stables renvoyés par le serveur (« code » ou « code:paramètre »).
-function apiError(detail, status) {
-  const [code, arg] = String(detail || "").split(":");
-  const k = "err_" + code;
-  if (I18N[k]) return t(k, { n: arg });
-  if (detail) return String(detail);
-  return status >= 500 ? t("err_server") : status === 404 ? t("err_not_found") : status === 422 ? t("err_invalid") : t("err_status", { n: status });
-}
-
 async function api(path, opts = {}) {
   const { json, quiet, ...init } = opts;
   init.headers = { "X-Tvsign": "1", ...(init.headers || {}) };
@@ -43,16 +36,21 @@ async function api(path, opts = {}) {
     init.headers["Content-Type"] = "application/json";
     init.body = JSON.stringify(json);
   }
-  const r = await fetch(path, { credentials: "same-origin", ...init });
+  let r;
+  try { r = await fetch(path, { credentials: "same-origin", ...init }); }
+  catch (x) {
+    if (x?.name === "AbortError") throw x;
+    const e = new Error(t("err_network"));      // serveur arrêté, réseau coupé, proxy qui ferme la connexion
+    e.network = true;
+    throw e;
+  }
   const data = await r.json().catch(() => ({}));
   if (!r.ok) {
-    const detail = typeof data.detail === "string" ? data.detail
-      : Array.isArray(data.detail) ? data.detail.map((d) => d?.msg || "").filter(Boolean).join(", ")
-      : data.detail && typeof data.detail === "object" ? Object.entries(data.detail).map(([k, v]) => `${k} : ${v}`).join(", ")
-      : "";
-    const e = new Error(apiError(detail, r.status));
-    e.status = r.status; e.code = detail;
-    if (r.status === 401 && /^(auth|setup)_required$/.test(detail) && !quiet) demarrer();
+    const detail = data.detail ?? "";
+    const code = typeof detail === "string" ? detail : "";
+    const e = new Error(apiError(detail, r.status));      // déjà traduit : code stable ou cause connue
+    e.status = r.status; e.code = code;
+    if (r.status === 401 && /^(auth|setup)_required$/.test(code) && !quiet) demarrer();
     throw e;
   }
   return data;
@@ -78,51 +76,6 @@ function relatif(ts, now) {
   return t("on_date", { date: fmtDate(ts) });
 }
 
-// ---------- erreurs en clair ----------
-// Chaque cause connue (messages du serveur et de plumesign) : un titre lisible et ce que l'utilisateur peut faire.
-const CAUSES = [
-  [/ntfy/i, "c_ntfy"],
-  [/8220|no devices from which/i, "c_8220"],
-  [/NO_TEAM|MULTIPLE_TEAMS/, "c_team"],
-  [/ancienne version de tvsign/i, "c_legacy"],
-  [/appairage perdu|PAIRING_LOST|pairing record|not paired|No stored pairing/i, "c_lost"],
-  [/aucune Apple TV/i, "c_no_tv"],
-  [/aucun compte Apple/i, "c_no_account"],
-  [/compte .*déconnecté|reconnecte-le/i, "c_disconnected"],
-  [/compte .*(introuvable|retiré)|account .*not found/i, "c_account_missing"],
-  [/anisette/i, "c_anisette"],
-  [/reconnexion|-22406|HTTP Some\(401\)|unauthori[sz]ed|session .*(expir|invalid)|not logged|log ?in required/i, "c_session"],
-  [/plumesign occupé/i, "c_busy"],
-  [/ouverte sur l'Apple TV|app ouverte sur la TV|installd ne progresse plus/i, "c_app_open"],
-  [/plumesign trop ancien/i, "c_plumesign_old"],
-  [/réseau ou Apple injoignable/i, "c_apple_net"],
-  [/maximum (number )?of (apps|app ids)|too many (apps|app ids)|app id limit|limit of \d+ (apps|app ids)/i, "c_limit"],
-  [/identifiant d'app changé/i, "c_bundle"],
-  [/empreinte SHA-256/i, "c_digest"],
-  [/certificat|certificate/i, "c_cert"],
-  [/injoignable|unreachable|no route|connection refused|tunnel|introuvable sur le réseau|NOT_FOUND|discover/i, "c_unreachable"],
-  [/interrompu/i, "c_interrupted"],
-  [/délai dépassé|trop long|timed? ?out|timeout/i, "c_timeout"],
-  [/plumesign.*(introuvable|not found)|No such file|cannot find the file/i, "c_plumesign"],
-  [/IPA d'origine absente/, "c_ipa_missing"],
-  [/aucune IPA|HTTP Error 4\d\d|téléchargement|download|pas une app tvOS|IPA|https:\/\/ sont acceptées/, "c_source"],
-];
-function nettoyer(msg) {
-  return String(msg || "")
-    .replace(/^[^:]{1,60} : échec, /, "")
-    .replace(/\s*\|\s*Caused by:[\s\S]*$/, "")
-    .replace(/\[URL: [^\]]*\]/g, "")
-    .replace(/https?:\/\/\S+/g, "")
-    .replace(/^(\w[\w ]{0,20} : )?(Error: )?(Core error: )?/, "$1")
-    .replace(/\s+/g, " ").trim();
-}
-function enClair(msg) {
-  const brut = String(msg || "");
-  for (const [re, k] of CAUSES) if (re.test(brut)) return { titre: t(k + "_t"), conseil: t(k + "_a"), cle: k, brut, connu: true };
-  const court = nettoyer(brut);
-  return { titre: court.length > 110 ? court.slice(0, 107) + "…" : court || t("unknown_error"), conseil: "", cle: null, brut, connu: false };
-}
-
 let TOAST = null;
 function flash(ton, titre, texte = "") {
   if (VUE !== "main") {         // hors de l'écran principal : bulle temporaire en bas de page
@@ -141,7 +94,8 @@ function flash(ton, titre, texte = "") {
 
 // ---------- rendu sans perte de focus ----------
 const CLES = ["data-renew", "data-toggle", "data-edit", "data-del-app", "data-refresh-dev", "data-del-dev", "data-check",
-  "data-select", "data-relogin", "data-logout", "data-open", "data-key"];
+  "data-select", "data-relogin", "data-logout", "data-open", "data-key", "data-reinstall", "data-retry-version",
+  "data-accept-version", "data-rename-dev", "data-renew-all"];
 function cleDe(el) {
   if (!el?.getAttribute) return null;
   for (const a of CLES) if (el.hasAttribute(a)) return [a, el.getAttribute(a)];
@@ -200,6 +154,7 @@ function etatApp(a, now, s) {
   if (a.status === "error") return ["err", exp && exp - now < 24 * 3600 ? t("st_failed_soon") : t("st_failed")];
   if (!exp) return ["warn", t("st_to_install")];
   if (exp - now < fenetre) return ["warn", t("st_to_renew")];
+  if (a.tv_present === false) return ["warn", t("st_not_on_tv")];
   return ["ok", t("st_valid")];
 }
 const COULEUR = { ok: "green", warn: "orange", err: "red", cours: "blue", neutre: "gray" };
@@ -242,10 +197,31 @@ function noteApp(a, now) {
   if (a.running && a.phase?.step === "waiting_app") {
     titre = t("wait_app_t", { name: a.name });
     texte = t("wait_app", { tv, when: relatif(a.phase.deadline, now) });
+  } else if (!a.running && a.tv_present === false) {
+    return `<div class="probleme probleme--info" role="group" aria-label="${esc(t("not_on_tv_t", { tv }))}">
+      <span class="probleme__ic">${ICONS.tv}</span>
+      <div class="probleme__texte"><p class="probleme__titre">${esc(t("not_on_tv_t", { tv }))}</p><p>${esc(t("not_on_tv", { when: relatif(a.tv_checked_at, now) }))}</p></div>
+      <button class="btn btn--petit" data-reinstall="${a.id}" aria-label="${esc(t("reinstall") + " " + a.name)}">${t("reinstall")}</button>
+    </div>`;
   } else return "";
   return `<div class="probleme probleme--info" role="status">
       <span class="probleme__ic">${ICONS.tv}</span>
       <div class="probleme__texte"><p class="probleme__titre">${esc(titre)}</p><p>${esc(texte)}</p></div>
+    </div>`;
+}
+
+// Mise à jour refusée par tvsign (identifiant d'app changé, empreinte fausse, IPA invalide) : la raison et quoi faire.
+function versionRefusee(a) {
+  if (!a.bad_tag) return "";
+  const e = a.bad_reason ? enClair(a.bad_reason) : null;
+  const titre = e?.connu ? e.titre : t("skipped_t", { tag: a.bad_tag });
+  const conseil = e?.connu ? e.conseil : t("skipped_a");
+  const detail = a.bad_reason ? `<details class="details" data-key="bad-${a.id}"><summary>${t("tech_details")}</summary><pre class="log">${esc(nettoyer(a.bad_reason) || a.bad_reason)}</pre></details>` : "";
+  const accepter = e?.cle === "c_bundle" ? `<button class="btn btn--petit" data-accept-version="${a.id}" aria-label="${esc(t("accept_change") + " " + a.name)}">${t("accept_change")}</button>` : "";
+  return `<div class="probleme probleme--info" role="group" aria-label="${esc(t("skipped_version"))}">
+      <span class="probleme__ic">${ICONS.alerte}</span>
+      <div class="probleme__texte"><p class="probleme__titre">${esc(titre)}</p><p>${esc(conseil)}</p>${detail}</div>
+      <span class="probleme__actions">${accepter}<button class="btn btn--petit" data-retry-version="${a.id}" aria-label="${esc(t("retry_version") + " " + a.name)}">${t("retry_version")}</button></span>
     </div>`;
 }
 
@@ -278,7 +254,7 @@ function problemeApp(a, now) {
 function carteApp(a, now, s) {
   const [ton, mot] = etatApp(a, now, s);
   const compte = a.effective_account || a.account_email;
-  const essai = a.last_attempt_at ? `${esc(relatif(a.last_attempt_at, now))}${a.last_trigger ? ` (${esc(trigger(a.last_trigger))})` : ""}` : null;
+  const essai = a.last_attempt_at ? `${esc(relatif(a.last_attempt_at, now))}${a.last_trigger ? ` (${esc(declencheur(a.last_trigger))})` : ""}` : null;
   return `<article class="app app--${ton}" aria-labelledby="app-${a.id}-t">
     <div class="app__tete">
       <span class="row__icon row__icon--${COULEUR[ton]}">${ICONS.app}</span>
@@ -291,24 +267,22 @@ function carteApp(a, now, s) {
     ${jauge(a, now, s, ton)}
     ${noteApp(a, now)}
     ${problemeApp(a, now)}
+    ${versionRefusee(a)}
     <dl class="meta">
       <div><dt>Apple TV</dt><dd>${a.device_id ? esc(a.device_name || "Apple TV") : `<span class="texte-err">${t("none_f")}</span>`}</dd></div>
       <div><dt>${t("account")}</dt><dd>${compte ? esc(compte) : t("default_account")}</dd></div>
       ${essai ? `<div><dt>${t("last_attempt")}</dt><dd>${essai}</dd></div>` : a.signed_at ? `<div><dt>${t("signed")}</dt><dd>${esc(relatif(a.signed_at, now))}</dd></div>` : ""}
       ${a.bad_tag ? `<div><dt>${t("skipped_version")}</dt><dd class="mono">${esc(a.bad_tag)}</dd></div>` : ""}
+      ${a.tv_present === true ? `<div><dt>${t("on_tv")}</dt><dd>${esc(t("on_tv_ok", { when: relatif(a.tv_checked_at, now) }))}</dd></div>` : ""}
     </dl>
     <div class="app__actions">
-      <button class="row__action row__action--go" data-renew="${a.id}" ${a.running ? "disabled" : ""}>${a.running ? t("in_progress") : t("renew")}</button>
-      <button class="row__action" data-toggle="${a.id}" data-enabled="${a.enabled}">${a.enabled ? t("pause") : t("resume")}</button>
-      <button class="row__action" data-edit="${a.id}">${t("settings")}</button>
-      <button class="row__action row__action--danger" data-del-app="${a.id}" data-nom="${esc(a.name)}">${t("delete")}</button>
+      <button class="row__action row__action--go" data-renew="${a.id}" aria-label="${esc(t("renew") + " " + a.name)}" ${a.running ? "disabled" : ""}>${a.running ? t("in_progress") : t("renew")}</button>
+      <button class="row__action" data-toggle="${a.id}" data-enabled="${a.enabled}" aria-label="${esc((a.enabled ? t("pause") : t("resume")) + " " + a.name)}">${a.enabled ? t("pause") : t("resume")}</button>
+      <button class="row__action" data-edit="${a.id}" aria-label="${esc(t("settings") + " " + a.name)}">${t("settings")}</button>
+      <button class="row__action row__action--danger" data-del-app="${a.id}" data-nom="${esc(a.name)}" aria-label="${esc(t("delete") + " " + a.name)}">${t("delete")}</button>
     </div>
   </article>`;
 }
-// déclencheurs enregistrés par le serveur (en français) -> libellé traduit
-const trigger = (x) => ({ auto: t("tr_auto"), manuel: t("tr_manual"), ajout: t("tr_added"), "nouvelle version": t("tr_new_version"),
-  "nouvelle source": t("tr_new_source"), "nouvelle destination": t("tr_new_dest") }[x] || x);
-
 // ---------- synthèse globale ----------
 const boucleArretee = (h, now) => !!h && (h.loop_stalled || (!!h.last_loop_at && now - h.last_loop_at > 3 * (h.check_interval || 600) + 2700));
 function synthese(s, now) {
@@ -363,6 +337,10 @@ function renderAlertes() {
     html.push(`<div class="banner"><p><strong>${esc(t("unreachable_since", { time: fmtHeure(DEPUIS / 1000) }))}</strong>${esc(t("unreachable_since_txt"))}</p></div>`);
   }
   if (s) {
+    if (VERSION_CHARGEE && s.version && s.version !== VERSION_CHARGEE) {
+      html.push(`<div class="banner banner--info"><p><strong>${t("updated_t")}</strong>${t("updated")}</p>
+        <button class="btn btn--primary" data-reload="1">${t("reload")}</button></div>`);
+    }
     if (s.auth_disabled) {
       html.push(`<div class="banner banner--info"><p><strong>${t("auth_off_t")}</strong>${t("auth_off")}</p></div>`);
     }
@@ -393,6 +371,7 @@ function renderAlertes() {
 
 function renderApps(s, now) {
   const h = s.health;
+  $("#renew-all").hidden = s.apps.filter((a) => a.enabled && a.device_id).length < 2;     // une seule app : « Renouveler » suffit
   const retry = h?.retry_minutes ?? 45;
   setHTML($("#apps"), s.apps.length
     ? `<div class="apps">${s.apps.map((a) => carteApp(a, now, s)).join("")}</div>
@@ -400,17 +379,20 @@ function renderApps(s, now) {
     : `<div class="vide"><p>${t("apps_empty")}</p><button class="btn btn--primary" data-open="dlg-app">${t("add_app")}</button></div>`);
 }
 
-function etatTV(d) {
+// tvsign ne contacte la TV qu'aux renouvellements et au test de connexion : « joignable » ne vaut que peu de temps.
+const TV_FRAIS = 2 * 3600;
+function etatTV(d, now) {
   const errRecente = d.last_error && (!d.last_seen || (d.last_error_at || 0) > d.last_seen);
   if (d.legacy_pairing) return ["warn", t("tv_repair_update"), errRecente];
   if (d.pairing_lost) return ["err", t("tv_lost"), errRecente];
   if (errRecente) return ["warn", t("tv_unreachable"), errRecente];
-  return d.last_seen ? ["ok", t("tv_reachable"), errRecente] : ["neutre", t("tv_never"), errRecente];
+  if (!d.last_seen) return ["neutre", t("tv_never"), errRecente];
+  return now - d.last_seen < TV_FRAIS ? ["ok", t("tv_reachable"), errRecente] : ["neutre", t("tv_not_checked"), errRecente];
 }
 
 function renderDevices(s, now) {
   setHTML($("#devices"), s.devices.length ? `<div class="list">${s.devices.map((d) => {
-    const [ton, mot, errRecente] = etatTV(d);
+    const [ton, mot, errRecente] = etatTV(d, now);
     const apps = s.apps.filter((a) => a.device_id === d.id).map((a) => a.name);
     return `<div class="row">
       <span class="row__icon row__icon--${COULEUR[ton]}">${ICONS.tv}</span>
@@ -423,14 +405,16 @@ function renderDevices(s, now) {
       </div>
       <div class="row__buttons">
         ${d.pairing_lost || d.legacy_pairing ? `<button class="row__action row__action--go" data-open="dlg-pair">${t("repair")}</button>` : ""}
-        ${d.legacy_pairing ? "" : `<button class="row__action" data-refresh-dev="${d.id}">${t("test_connection")}</button>`}
-        <button class="row__action row__action--danger" data-del-dev="${d.id}" data-nom="${esc(d.name)}">${t("forget")}</button>
+        ${d.legacy_pairing ? "" : `<button class="row__action" data-refresh-dev="${d.id}" aria-label="${esc(t("test_connection") + " " + d.name)}">${t("test_connection")}</button>`}
+        <button class="row__action" data-rename-dev="${d.id}" data-nom="${esc(d.name)}" aria-label="${esc(t("rename") + " " + d.name)}">${t("rename")}</button>
+        <button class="row__action row__action--danger" data-del-dev="${d.id}" data-nom="${esc(d.name)}" aria-label="${esc(t("forget") + " " + d.name)}">${t("forget")}</button>
       </div>
     </div>`;
   }).join("")}</div>`
     : `<div class="vide"><p>${t("tv_empty")}</p><button class="btn" data-open="dlg-pair">${t("pair_title")}</button></div>`);
 }
 
+const messageCompte = (m) => { const e = enClair(m); return e.connu ? e.titre : nettoyer(m); };
 function renderAccounts(s, now) {
   const heures = s.health?.account_check_hours;
   setHTML($("#accounts"), s.accounts.length ? `<div class="list">${s.accounts.map((a) => {
@@ -438,7 +422,7 @@ function renderAccounts(s, now) {
       : a.ok === 0 ? `<span class="etat etat--err">${t("acc_off")}</span>`
       : a.checked_at ? `<span class="etat etat--neutre">${t("acc_unknown")}</span>` : `<span class="etat etat--neutre">${t("acc_unchecked")}</span>`;
     const note = a.ok == null && a.checked_at && a.message ? `<p class="row__sub">${esc(t("acc_retry_later", { why: enClair(a.message).titre }))}</p>`
-      : a.ok === 0 && a.message ? `<p class="row__sub texte-err">${esc(nettoyer(a.message))}</p>` : "";
+      : a.ok === 0 && a.message ? `<p class="row__sub texte-err">${esc(messageCompte(a.message))}</p>` : "";
     return `<div class="row">
       <span class="row__icon row__icon--${a.ok === 0 ? "red" : a.ok === 1 ? "blue" : "gray"}">${ICONS.user}</span>
       <div class="row__label">
@@ -447,10 +431,10 @@ function renderAccounts(s, now) {
         ${note}
       </div>
       <div class="row__buttons">
-        <button class="row__action" data-check="${esc(a.email)}">${t("check")}</button>
-        ${a.selected ? "" : `<button class="row__action" data-select="${esc(a.email)}">${t("use_default")}</button>`}
-        <button class="row__action ${a.ok === 0 ? "row__action--go" : ""}" data-relogin="${esc(a.email)}">${t("reconnect")}</button>
-        <button class="row__action row__action--danger" data-logout="${esc(a.email)}">${t("remove")}</button>
+        <button class="row__action" data-check="${esc(a.email)}" aria-label="${esc(t("check") + " " + a.email)}">${t("check")}</button>
+        ${a.selected ? "" : `<button class="row__action" data-select="${esc(a.email)}" aria-label="${esc(t("use_default") + " " + a.email)}">${t("use_default")}</button>`}
+        <button class="row__action ${a.ok === 0 ? "row__action--go" : ""}" data-relogin="${esc(a.email)}" aria-label="${esc(t("reconnect") + " " + a.email)}">${t("reconnect")}</button>
+        <button class="row__action row__action--danger" data-logout="${esc(a.email)}" aria-label="${esc(t("remove") + " " + a.email)}">${t("remove")}</button>
       </div>
     </div>`;
   }).join("")}</div>
@@ -473,7 +457,7 @@ function renderSysteme(s, now) {
         <p class="row__title">${t("auto_renewal")}</p>
         <p class="row__sub"><span class="etat etat--${boucle[0]}">${boucle[1]}</span> · ${esc(t("checked_when", { when: relatif(h.last_loop_at, now) }))}${esc(prochaine)}</p>
         ${h.loop_error ? `<p class="row__sub texte-err">${esc(enClair(h.loop_error).titre)}</p>` : ""}
-        ${arret ? `<p class="row__sub">${t("restart_hint")}</p>` : ""}
+        ${arret ? `<p class="row__sub">${esc(conseilEdition("restart_hint", AUTH?.edition))}</p>` : ""}
       </div>
     </div>
     <a class="row row--lien" href="#/settings">
@@ -507,7 +491,8 @@ function renderEvents(s) {
     const pb = e.level !== "info";
     const lisible = pb ? enClair(e.message) : null;
     const prefixe = (e.message.match(/^([^:]{1,40}) : /) || [])[1];
-    const titre = pb && lisible.connu ? `${prefixe ? prefixe + " : " : ""}${lisible.titre}` : nettoyer(e.message).slice(0, 180);
+    const traduit = evenementTexte(e.message);     // ligne connue du serveur, traduite en anglais
+    const titre = traduit ?? (pb && lisible.connu ? `${prefixe ? prefixe + " : " : ""}${lisible.titre}` : nettoyer(e.message).slice(0, 180));
     const long = pb && (lisible.connu || e.message.length > 180);
     html += `<li class="row journal__ligne journal__ligne--${esc(e.level)}">
       <time datetime="${new Date(e.ts * 1000).toISOString()}">${fmtHeure(e.ts)}</time>
@@ -548,12 +533,35 @@ async function refresh() {
     if (n !== SEQ) return;
     if (typeof s.now === "number") DECALAGE = s.now - Date.now() / 1000;
     STATE = s; ECHECS = 0; DEPUIS = null;
+    // /api/auth/status avait échoué (serveur en redémarrage) : on le relit maintenant qu'il répond
+    if (!AUTH && !AUTH_RELU) { AUTH_RELU = true; demarrer().finally(() => (AUTH_RELU = false)); }
   } catch (e) {
     if (n !== SEQ || e.status === 401) return;
     if (++ECHECS === 1) DEPUIS = Date.now();
   } finally {
     clearTimeout(tm);
-    if (n === SEQ) render();
+    if (n === SEQ) { render(); verifierAuto(); }
+  }
+}
+let AUTH_RELU = false;
+
+// L'app est-elle encore sur l'Apple TV ? Contrôle en lecture seule, au plus une fois par jour et par TV
+// tant que la page est ouverte (le résultat est gardé par le serveur), ou à « Tester la connexion ».
+const VERIF = {};              // TV -> dernière tentative automatique (ms)
+let VERIF_EN_COURS = false;
+async function verifierAuto() {
+  if (VERIF_EN_COURS || VUE !== "main" || document.hidden || !STATE || STATE.apps.some((a) => a.running)) return;
+  const now = maintenant();
+  for (const d of STATE.devices) {
+    if (d.legacy_pairing || d.pairing_lost) continue;
+    const apps = STATE.apps.filter((a) => a.device_id === d.id && a.enabled && a.bundle_id && a.expires_at);
+    const perime = apps.some((a) => !a.tv_checked_at || now - a.tv_checked_at > 24 * 3600);
+    if (!perime || Date.now() - (VERIF[d.id] || 0) < 6 * 3600 * 1000) continue;
+    VERIF[d.id] = Date.now(); VERIF_EN_COURS = true;
+    try { await api(`/api/devices/${d.id}/verify`, { method: "POST", quiet: true }); await refresh(); }
+    catch { /* TV en veille : on ne dérange pas, nouvel essai dans quelques heures */ }
+    finally { VERIF_EN_COURS = false; }
+    return;
   }
 }
 function planifier(ms = 5000) {
@@ -570,6 +578,7 @@ document.addEventListener("click", async (ev) => {
   const b = ev.target.closest("button");
   if (!b || b.closest("dialog") || !b.closest("#vue-main, #vue-onboarding")) return;
   const d = b.dataset;
+  if (d.reload) return location.reload();
   if (d.open) return openDialog(d.open);
   if (d.relogin) {
     openDialog("dlg-login");
@@ -578,7 +587,8 @@ document.addEventListener("click", async (ev) => {
     return;
   }
   if (d.edit) return openEdit(+d.edit);
-  if (!(d.renew || d.toggle || d.delApp || d.refreshDev || d.delDev || d.check || d.select || d.logout)) return;
+  if (!(d.renew || d.toggle || d.delApp || d.refreshDev || d.delDev || d.check || d.select || d.logout
+    || d.reinstall || d.retryVersion || d.acceptVersion || d.renameDev || d.renewAll)) return;
   try {
     if (d.renew) {
       await busy(b, "data-renew", t("starting"), async () => {
@@ -596,10 +606,43 @@ document.addEventListener("click", async (ev) => {
     if (d.delApp && confirm(t("confirm_del_app", { name: d.nom }))) {
       await api(`/api/apps/${d.delApp}`, { method: "DELETE" });
     }
+    if (d.reinstall || d.retryVersion) {
+      const [attr, id, chemin] = d.reinstall ? ["data-reinstall", d.reinstall, "renew"] : ["data-retry-version", d.retryVersion, "retry-version"];
+      await busy(b, attr, t("starting"), async () => {
+        const r = await api(`/api/apps/${id}/${chemin}`, { method: "POST" });
+        if (r.started === false) flash("info", t("already_running_t"), " " + t("already_running"));
+        else flash("info", t("renew_started_t"), " " + t("renew_started"));
+        await refresh();
+      });
+    }
+    if (d.acceptVersion && confirm(t("confirm_accept_change"))) {
+      await busy(b, "data-accept-version", t("starting"), async () => {
+        await api(`/api/apps/${d.acceptVersion}/accept-version`, { method: "POST" });
+        flash("info", t("renew_started_t"), " " + t("renew_started"));
+        await refresh();
+      });
+    }
+    if (d.renewAll) {
+      await busy(b, "data-renew-all", t("starting"), async () => {
+        const r = await api("/api/apps/renew-all", { method: "POST" });
+        flash("info", r.started ? t("renew_all_t", { n: r.started }) : t("already_running_t"), " " + (r.started ? t("renew_all") : t("already_running")));
+        await refresh();
+      });
+    }
+    if (d.renameDev) {
+      const nom = prompt(t("rename_prompt"), d.nom);
+      if (nom !== null && nom.trim() && nom.trim() !== d.nom) await api(`/api/devices/${d.renameDev}`, { method: "PATCH", json: { name: nom.trim() } });
+    }
     if (d.refreshDev) {
       await busy(b, "data-refresh-dev", t("connecting"), async () => {
         await api(`/api/devices/${d.refreshDev}/refresh`, { method: "POST" });
-        flash("ok", t("tv_ok_t"), " " + t("tv_ok"));
+        // la TV répond : on regarde aussi si les apps y sont encore (sans que ça puisse masquer la connexion réussie)
+        let verif = null;
+        try { verif = await api(`/api/devices/${d.refreshDev}/verify`, { method: "POST" }); } catch { /* liste d'apps indisponible */ }
+        VERIF[d.refreshDev] = Date.now();
+        const absentes = (verif?.apps || []).filter((x) => !x.present).map((x) => STATE?.apps.find((a) => a.id === x.app_id)?.name).filter(Boolean);
+        if (absentes.length) flash("err", t("tv_ok_t"), " " + t("tv_missing_apps", { apps: absentes.join(", ") }));
+        else flash("ok", t("tv_ok_t"), " " + t(verif ? "tv_ok_verified" : "tv_ok"));
       });
     }
     if (d.delDev) {
@@ -620,8 +663,7 @@ document.addEventListener("click", async (ev) => {
       await api(`/api/accounts/${encodeURIComponent(d.logout)}`, { method: "DELETE" });
     }
   } catch (e) {
-    const c = enClair(e.message);
-    flash("err", t("action_failed"), ` ${c.titre}${c.conseil ? ". " + c.conseil : ""}`);
+    flash("err", t("action_failed"), " " + e.message);     // déjà traduit par api()
   }
   refresh();
 });
@@ -639,21 +681,28 @@ function openDialog(id) {
   if (id === "dlg-login") {
     $("#login-session").innerHTML = ""; $("#login-error").textContent = "";
     $("#login-submit").disabled = false;
+    $("#login-cancel").textContent = t("cancel");
+    $("#http-avis-login").hidden = !NON_CHIFFREE();
   }
   document.getElementById(id).showModal();
 }
 
 // ---------- ajout d'app ----------
 let PRESETS = null;
+let PRESETS_ECHEC = false;     // la dernière lecture a échoué : on réessaie à la prochaine demande
 async function presets() {
-  if (!PRESETS) { try { PRESETS = await api("/api/presets"); } catch { PRESETS = []; } }
+  if (!PRESETS) {
+    try { PRESETS = await api("/api/presets", { quiet: true }); PRESETS_ECHEC = false; }
+    catch { PRESETS_ECHEC = true; return []; }
+  }
   return PRESETS;
 }
 const presetDesc = (p) => (p.description && (p.description[LANG] || p.description.en)) || p.repo;
-function presetCartes(list, nom) {
+function presetCartes(list, nom, choisi = null) {
+  const present = !!choisi && list.some((p) => p.id === choisi);      // le choix de l'utilisateur survit à un nouveau rendu
   return list.length ? `<div class="list">${list.map((p, i) => `
     <label class="row row--choix">
-      <input type="radio" name="${nom}" value="${esc(p.id)}" ${i === 0 ? "checked" : ""}>
+      <input type="radio" name="${nom}" value="${esc(p.id)}" ${present ? (p.id === choisi ? "checked" : "") : i === 0 ? "checked" : ""}>
       <span class="row__icon row__icon--blue">${ICONS.app}</span>
       <span class="row__label"><span class="row__title">${esc(p.name)}</span><span class="row__sub">${esc(presetDesc(p))}</span>
         <span class="row__sub mono">${esc(p.repo)}</span></span>
@@ -700,8 +749,10 @@ $("#form-app").addEventListener("submit", async (ev) => {
     fd.append("preset", p.value); fd.append("channel", f.channel.value);
   }
   if (type === "github") {
-    if (!/^[\w.-]+\/[\w.-]+$/.test(f.source.value.trim())) return (err.textContent = t("repo_format"));
-    fd.append("source", f.source.value.trim()); fd.append("source_filter", f.source_filter.value.trim());
+    const depot = normaliserDepot(f.source.value);
+    if (!depotValide(depot)) return (err.textContent = t("repo_format"));
+    f.source.value = depot;
+    fd.append("source", depot); fd.append("source_filter", f.source_filter.value.trim());
     fd.append("channel", f.channel.value);
   }
   if (type === "url") {
@@ -716,16 +767,22 @@ $("#form-app").addEventListener("submit", async (ev) => {
   fd.append("device_id", f.device_id.value);
   if (f.account_email.value) fd.append("account_email", f.account_email.value);
   const btn = $("#app-submit");
-  btn.disabled = true; btn.textContent = type === "upload" ? t("uploading") : t("downloading");
+  const libelle = type === "upload" ? t("uploading") : t("downloading"), debut = Date.now();
+  const chrono = setInterval(() => { btn.textContent = `${libelle} ${Math.round((Date.now() - debut) / 1000)} s`; }, 1000);
+  btn.disabled = true; btn.textContent = libelle;
   err.textContent = "";
+  $("#app-note").textContent = t("add_wait_note");     // le téléchargement se fait dans la requête : pas de pourcentage
   try {
     const app = await api("/api/apps", { method: "POST", body: fd });
     f.closest("dialog").close();
     f.reset();
     flash("ok", t("app_added_t", { name: app.name }), " " + t("app_added"));
   } catch (e) {
-    err.textContent = e.message;
+    // coupure (proxy à délai court) : le serveur continue et l'app apparaîtra si l'IPA est valide
+    err.textContent = e.network || [502, 503, 504].includes(e.status) ? t("add_maybe_running") : e.message;
   } finally {
+    clearInterval(chrono);
+    $("#app-note").textContent = "";
     btn.disabled = false; btn.textContent = t("add");
     refresh();
   }
@@ -760,8 +817,9 @@ $("#form-edit").addEventListener("submit", async (ev) => {
   const compte = a.account_email || a.effective_account || "";
   if (f.account_email.value && f.account_email.value !== compte) body.account_email = f.account_email.value;
   if (a.source_type === "github") {
-    const src = f.source.value.trim();
-    if (!/^[\w.-]+\/[\w.-]+$/.test(src)) return (err.textContent = t("repo_format"));
+    const src = normaliserDepot(f.source.value);
+    if (!depotValide(src)) return (err.textContent = t("repo_format"));
+    f.source.value = src;
     if (src !== a.source) body.source = src;
     if (f.source_filter.value.trim() !== (a.source_filter || "")) body.source_filter = f.source_filter.value.trim();
     if (f.channel.value !== (a.channel === "beta" ? "beta" : "stable")) body.channel = f.channel.value;
@@ -790,6 +848,29 @@ $("#form-edit").addEventListener("submit", async (ev) => {
   }
 });
 
+// Nouvelle build d'une app importée : l'IPA est remplacée, l'historique de l'app est conservé.
+$("#edit-replace").addEventListener("change", async (e) => {
+  const file = e.target.files[0], a = EDIT, err = $("#edit-error");
+  e.target.value = "";
+  if (!file || !a) return;
+  err.textContent = "";
+  const fd = new FormData();
+  fd.append("file", file);
+  const lib = $("#edit-replace-label span");
+  lib.textContent = t("uploading");
+  e.target.disabled = true;
+  try {
+    const r = await api(`/api/apps/${a.id}/ipa`, { method: "POST", body: fd });
+    $("#dlg-edit").close();
+    flash("ok", t("replaced_t", { name: a.name }), " " + t("replaced", { version: r.version || "" }));
+  } catch (x) {
+    err.textContent = x.message;
+  } finally {
+    lib.textContent = t("replace_file"); e.target.disabled = false;
+    refresh();
+  }
+});
+
 // ---------- sessions interactives (PIN de la TV, code Apple) ----------
 const SUIVIES = {};   // boîte -> session suivie (pour l'annuler à la fermeture)
 function annulerSession(cle) {
@@ -813,29 +894,38 @@ function watchSession(sess, box, { cle, label, doneText, numerique, onEnd }) {
   let envois = 0;          // nombre de codes envoyés
   let gen = 0;             // ignore les réponses lancées avant le dernier envoi
   let rates = 0;
+  let sms = false;         // la dernière saisie était une demande de SMS : la suivante n'est pas une « nouvelle saisie »
+  let numeros = [];        // fins des numéros de téléphone de confiance (plusieurs : l'utilisateur choisit)
   const statut = (html) => (box.innerHTML = `<p class="statut">${html}</p>`);
   const fin = (ok) => { suivi.fini = true; if (SUIVIES[cle] === suivi) delete SUIVIES[cle]; onEnd?.(ok); refresh(); };
   const afficherSaisie = () => {
     saisie = true;
+    const n = numerosSms(sess.prompt);
+    if (n.length) numeros = n;
+    const peutSms = /type 'sms'/i.test(sess.prompt || "");
+    const renvoi = /via SMS/i.test(sess.prompt || "") && cle === "login";
+    const boutons = (peutSms || renvoi) ? (numeros.length > 1
+      ? numeros.map((x) => `<button type="button" class="lien" data-sms="${esc(x)}">${esc(t(renvoi ? "resend_sms_to" : "send_sms_to", { n: x }))}</button>`).join(" ")
+      : `<button type="button" class="lien" data-sms="">${t(renvoi ? "resend_sms" : "send_sms")}</button>`) : "";
     box.innerHTML = `<div class="code"><p class="group__header">${esc(label)}</p>
       ${invite(sess) ? `<p class="code__invite">${esc(invite(sess))}</p>` : ""}
-      ${envois ? `<p class="code__invite">${t("new_entry")}</p>` : ""}
+      ${envois && !sms ? `<p class="code__invite">${t("new_entry")}</p>` : ""}
       <div class="list"><input ${numerique ? 'inputmode="numeric" pattern="[0-9]*" maxlength="8"' : 'inputmode="text" maxlength="12"'} autocomplete="one-time-code" aria-label="${esc(label)}" spellcheck="false"><button type="button" class="btn btn--primary" data-valider>${t("validate")}</button></div>
-      ${/type 'sms'/i.test(sess.prompt || "") ? `<p class="code__invite"><button type="button" class="lien" data-sms>${t("send_sms")}</button></p>` : ""}</div>`;
+      ${boutons ? `<p class="code__invite code__sms">${boutons}</p>` : ""}</div>`;
     const input = $("input", box);
     const go = async (valeur) => {
       if (!saisie) return;
       const v = (valeur ?? input.value).trim();
       if (!v) return input.focus();
       saisie = false; envois++; gen++;
+      sms = /^sms\b/i.test(v);
       statut(`<span class="etat etat--cours">${t("verifying")}</span>`);
       try { await api(`/api/sessions/${sess.id}/answer`, { json: { value: v } }); }
       catch (e) { if (e.status !== 409) box.insertAdjacentHTML("beforeend", `<p class="erreur">${esc(e.message)}</p>`); }
       gen++;   // l'état « running » est posé par le serveur avant la réponse : tout « waiting » ultérieur est une nouvelle demande
     };
     $("[data-valider]", box).onclick = () => go();
-    const sms = $("[data-sms]", box);
-    if (sms) sms.onclick = () => go("sms");
+    $$("[data-sms]", box).forEach((b) => (b.onclick = () => go(b.dataset.sms ? `sms ${b.dataset.sms}` : "sms")));
     input.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); go(); } };
     input.focus();
   };
@@ -857,10 +947,11 @@ function watchSession(sess, box, { cle, label, doneText, numerique, onEnd }) {
     if (sess.state === "done") { statut(`<span class="etat etat--ok">${esc(doneText)}</span>`); return fin(true); }
     if (sess.state === "failed") {
       const log = (sess.log || []).join("\n");
-      const e = enClair(log);
+      // connexion : l'erreur d'Apple (mot de passe refusé, compte verrouillé, code faux…) ; le journal reste en détail technique
+      const e = cle === "login" ? causeConnexion(log) : enClair(log);
       box.innerHTML = `<p class="statut"><span class="etat etat--err">${t("failed")}</span></p>
         ${e.connu ? `<p class="code__invite"><strong>${esc(e.titre)}.</strong> ${esc(e.conseil)}</p>` : ""}
-        <pre class="log">${esc(log)}</pre>`;
+        <details class="details"${e.connu ? "" : " open"}><summary>${t("tech_details")}</summary><pre class="log">${esc(journalSession(sess.log))}</pre></details>`;
       return fin(false);
     }
     saisie = false;
@@ -890,11 +981,14 @@ async function scan() {
         <div class="row__label"><p class="row__title">${esc(d.name)}</p><p class="row__sub">${esc(d.ip)}</p></div>
         <div class="row__buttons"><button type="button" class="row__action row__action--go" data-pair-idx="${i}">${t("pair")}</button></div>
       </div>`).join("")}</div>`
-      : `<div class="vide"><p>${t("pair_none")}</p><p>${t("pair_none_hint")}</p></div>`)
+      : `<div class="vide"><p>${t("pair_none")}</p><p>${t("pair_none_hint")}</p>
+          <button type="button" class="btn btn--primary" id="pair-again">${t("pair_search_again")}</button>
+          <details class="details"><summary>${t("pair_help_t")}</summary><p class="pair-aide">${esc(conseilEdition("pair_help", AUTH?.edition))}</p></details></div>`)
       + (vues.length ? `<p class="group__footer">${esc(t("pair_already_visible", { names: [...new Set(vues)].join(", ") }))}</p>` : "");
     list.onclick = (e) => {
       const b = e.target.closest("[data-pair-idx]");
       if (b) startPair(r.pairable[b.dataset.pairIdx]);
+      if (e.target.closest("#pair-again")) scan();
     };
   } catch (e) {
     list.innerHTML = `<p class="erreur">${esc(e.message)}</p>`;
@@ -903,12 +997,27 @@ async function scan() {
   }
 }
 async function startPair(d) {
-  $("#pair-list").innerHTML = `<p class="statut"><span class="etat etat--cours">${esc(t("pair_connecting", { name: d.name }))}</span></p>`;
+  const liste = $("#pair-list");
+  liste.innerHTML = `<p class="statut"><span class="etat etat--cours">${esc(t("pair_connecting", { name: d.name }))}</span></p>`;
+  $("#pair-session").innerHTML = "";
+  // échec : on propose de recommencer au lieu de laisser la ligne « connexion… » ; succès : plus rien à chercher
+  const encore = () => {
+    liste.innerHTML = `<p class="statut"><button type="button" class="btn" id="pair-retry">${t("try_again")}</button></p>`;
+    $("#pair-retry").onclick = scan;
+  };
   try {
     const sess = await api("/api/devices/pair", { json: { identifier: d.identifier, ip: d.ip, port: d.port, name: d.name } });
-    watchSession(sess, $("#pair-session"), { cle: "pair", label: t("pin_label"), doneText: t("paired_ok", { name: d.name }), numerique: true });
+    if (!$("#dlg-pair").open) {          // feuille fermée pendant la requête : plumesign attendrait un code pour rien
+      api(`/api/sessions/${sess.id}/cancel`, { method: "POST", quiet: true }).catch(() => {});
+      return;
+    }
+    watchSession(sess, $("#pair-session"), {
+      cle: "pair", label: t("pin_label"), doneText: t("paired_ok", { name: d.name }), numerique: true,
+      onEnd: (ok) => { if (ok) liste.innerHTML = ""; else encore(); },
+    });
   } catch (e) {
     $("#pair-session").innerHTML = `<p class="erreur">${esc(e.message)}</p>`;
+    encore();
   }
 }
 $("#pair-rescan").onclick = scan;
@@ -923,18 +1032,35 @@ $("#form-login").addEventListener("submit", async (ev) => {
   if (btn.disabled) return;
   $("#login-error").textContent = "";
   btn.disabled = true;
+  const email = f.email.value.trim();
   try {
-    const sess = await api("/api/accounts/login", { json: { email: f.email.value.trim(), password: f.password.value } });
+    const sess = await api("/api/accounts/login", { json: { email, password: f.password.value } });
     f.password.value = "";
     watchSession(sess, $("#login-session"), {
       cle: "login", label: t("apple_code"), doneText: t("account_connected"), numerique: false,
-      onEnd: () => { btn.disabled = false; },
+      onEnd: (ok) => {
+        btn.disabled = false;
+        if (ok) { $("#login-cancel").textContent = t("close"); reessayerApres(email); }
+        else f.password.focus();         // l'adresse reste remplie : on ne ressaisit que le mot de passe
+      },
     });
   } catch (e) {
     $("#login-error").textContent = e.message;
     btn.disabled = false;
   }
 });
+
+// Compte reconnecté : les apps en échec à cause de lui sont relancées tout de suite, sans attendre leur prochain essai.
+const CAUSES_COMPTE = ["c_session", "c_disconnected", "c_account_missing"];
+async function reessayerApres(email) {
+  try {
+    await refresh();
+    const apps = (STATE?.apps || []).filter((a) => a.enabled && a.device_id && a.status === "error" && !a.running
+      && a.effective_account === email && CAUSES_COMPTE.includes(enClair(a.last_error).cle));
+    for (const a of apps) await api(`/api/apps/${a.id}/renew`, { method: "POST", quiet: true });
+    if (apps.length) { flash("info", t("retrying_now_t"), " " + t("retrying_now", { n: apps.length })); await refresh(); }
+  } catch { /* le prochain essai automatique reprendra */ }
+}
 
 // ═══════════════ Connexion à l'interface / premier lancement ═══════════════
 function afficher(vue) {
@@ -957,6 +1083,7 @@ function renderAuth() {
   $("#auth-note").textContent = setup ? (AUTH.setup_code_required ? t("setup_code_where") : t("setup_local_note")) : "";
   $("#auth-submit").textContent = setup ? t("secure_continue") : t("sign_in");
   $("#auth-error").textContent = "";
+  $("#http-avis-auth").hidden = !NON_CHIFFREE();
 }
 $("#vue-auth").addEventListener("change", (e) => {
   if (e.target.name === "langue-porte") { changerLangue(e.target.value); renderAuth(); }
@@ -988,7 +1115,8 @@ $("#form-auth").addEventListener("submit", async (ev) => {
 
 // ═══════════════ Assistant de premier lancement ═══════════════
 const ETAPES = ["welcome", "check", "account", "tv", "app", "done"];
-let WIZ = { i: 0, diag: null, diagEnCours: false, appAjoutee: false, restaurer: false };
+// adding : requête d'ajout en cours (téléchargement) ; erreur : son échec, gardé ici et non dans le DOM
+let WIZ = { i: 0, diag: null, diagEnCours: false, adding: false, erreur: "", appId: null, restaurer: false, preset: null, canal: null };
 
 function renderWizard() {
   const etape = ETAPES[WIZ.i];
@@ -997,21 +1125,47 @@ function renderWizard() {
   const html = WIZ_RENDU[etape]();
   setHTML(corps, html);
   $("#wiz-retour").hidden = WIZ.i === 0 || etape === "done";
-  $("#wiz-passer").hidden = !["account", "tv", "app"].includes(etape) || etapeFaite(etape);
+  $("#wiz-passer").hidden = !["account", "tv", "app"].includes(etape) || etapeFaite(etape) || (etape === "app" && WIZ.adding);
   const suivant = $("#wiz-suivant");
   suivant.hidden = etape === "welcome" && WIZ.restaurer;
   suivant.textContent = etape === "done" ? t("open_tvsign") : etape === "welcome" ? t("get_started") : t("continue");
   suivant.disabled = ["account", "tv", "app"].includes(etape) && !etapeFaite(etape);
 }
+// L'app suivie par l'assistant : celle qu'il vient d'ajouter, sinon la première.
+const appAssistant = () => (STATE?.apps || []).find((a) => a.id === WIZ.appId) || (STATE?.apps || [])[0] || null;
+// installed : installée sur la TV (premier renouvellement réussi) ; running ; failed ; waiting : créée, pas encore démarrée
+function etatPremiereApp(a) {
+  if (a.running) return "running";
+  if (a.status === "error") return "failed";
+  if (a.expires_at && a.status === "ok") return "installed";
+  return "waiting";
+}
 function etapeFaite(e) {
   if (!STATE) return false;
   if (e === "account") return STATE.accounts.length > 0;
   if (e === "tv") return STATE.devices.some((d) => !d.legacy_pairing && !d.pairing_lost);
-  if (e === "app") return STATE.apps.length > 0 || WIZ.appAjoutee;
+  if (e === "app") { const a = appAssistant(); return !!a && etatPremiereApp(a) === "installed"; }
   return true;
 }
-const titreEtape = (k, sous) => `<p class="assistant__eyebrow">${esc(t("step_n", { n: WIZ.i + 1, total: ETAPES.length }))}</p><h1 class="assistant__titre" id="wiz-titre">${t(k)}</h1>${sous ? `<p class="assistant__texte">${sous}</p>` : ""}`;
+const titreEtape = (k, sous) => `<p class="assistant__eyebrow">${esc(t("step_n", { n: WIZ.i + 1, total: ETAPES.length }))}</p><h1 class="assistant__titre" id="wiz-titre" tabindex="-1">${t(k)}</h1>${sous ? `<p class="assistant__texte">${sous}</p>` : ""}`;
 const fait = (txt) => `<p class="statut"><span class="etat etat--ok">${esc(txt)}</span></p>`;
+
+// Avancement réel de la première installation, d'après l'état de l'app (et non « ajoutée » = « installée »).
+function blocPremiereApp(a) {
+  const e = etatPremiereApp(a), now = maintenant();
+  if (e === "installed") return fait(t("wiz_app_installed", { name: a.name, date: fmtDate(a.expires_at) })) + `<p class="assistant__texte">${t("wiz_app_more")}</p>`;
+  if (e === "failed") {
+    const c = enClair(a.last_error);
+    return `<div class="probleme" role="alert"><span class="probleme__ic">${ICONS.alerte}</span>
+        <div class="probleme__texte"><p class="probleme__titre">${esc(t("wiz_app_failed", { name: a.name }))} ${esc(c.titre)}</p>${c.conseil ? `<p>${esc(c.conseil)}</p>` : ""}
+        <p class="probleme__retry">${esc(a.next_attempt_at && a.next_attempt_at > now ? t("retry_at", { when: relatif(a.next_attempt_at, now) }) : t("retry_next_pass"))}</p></div>
+        <button class="btn btn--petit" type="button" id="wiz-reessayer">${t("try_again")}</button></div>
+      <p class="assistant__texte">${t("wiz_app_failed_hint")}</p>`;
+  }
+  const libelle = e === "running" ? etatApp(a, now, STATE)[1] : t("wiz_app_queued");
+  return `<p class="statut"><span class="etat etat--cours">${esc(t("wiz_app_installing", { name: a.name }))} ${esc(libelle)}</span></p>
+    ${noteApp(a, now)}<p class="assistant__texte">${t("wiz_app_wait")}</p>`;
+}
 
 const WIZ_RENDU = {
   welcome: () => `${titreEtape("welcome_title", t("welcome_text"))}
@@ -1028,10 +1182,11 @@ const WIZ_RENDU = {
     <div class="list">
       <div class="row">
         <div class="row__label"><p class="row__title">${t("restore_instead")}</p><p class="row__sub">${t("restore_instead_sub")}</p></div>
-        <div class="row__buttons"><label class="row__action fichier"><input type="file" id="wiz-backup" accept=".tvsign-backup,.zip"><span>${t("choose_file")}</span></label></div>
+        <div class="row__buttons"><label class="row__action fichier"><input type="file" id="wiz-backup" accept=".tvsign-backup,.zip" ${WIZ.restaurer ? "disabled" : ""}><span>${t("choose_file")}</span></label></div>
       </div>
     </div>
-    <p class="erreur" id="wiz-erreur" role="alert"></p>`,
+    ${WIZ.restaurer ? `<p class="statut"><span class="etat etat--cours">${t("restoring")}</span></p>` : ""}
+    <p class="erreur" id="wiz-erreur" role="alert">${esc(WIZ.erreur)}</p>`,
   check: () => {
     const d = WIZ.diag;
     const bloquant = d && d.checks.some((c) => c.status === "error" && ["plumesign", "event_loop"].includes(c.id));
@@ -1045,7 +1200,9 @@ const WIZ_RENDU = {
     return `${titreEtape("wiz_account_title", t("wiz_account_text"))}
       <ul class="points">
         <li>${ICONS.user}<span>${t("wiz_account_p1")}</span></li>
+        <li>${ICONS.alerte}<span><strong>${t("wiz_account_revoke")}</strong></span></li>
         <li>${ICONS.cle}<span>${t("wiz_account_p2")}</span></li>
+        <li>${ICONS.cle}<span>${t("wiz_account_p4")}</span></li>
         <li>${ICONS.alerte}<span>${t("wiz_account_p3")}</span></li>
       </ul>
       ${accs.length ? accs.map((a) => fait(t("wiz_account_done", { email: a.email }))).join("") : ""}
@@ -1062,16 +1219,22 @@ const WIZ_RENDU = {
       <button class="btn ${ok.length ? "" : "btn--primary"}" data-open="dlg-pair">${ok.length ? t("pair_another") : t("pair_title")}</button>`;
   },
   app: () => {
-    const apps = STATE?.apps || [];
     const tvs = (STATE?.devices || []).filter((d) => !d.legacy_pairing);
-    if (apps.length) return `${titreEtape("wiz_app_title", "")}${apps.map((a) => fait(t("wiz_app_done", { name: a.name }))).join("")}
-      <p class="assistant__texte">${t("wiz_app_more")}</p>`;
+    const a = appAssistant();
+    // l'ajout est en cours (téléchargement, validation) : jamais le formulaire ni « ajoutée » avant d'en connaître l'issue
+    if (WIZ.adding) return `${titreEtape("wiz_app_title", "")}
+      <p class="statut"><span class="etat etat--cours">${t("wiz_app_downloading")}</span></p>
+      <p class="assistant__texte">${t("wiz_app_wait")}</p>`;
+    if (a) return `${titreEtape("wiz_app_title", "")}${blocPremiereApp(a)}`;
+    const choix = WIZ.preset, canal = WIZ.canal || (PRESETS?.[0]?.default_channel === "beta" ? "beta" : "stable");
     return `${titreEtape("wiz_app_title", t("wiz_app_text"))}
-      ${PRESETS ? presetCartes(PRESETS, "wiz-preset") : `<p class="statut"><span class="etat etat--cours">${t("loading")}</span></p>`}
+      ${PRESETS ? presetCartes(PRESETS, "wiz-preset", choix)
+        : PRESETS_ECHEC ? `<p class="erreur">${t("presets_failed")} <button class="lien lien--inline" type="button" id="wiz-presets">${t("try_again")}</button></p>`
+        : `<p class="statut"><span class="etat etat--cours">${t("loading")}</span></p>`}
       <p class="group__header espace">${t("channel")}</p>
       <div class="segmented" role="radiogroup" aria-label="${esc(t("channel"))}">
-        <label><input type="radio" name="wiz-canal" value="stable" ${PRESETS?.[0]?.default_channel === "beta" ? "" : "checked"}><span>${t("channel_stable")}</span></label>
-        <label><input type="radio" name="wiz-canal" value="beta" ${PRESETS?.[0]?.default_channel === "beta" ? "checked" : ""}><span>${t("channel_beta")}</span></label>
+        <label><input type="radio" name="wiz-canal" value="stable" ${canal === "beta" ? "" : "checked"}><span>${t("channel_stable")}</span></label>
+        <label><input type="radio" name="wiz-canal" value="beta" ${canal === "beta" ? "checked" : ""}><span>${t("channel_beta")}</span></label>
       </div>
       <p class="group__footer">${t("channel_note")}</p>
       ${tvs.length ? "" : `<p class="erreur">${t("pair_first")}</p>`}
@@ -1079,14 +1242,22 @@ const WIZ_RENDU = {
         <button class="btn btn--primary" id="wiz-installer" ${tvs.length && PRESETS?.length ? "" : "disabled"}>${t("install")}</button>
         <button class="btn" data-open="dlg-app">${t("other_app")}</button>
       </div>
-      <p class="erreur" id="wiz-erreur" role="alert"></p>`;
+      <p class="erreur" id="wiz-erreur" role="alert">${esc(WIZ.erreur)}</p>`;
   },
   done: () => {
-    const apps = STATE?.apps || [];
+    const s = STATE || { accounts: [], devices: [], apps: [] };
+    const tvOk = s.devices.some((d) => !d.legacy_pairing && !d.pairing_lost);
+    const installees = s.apps.filter((a) => etatPremiereApp(a) === "installed");
+    const manque = [!s.accounts.length && t("wiz_missing_account"), !tvOk && t("wiz_missing_tv"),
+      !s.apps.length && t("wiz_missing_app"), s.apps.length && !installees.length && t("wiz_missing_install")].filter(Boolean);
+    if (manque.length) return `${titreEtape("wiz_done_title_partial", t("wiz_done_text_partial"))}
+      <ul class="points">${manque.map((m) => `<li>${ICONS.alerte}<span>${esc(m)}</span></li>`).join("")}</ul>`;
+    const h = Math.round(STATE?.renew_before_hours || 60);
     return `${titreEtape("wiz_done_title", t("wiz_done_text"))}
       <ul class="points">
+        <li>${ICONS.tv}<span>${esc(t("wiz_done_open", { name: installees[0].name }))}</span></li>
         <li>${ICONS.cloche}<span>${t("wiz_done_p1")}</span></li>
-        <li>${ICONS.boucle}<span>${apps.length ? t("wiz_done_p2", { h: Math.round(STATE?.renew_before_hours || 60) }) : t("wiz_done_p2_empty")}</span></li>
+        <li>${ICONS.boucle}<span>${esc(conseilEdition("wiz_done_p2", AUTH?.edition).replace("{h}", h))}</span></li>
       </ul>`;
   },
 };
@@ -1094,14 +1265,14 @@ const WIZ_RENDU = {
 function listeDiag(d) {
   return `<div class="list">${d.checks.map((c) => {
     const ton = c.status === "ok" ? "ok" : c.status === "warn" ? "warn" : "err";
-    const conseil = c.status !== "ok" ? t(`diag_${c.id}_fix`) : "";
+    const conseil = c.status !== "ok" ? conseilEdition(`diag_${c.id}_fix`, AUTH?.edition) : "";
     return `<div class="row">
       <span class="row__icon row__icon--${COULEUR[ton]}">${c.status === "ok" ? ICONS.ok : ICONS.alerte}</span>
       <div class="row__label">
         <p class="row__title">${t("diag_" + c.id)}</p>
         <p class="row__sub"><span class="etat etat--${ton}">${t("diag_" + c.status)}</span>${c.id === "plumesign" && c.value ? ` · <span class="mono">${esc(c.value)}</span>` : ""}</p>
-        <p class="row__sub">${esc(c.detail)}</p>
-        ${conseil && conseil !== `diag_${c.id}_fix` ? `<p class="row__sub">${esc(conseil)}</p>` : ""}
+        <p class="row__sub">${esc(diagDetail(c, d))}</p>
+        ${conseil ? `<p class="row__sub">${esc(conseil)}</p>` : ""}
       </div>
     </div>`;
   }).join("")}</div>`;
@@ -1115,13 +1286,22 @@ async function lancerDiag(apres) {
   finally { WIZ.diagEnCours = false; apres?.(); }
 }
 
+// Restaurer une sauvegarde depuis l'accueil : confirmation si l'installation contient déjà quelque chose
+const nonVide = () => !!STATE && (STATE.apps.length > 0 || STATE.devices.length > 0 || STATE.accounts.length > 0);
 $("#vue-onboarding").addEventListener("change", async (e) => {
   if (e.target.name === "wiz-langue") { await changerLangue(e.target.value, true); renderWizard(); }
-  if (e.target.id === "wiz-backup" && e.target.files[0]) {
-    WIZ.restaurer = true;
-    const ok = await restaurer(e.target.files[0], $("#wiz-erreur"));
+  if (e.target.name === "wiz-preset") WIZ.preset = e.target.value;
+  if (e.target.name === "wiz-canal") WIZ.canal = e.target.value;
+  if (e.target.id === "wiz-backup") {
+    const fichier = e.target.files[0];
+    e.target.value = "";          // choisir de nouveau le même fichier après un échec doit déclencher « change »
+    if (!fichier || WIZ.restaurer) return;
+    if (nonVide() && !confirm(t("confirm_restore"))) return;
+    WIZ.restaurer = true; WIZ.erreur = "";
+    renderWizard();
+    const ok = await restaurer(fichier, (msg) => (WIZ.erreur = msg));
     WIZ.restaurer = false;
-    if (ok) { await api("/api/onboarding/complete", { method: "POST" }); return demarrer(); }
+    if (ok) { try { await api("/api/onboarding/complete", { method: "POST" }); } catch { /* repris au prochain lancement */ } return demarrer(); }
     renderWizard();
   }
 });
@@ -1129,21 +1309,42 @@ $("#vue-onboarding").addEventListener("click", async (e) => {
   const b = e.target.closest("button");
   if (!b) return;
   if (b.id === "wiz-diag") lancerDiag(() => { $("#wiz-corps")._html = null; renderWizard(); });
+  if (b.id === "wiz-presets") presets().then(() => renderWizard());
+  if (b.id === "wiz-reessayer") {
+    const a = appAssistant();
+    if (a) await busy(b, "id", t("starting"), async () => {
+      try { await api(`/api/apps/${a.id}/renew`, { method: "POST" }); await refresh(); }
+      catch (err) { WIZ.erreur = err.message; renderWizard(); }
+    });
+  }
   if (b.id === "wiz-installer") {
     const p = $('input[name="wiz-preset"]:checked'), canal = $('input[name="wiz-canal"]:checked');
     const tv = (STATE?.devices || []).find((d) => !d.legacy_pairing);
-    if (!p || !tv) return;
+    if (!p || !tv || WIZ.adding) return;
     const fd = new FormData();
     fd.append("source_type", "preset"); fd.append("preset", p.value); fd.append("channel", canal?.value || "stable");
     fd.append("device_id", tv.id);
-    await busy(b, "id", t("downloading"), async () => {
-      try { await api("/api/apps", { method: "POST", body: fd }); WIZ.appAjoutee = true; await refresh(); }
-      catch (err) { const el = $("#wiz-erreur"); if (el) el.textContent = err.message; }
-    });
+    WIZ.adding = true; WIZ.erreur = "";
+    renderWizard();
+    try {
+      const app = await api("/api/apps", { method: "POST", body: fd });
+      WIZ.appId = app.id;
+    } catch (err) {
+      // l'échec reste dans l'état de l'assistant : le formulaire revient avec l'explication
+      WIZ.erreur = err.network || [502, 503, 504].includes(err.status) ? t("add_maybe_running") : err.message;
+    } finally {
+      WIZ.adding = false;
+      await refresh();
+      renderWizard();
+    }
   }
 });
-$("#wiz-retour").onclick = () => { if (WIZ.i > 0) { WIZ.i--; renderWizard(); } };
-$("#wiz-passer").onclick = () => avancer();
+$("#wiz-retour").onclick = () => { if (WIZ.i > 0) { WIZ.i--; renderWizard(); $("#wiz-titre")?.focus?.(); } };
+$("#wiz-passer").onclick = () => {
+  const a = appAssistant();
+  if (ETAPES[WIZ.i] === "app" && a && !confirm(t("wiz_skip_app_warning", { name: a.name }))) return;
+  avancer();
+};
 $("#wiz-suivant").onclick = async () => {
   if (ETAPES[WIZ.i] === "done") {
     try { await api("/api/onboarding/complete", { method: "POST" }); } catch { /* repris au prochain lancement */ }
@@ -1159,7 +1360,7 @@ function avancer() {
   if (e === "check" && !WIZ.diag) lancerDiag(() => { $("#wiz-corps")._html = null; renderWizard(); });
   if (e === "app" && !PRESETS) presets().then(() => { $("#wiz-corps")._html = null; renderWizard(); });
   renderWizard();
-  $("#wiz-titre")?.focus?.();
+  $("#wiz-titre")?.focus?.();       // le bouton Continuer peut être désactivé à l'étape suivante : le focus va au titre
 }
 
 // ═══════════════ Réglages ═══════════════
@@ -1180,7 +1381,6 @@ async function chargerReglages() {
   // des apps importées : sans leur .ipa dans la sauvegarde, elles sont à réimporter après une restauration
   const cb = $("#backup-uploads");
   cb.checked = (STATE?.apps || []).some((a) => a.source_type === "upload");
-  $("#backup-export").href = "/api/backup/export" + (cb.checked ? "?uploads=true" : "");
   renderSecurite();
 }
 function renderSecurite() {
@@ -1220,7 +1420,7 @@ $("#form-reglages").addEventListener("submit", async (ev) => {
   for (const [k, s] of Object.entries(REGLAGES?.settings || {})) {
     const champ = f.elements[k];
     if (!champ || s.locked) continue;
-    const v = champ.value.trim();
+    const v = k === "ntfy_url" ? normaliserNtfy(champ.value) : champ.value.trim();
     if (v !== String(s.value ?? "")) body[k] = v === "" ? null : v;
   }
   if (!Object.keys(body).length) return flash("ok", t("saved_t"));
@@ -1241,10 +1441,23 @@ function afficherFlashReglages() {
 $("#ntfy-test").onclick = async (ev) => {
   const b = ev.currentTarget, err = $("#reglages-error");
   err.textContent = "";
+  let envoye = false;
+  // busy() rétablit le libellé du bouton à la fin : la confirmation passe par une bulle, pas par le bouton
   await busy(b, "id", t("sending"), async () => {
-    try { await api("/api/settings/test-notification", { json: { url: $("#form-reglages").ntfy_url.value.trim() || null } }); b.textContent = t("sent"); }
+    try { await api("/api/settings/test-notification", { json: { url: normaliserNtfy($("#form-reglages").ntfy_url.value) || null } }); envoye = true; }
     catch (e) { err.textContent = e.message; }
   });
+  if (envoye) flash("ok", t("notif_sent_t"), " " + t("notif_sent"));
+};
+$("#ntfy-generate").onclick = () => {
+  const champ = $("#form-reglages").ntfy_url;
+  if (champ.disabled) return;
+  const octets = new Uint8Array(10);
+  crypto.getRandomValues(octets);
+  champ.value = sujetNtfy(octets);
+  $("#ntfy-sujet").textContent = champ.value.split("/").pop();
+  $("#ntfy-etapes").open = true;
+  champ.focus();
 };
 $("#vue-settings").addEventListener("click", async (e) => {
   const b = e.target.closest("button");
@@ -1271,14 +1484,40 @@ $("#vue-settings").addEventListener("click", async (e) => {
     }
   } catch (ex) { if (err) err.textContent = ex.message; else flash("err", t("action_failed"), " " + ex.message); }
 });
-$("#backup-uploads").onchange = (e) => ($("#backup-export").href = "/api/backup/export" + (e.target.checked ? "?uploads=true" : ""));
+// Export : téléchargé par fetch pour voir une session expirée, une erreur ou l'attente du verrou au lieu d'enregistrer un JSON d'erreur
+$("#backup-export").onclick = async (ev) => {
+  const b = ev.currentTarget, err = $("#backup-error");
+  err.textContent = "";
+  await busy(b, "id", t("preparing"), async () => {
+    try {
+      const r = await fetch("/api/backup/export" + ($("#backup-uploads").checked ? "?uploads=true" : ""), { credentials: "same-origin", headers: { "X-Tvsign": "1" } });
+      if (!r.ok) {
+        const data = await r.json().catch(() => ({}));
+        if (r.status === 401) demarrer();
+        throw new Error(apiError(data.detail ?? "", r.status));
+      }
+      const blob = await r.blob();
+      const nom = (r.headers.get("Content-Disposition") || "").match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i)?.[1] || "tvsign.tvsign-backup";
+      const lien = document.createElement("a");
+      lien.href = URL.createObjectURL(blob); lien.download = decodeURIComponent(nom);
+      document.body.appendChild(lien); lien.click(); lien.remove();
+      setTimeout(() => URL.revokeObjectURL(lien.href), 10000);
+      flash("ok", t("export_done_t"), " " + t("export_done"));
+    } catch (e) { err.textContent = e.network ? t("err_network") : e.message; }
+  });
+};
 $("#backup-file").onchange = async (e) => {
   const f = e.target.files[0];
   e.target.value = "";
+  $("#backup-error").textContent = "";
   if (!f || !confirm(t("confirm_restore"))) return;
-  if (await restaurer(f, $("#reglages-error"))) { location.hash = "#/"; route(); }
+  if (await restaurer(f, (m) => ($("#backup-error").textContent = m))) {
+    STATE = null;          // l'ancien état décrit une autre base : ses identifiants ne valent plus rien
+    await refresh();
+    location.hash = "#/"; route();
+  }
 };
-async function restaurer(file, errEl) {
+async function restaurer(file, onError) {
   const fd = new FormData();
   fd.append("file", file);
   try {
@@ -1288,7 +1527,7 @@ async function restaurer(file, errEl) {
     else flash("ok", t("restored_t"), " " + t("restored", { apps: r.apps, tvs: r.devices }));
     return true;
   } catch (e) {
-    if (errEl) errEl.textContent = e.message;
+    onError?.(e.message);
     return false;
   }
 }
@@ -1328,11 +1567,16 @@ function appliquerI18n() {
 
 // ═══════════════ Démarrage et navigation ═══════════════
 async function demarrer() {
+  // setHTML saute un rendu identique au précédent : après une reconnexion le DOM doit repartir de zéro
+  const precedent = AUTH;
   try { AUTH = await api("/api/auth/status", { quiet: true }); }
-  catch { AUTH = null; }
+  catch { AUTH = precedent; }           // serveur qui redémarre : on garde ce que l'on savait
+  if (AUTH?.version) VERSION_CHARGEE ??= AUTH.version;
   const local = store.get("tvsign.lang");
   setLang(local || (AUTH && AUTH.language !== "auto" ? AUTH.language : langueNavigateur()));
   appliquerI18n();
+  const resume = $("#resume");
+  resume._html = null; resume.textContent = t("loading_state");
   if (!AUTH) { afficher("main"); ECHECS = 2; DEPUIS = Date.now(); render(); return planifier(); }
   if (!AUTH.authenticated || AUTH.setup_required) { afficher("auth"); renderAuth(); $$("#form-auth label:not([hidden]) input")[0]?.focus(); return; }
   VUE = null;

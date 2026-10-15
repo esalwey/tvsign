@@ -438,8 +438,8 @@ a.row__action { display: inline-flex; align-items: center; text-decoration: none
 .field--pile { flex-direction: column; align-items: stretch; gap: 2px; padding-top: var(--sp-2); padding-bottom: var(--sp-2); }
 .field--pile > span { font-size: var(--t-foot); color: var(--label-2); min-width: 0; }
 .field--pile input { text-align: left; padding: 4px 0; }
-.field__unite { flex: 1; display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; color: var(--label-2); }
-.field__unite input { flex: 0 1 5em; }
+.field__unite { flex: 1; display: flex; align-items: center; justify-content: flex-end; flex-wrap: nowrap; gap: 6px; min-width: 0; color: var(--label-2); }
+.field__unite input { flex: 0 1 5em; min-width: 3em; }
 .verrou {
   flex: none; font-family: var(--font-num); font-size: var(--t-caption); color: var(--label-2);
   background: var(--fill-tertiary); border-radius: 6px; padding: 2px 6px;
@@ -519,6 +519,32 @@ a.row__action { display: inline-flex; align-items: center; text-decoration: none
 .toast--err { color: var(--red-text); }
 @media (prefers-reduced-transparency: reduce) { .toast { backdrop-filter: none; background: var(--surface); } }
 
+/* Textes d'état longs (assistant, appairage, connexion) : ils passent à la ligne au lieu d'élargir la page. */
+.statut { min-width: 0; flex-wrap: wrap; }
+.statut .etat { white-space: normal; min-width: 0; overflow-wrap: anywhere; }
+.assistant > *, .assistant__corps, .sheet__body { min-width: 0; }
+.assistant__corps { overflow-wrap: anywhere; }
+.statut .btn { flex: none; }
+
+/* Avis : mise en garde sous un formulaire (connexion non chiffrée, certificats d'un autre outil). */
+.avis {
+  margin: var(--sp-3) 0 0; padding: var(--sp-3) var(--sp-4); font-size: var(--t-foot); line-height: 1.4;
+  background: color-mix(in srgb, var(--orange) 10%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--orange) 35%, transparent);
+  border-radius: 12px; color: var(--label);
+}
+.avis strong { color: var(--orange-text); }
+.porte .avis { margin-top: var(--sp-4); }
+.probleme__actions { display: flex; gap: var(--sp-2); flex-wrap: wrap; align-self: center; }
+.code__sms { display: flex; flex-wrap: wrap; gap: var(--sp-1) var(--sp-3); }
+.code__sms .lien { padding: 0; min-height: 32px; text-align: left; }
+.pair-aide { margin: var(--sp-2) 0 0; text-align: left; font-size: var(--t-foot); }
+.vide .details { text-align: left; }
+.ntfy-aide { margin: var(--sp-2) var(--sp-4) 0; }
+.ntfy-aide p { margin: var(--sp-2) 0; color: var(--label-2); }
+.ntfy-aide ol { margin: var(--sp-2) 0; padding-left: var(--sp-5); display: grid; gap: var(--sp-2); }
+.ntfy-aide code { overflow-wrap: anywhere; }
+
 /* ═══════════ Mobile ═══════════ */
 
 @media (max-width: 700px) {
@@ -541,7 +567,12 @@ a.row__action { display: inline-flex; align-items: center; text-decoration: none
   .app__tete { flex-wrap: wrap; }
   .app__actions .row__action { flex: 1 1 auto; }
   .app__actions .row__action--danger { flex: 0 1 auto; margin-left: auto; }
-  .field > span { min-width: 6rem; }
+  .field { flex-wrap: wrap; }
+  .field > span { min-width: 0; flex: 0 1 auto; }
+  .field input, .field select { flex: 1 1 8rem; }
+  .entete__actions { flex-wrap: wrap; }
+  .entete__actions .btn { flex: 1 1 auto; }
+  .entete__actions .btn--icone { flex: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {
