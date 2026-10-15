@@ -38,7 +38,8 @@ services:
   # then enter http://127.0.0.1:6969 as the anisette server in tvsign's Settings. Several addresses
   # can be listed there: the next one takes over when the first is down.
   anisette:
-    image: dadoum/anisette-v3-server:latest
+    # pinned (tag + digest) like the other images of this stack; bump both together to update
+    image: dadoum/anisette-v3-server:10-2026@sha256:8577c27cb7592900947960799bf03c79a53bf857ed951e4c48ef6e06c6e0f488
     container_name: tvsign-anisette
     profiles: ["anisette"]
     restart: unless-stopped
@@ -47,4 +48,9 @@ services:
     security_opt:
       - no-new-privileges:true
     volumes:
-      - ./anisette-data:/home/Alcoholic/.config/anisette-v3/lib/
+      # named volume (not a bind mount): Docker would create a host folder owned by root, which the
+      # image's unprivileged user cannot write its provisioning files to
+      - anisette_data:/home/Alcoholic/.config/anisette-v3/lib/
+
+volumes:
+  anisette_data:
