@@ -59,6 +59,11 @@ sh install.sh              # checks only, changes nothing
 sh install.sh --install    # writes /opt/tvsign/docker-compose.yml and starts tvsign
 ```
 
+`install.sh` is in this repository: `git clone https://github.com/esalwey/tvsign && cd tvsign`, or just
+`curl -fsSLO https://raw.githubusercontent.com/esalwey/tvsign/main/install.sh`. It needs root or
+`sudo` for `/opt/tvsign`; on a shell with neither (many NAS shells) it installs into `~/tvsign`
+instead, or into any folder you give: `sh install.sh --install "$HOME/tvsign"`.
+
 Or by hand with [`docker-compose.yml`](docker-compose.yml):
 
 ```sh
@@ -67,7 +72,10 @@ docker compose up -d
 docker compose logs tvsign     # the one-time setup code is printed here
 ```
 
-Set `PUID`/`PGID` to the owner of the data folder (`id -u`, `id -g`), and `TZ` to your time zone.
+Set `PUID`/`PGID` to the owner of the data folder (`id -u`, `id -g`), and `TZ` to your time zone
+(`timedatectl`), in the file or in a `.env` file next to it. Without them the container runs in UTC
+as uid/gid 1000: journal and renewal times are then in UTC, and a data folder owned by someone else
+cannot be written. The compose file also caps the container log (10 MB x 3 files).
 
 ### Platform notes
 
@@ -117,6 +125,12 @@ never put it in a synced or network-shared folder in clear.
 - Settings → Backup → **Export** downloads a `.tvsign-backup` archive (database, Apple sessions,
   keys, pairings; uploaded IPAs optional). Restore it from Settings or from the first-run wizard.
   The archive moves between the Docker and Windows editions without re-pairing the Apple TV.
+- Restoring checks the archive first (integrity, tables and columns of the database, migration to
+  the current schema) and only then replaces anything. The replacement is all-or-nothing: if a step
+  fails (file locked, disk full), the steps already done are undone and the instance stays as it was.
+  Renewals and the web interface pause while it runs. The previous state is kept aside for 30 days.
+- The archive is **not encrypted**. On Windows the browser's Downloads folder is often synced by
+  OneDrive: choose a folder that is not, or move the file to a safe place right away.
 - Or back up the whole data folder with the container stopped (Hyper Backup, Appdata Backup, restic…).
 - Never run the old and the new instance at the same time after a move.
 
@@ -130,6 +144,25 @@ Tags: `:1` (recommended, stays on major version 1), `:1.2`, `:1.2.3`, `:latest`,
 branch, for testers). The database is copied before any schema change. Avoid updating during a
 renewal: `stop_grace_period: 5m` and `TVSIGN_SHUTDOWN_DRAIN_SECONDS` (240) let an install in
 progress finish before the container stops. Watchtower or Diun work but are optional.
+
+**New versions of your apps.** A followed GitHub release is downloaded, signed and installed when it
+is published. Safety nets:
+
+- *tvOS check.* The app's `MinimumOSVersion` is compared with the tvOS of the Apple TV. Adding an
+  app that needs a newer tvOS is refused ("needs tvOS 26.0, your Apple TV runs 18.4"); a new release
+  that needs one is skipped, the installed version keeps being renewed, and you get a notification.
+  Updating the Apple TV lifts the refusal.
+- *Automatic rollback.* tvsign keeps the previous version next to the new one until the new one is
+  installed successfully. If the new version fails to sign or install twice for a reason that is not
+  a network hiccup (new entitlement, App ID limit…), tvsign goes back to the previous version,
+  skips the bad release and notifies you.
+- *Not at any price.* A new version that cannot be installed right now (app open, Apple TV asleep,
+  anisette down) never turns a valid app red and sends no failure alert: it waits (an optional update
+  waits `TVSIGN_UPDATE_WAIT_MINUTES`, 5, for an open app, not 30). Alerts start when expiry nears.
+- *Your choice.* In an app's Settings, turn off "Install new versions automatically": tvsign keeps
+  renewing the installed version, shows "update available" with the release notes and notifies you;
+  **Install now** installs it. **Roll back** goes back to the previous version and turns automatic
+  updates off for that app (if the Apple TV refuses an older version, delete the app on it first).
 
 ### Security
 
@@ -147,7 +180,15 @@ progress finish before the container stops. Watchtower or Diun work but are opti
   with "unexpected origin" (Caddy and Traefik keep `Host` by default). If a page answers
   `host_not_allowed`, add the address you type in the browser to `TVSIGN_ALLOWED_HOSTS`.
 - Use a dedicated Apple ID. The Apple password is passed to `plumesign` through its environment,
-  never on a command line, and is not stored.
+  never on a command line, and is not stored. **Signing may revoke the development certificate of
+  that Apple ID**: apps that AltStore, SideStore, Sideloadly or Xcode signed with it (on an iPhone,
+  say) stop launching. The sign-in sheet asks you to confirm this, and a banner stays on the main
+  page after a revocation.
+- Desktop edition without a password: any program or Windows account on that computer can reach
+  tvsign. Settings says so; set a password if others use the computer.
+- Notification secrets (webhook addresses, bot and access tokens, ntfy passwords) are stored in the
+  database, are never sent back by the API (shown as `********`) and are masked in logs, the support
+  bundle and error messages. Notifications are plain POSTs that never follow redirects.
 
 ### Configuration
 
@@ -167,9 +208,43 @@ replaced under the same tag (new checksum). A direct link is checked at each ren
 that sends none of them cannot be followed: the first download is kept. Shutdown: a renewal in
 progress may finish for up to `TVSIGN_SHUTDOWN_DRAIN_SECONDS` (240) before it is interrupted.
 
-Notifications (ntfy): the topic name acts as a password on the public ntfy.sh, and messages name
-your Apple ID and your apps: pick a long random topic, or use a self-hosted ntfy. A protected
-server can be reached with `https://user:password@host/topic` (sent as Basic authentication).
+Notifications: Settings → Notifications holds a list of destinations: **ntfy**, a generic **JSON
+webhook** (Home Assistant, n8n, Node-RED: `title`, `message`, `event`, `priority`, `time`, `app`),
+**Discord** (webhook), **Telegram** (bot token + chat ID) and **Gotify**. Each destination picks the
+events it receives (renewal failed, expiry approaching, renewal recovered, app updates, Apple
+account and certificates) and has a **Send a test** button. Messages follow the language chosen in
+Settings (with "Automatic", the last language shown in the web interface); times carry their UTC
+offset. `TVSIGN_NTFY_URL` still presets an ntfy destination, `TVSIGN_NTFY_EVENTS` its events
+(comma separated, `none` for none). On the public ntfy.sh the topic name acts as a password and
+messages name your Apple ID and your apps: pick a long random topic, or use a self-hosted ntfy. A
+protected server works with `https://user:password@host/topic` (Basic authentication) or an access
+token; a bare name such as `my-topic` means `https://ntfy.sh/my-topic`. The Windows desktop app also
+raises a Windows notification.
+
+Logs: the access log is off (the page polls every 5 s); `TVSIGN_ACCESS_LOG=1` turns it on.
+
+### Troubleshooting and support
+
+- **Diagnostics** (Settings → Diagnostics) checks plumesign, mDNS, Apple, the anisette server,
+  GitHub, the clock and the disk. A bad `Date` header from a proxy does not break it.
+- **Apple TV not found / "unreachable".** The Apple TV must be on the same network (VLAN) as tvsign
+  and answer mDNS. A Wi-Fi Apple TV in standby, or one switched off with the television (HDMI-CEC),
+  often stops answering: prefer Ethernet, keep *Settings › General › Sleep After* long enough, turn
+  CEC power-off off at night, or wake it with the remote before the renewal window. tvsign retries
+  every 45 minutes (10 near expiry) and alerts at 24 h and 6 h.
+- **The app is on the Apple TV but does not open.** Its profile may have expired (check its card),
+  its certificate may have been revoked by another tool on the same Apple ID (tvsign re-signs it at
+  the next check), or the installation may still be waiting because the app is open. Try *Renew
+  now*, then restart the Apple TV. The app appears in the home screen a few seconds after the
+  installation reports success.
+- **Apple sign-in errors.** Check the clock (Diagnostics), the anisette server (the default,
+  `ani.sidestore.app`, is shared: a temporary outage is retried automatically), and that the
+  account is not signed in on another tvsign.
+- **Reporting a bug.** Open an issue at <https://github.com/esalwey/tvsign/issues> and attach the
+  **support bundle** (Settings → Diagnostics → Support → Download): versions, checks, apps, journal,
+  renewal history and the last plumesign outputs, with e-mail addresses, IP addresses, device
+  identifiers and secrets masked (it holds no database, Apple session or key). *Copy support info*
+  gives the short text version; *Download the log* (in the Log block) the journal alone.
 
 Building from source: see [docs/building.md](docs/building.md).
 
@@ -222,6 +297,11 @@ sh install.sh              # vérifications seulement, ne modifie rien
 sh install.sh --install    # écrit /opt/tvsign/docker-compose.yml et démarre tvsign
 ```
 
+`install.sh` est dans ce dépôt : `git clone https://github.com/esalwey/tvsign && cd tvsign`, ou
+simplement `curl -fsSLO https://raw.githubusercontent.com/esalwey/tvsign/main/install.sh`. Il
+demande root ou `sudo` pour `/opt/tvsign` ; sur un shell qui n'a ni l'un ni l'autre (beaucoup de
+NAS), il installe dans `~/tvsign`, ou dans le dossier donné : `sh install.sh --install "$HOME/tvsign"`.
+
 Ou à la main avec [`docker-compose.yml`](docker-compose.yml) :
 
 ```sh
@@ -230,7 +310,11 @@ docker compose up -d
 docker compose logs tvsign     # le code d'installation à usage unique s'affiche ici
 ```
 
-Mettre `PUID`/`PGID` au propriétaire du dossier de données (`id -u`, `id -g`) et `TZ` à votre fuseau.
+Mettre `PUID`/`PGID` au propriétaire du dossier de données (`id -u`, `id -g`) et `TZ` à votre fuseau
+(`timedatectl`), dans le fichier ou dans un fichier `.env` à côté. Sans eux, le conteneur tourne en
+UTC avec l'uid/gid 1000 : les heures du journal et des renouvellements sont en UTC, et un dossier de
+données appartenant à quelqu'un d'autre n'est pas inscriptible. Le fichier compose limite aussi le
+journal du conteneur (3 fichiers de 10 Mo).
 
 ### Notes par plateforme
 
@@ -283,6 +367,13 @@ partager, à ne jamais mettre en clair dans un dossier synchronisé ou partagé 
   Apple, clés, appairages ; IPA envoyées en option). Elle se restaure depuis les Réglages ou depuis
   l'assistant du premier lancement, et passe d'une édition à l'autre (Docker ↔ Windows) sans
   réappairer l'Apple TV.
+- La restauration contrôle d'abord l'archive (intégrité, tables et colonnes de la base, migration
+  vers le schéma actuel) et ne remplace rien avant. Le remplacement est tout ou rien : si une étape
+  échoue (fichier verrouillé, disque plein), celles déjà faites sont annulées et l'instance reste
+  comme elle était. Les renouvellements et l'interface se mettent en pause pendant ce temps.
+  L'état précédent est gardé à côté pendant 30 jours.
+- L'archive **n'est pas chiffrée**. Sous Windows, le dossier Téléchargements du navigateur est souvent
+  synchronisé par OneDrive : choisir un dossier qui ne l'est pas, ou déplacer le fichier aussitôt.
 - Ou sauvegarder tout le dossier de données, conteneur arrêté (Hyper Backup, Appdata Backup, restic…).
 - Après un déménagement, ne jamais faire tourner l'ancienne et la nouvelle instance en même temps.
 
@@ -297,6 +388,27 @@ main, pour les testeurs). La base est copiée avant tout changement de schéma. 
 pendant un renouvellement : `stop_grace_period: 5m` et `TVSIGN_SHUTDOWN_DRAIN_SECONDS` (240) laissent
 finir une installation en cours avant l'arrêt du conteneur. Watchtower ou Diun fonctionnent mais
 restent facultatifs.
+
+**Nouvelles versions de vos apps.** Une release GitHub suivie est téléchargée, signée et installée
+dès sa publication. Garde-fous :
+
+- *Contrôle de la tvOS.* Le `MinimumOSVersion` de l'app est comparé à la tvOS de l'Apple TV. Ajouter
+  une app qui exige une tvOS plus récente est refusé (« exige tvOS 26.0, ton Apple TV est en 18.4 ») ;
+  une nouvelle release qui en exige une est écartée, la version installée continue d'être renouvelée,
+  et une notification vous prévient. Mettre l'Apple TV à jour lève le refus.
+- *Retour arrière automatique.* tvsign garde la version précédente à côté de la nouvelle jusqu'à ce
+  que celle-ci soit installée avec succès. Si la nouvelle échoue deux fois à se signer ou s'installer
+  pour une raison qui n'est pas une panne réseau (nouveau droit, limite d'App ID…), tvsign revient à
+  la précédente, écarte la mauvaise release et vous prévient.
+- *Pas à n'importe quel prix.* Une nouvelle version impossible à installer sur le moment (app ouverte,
+  Apple TV en veille, anisette en panne) ne passe jamais une app valide au rouge et n'envoie aucune
+  alerte d'échec : elle attend (une mise à jour facultative n'attend une app ouverte que
+  `TVSIGN_UPDATE_WAIT_MINUTES`, 5, pas 30). Les alertes commencent quand l'expiration approche.
+- *Votre choix.* Dans les Réglages d'une app, décocher « Installer les nouvelles versions
+  automatiquement » : tvsign continue de renouveler la version installée, affiche « mise à jour
+  disponible » avec les notes de version et vous prévient ; **Installer maintenant** l'installe.
+  **Revenir** retourne à la version précédente et coupe les mises à jour automatiques de cette app
+  (si l'Apple TV refuse une version plus ancienne, supprimer d'abord l'app dessus).
 
 ### Sécurité
 
@@ -314,7 +426,17 @@ restent facultatifs.
   et chaque écriture est refusée (« origine inattendue ») ; Caddy et Traefik gardent `Host`. Si une
   page répond `host_not_allowed`, ajouter l'adresse saisie dans le navigateur à `TVSIGN_ALLOWED_HOSTS`.
 - Utiliser un Apple ID dédié. Le mot de passe Apple est transmis à `plumesign` par son
-  environnement, jamais en ligne de commande, et n'est pas enregistré.
+  environnement, jamais en ligne de commande, et n'est pas enregistré. **La signature peut révoquer
+  le certificat de développement de cet Apple ID** : les apps qu'AltStore, SideStore, Sideloadly ou
+  Xcode ont signées avec lui (sur un iPhone par exemple) cessent de se lancer. La feuille de
+  connexion demande de le confirmer, et un bandeau reste affiché sur la page principale après une
+  révocation.
+- Édition bureau sans mot de passe : tout programme ou compte Windows de l'ordinateur peut joindre
+  tvsign. Les Réglages le disent ; choisir un mot de passe si d'autres personnes utilisent l'ordinateur.
+- Les secrets des notifications (adresses de webhook, jetons de bot ou d'accès, mots de passe ntfy)
+  sont stockés dans la base, jamais renvoyés par l'API (affichés `********`) et masqués dans les
+  journaux, le dossier de support et les messages d'erreur. Les notifications sont de simples POST qui
+  ne suivent jamais une redirection.
 
 ### Configuration
 
@@ -337,9 +459,47 @@ serveur qui n'envoie rien de tout cela ne peut pas être suivi : le premier tél
 conservé. À l'arrêt, un renouvellement en cours peut finir pendant `TVSIGN_SHUTDOWN_DRAIN_SECONDS`
 (240) avant d'être interrompu.
 
-Notifications (ntfy) : sur ntfy.sh public, le nom du sujet fait office de mot de passe, et les messages
-citent votre Apple ID et vos apps : choisir un sujet long et aléatoire, ou un ntfy auto-hébergé. Un
-serveur protégé s'utilise avec `https://utilisateur:motdepasse@hôte/sujet` (envoyé en authentification Basic).
+Notifications : Réglages → Notifications contient une liste de destinations : **ntfy**, un
+**webhook JSON** générique (Home Assistant, n8n, Node-RED : `title`, `message`, `event`, `priority`,
+`time`, `app`), **Discord** (webhook), **Telegram** (jeton de bot + identifiant de conversation) et
+**Gotify**. Chaque destination choisit les événements qu'elle reçoit (renouvellement en échec,
+expiration proche, renouvellement rétabli, mises à jour des apps, compte Apple et certificats) et a un
+bouton **Envoyer un test**. Les messages suivent la langue choisie dans les Réglages (avec
+« Automatique », la dernière langue affichée par l'interface) ; les heures portent leur décalage UTC.
+`TVSIGN_NTFY_URL` préconfigure toujours une destination ntfy, `TVSIGN_NTFY_EVENTS` ses événements
+(séparés par des virgules, `none` pour aucun). Sur ntfy.sh public, le nom du sujet fait office de mot
+de passe et les messages citent votre Apple ID et vos apps : choisir un sujet long et aléatoire, ou un
+ntfy auto-hébergé. Un serveur protégé s'utilise avec `https://utilisateur:motdepasse@hôte/sujet`
+(authentification Basic) ou un jeton d'accès ; un simple nom comme `mon-sujet` vaut
+`https://ntfy.sh/mon-sujet`. L'application Windows affiche aussi une notification Windows.
+
+Journaux : le journal d'accès est coupé (la page interroge le serveur toutes les 5 s) ;
+`TVSIGN_ACCESS_LOG=1` le rétablit.
+
+### Dépannage et assistance
+
+- **Diagnostic** (Réglages → Diagnostic) vérifie plumesign, mDNS, Apple, le serveur anisette,
+  GitHub, l'horloge et le disque. Un en-tête `Date` invalide renvoyé par un proxy ne le casse pas.
+- **Apple TV introuvable / « injoignable ».** L'Apple TV doit être sur le même réseau (VLAN) que tvsign
+  et répondre en mDNS. Une Apple TV en Wi-Fi en veille, ou éteinte avec le téléviseur (HDMI-CEC),
+  cesse souvent de répondre : préférer l'Ethernet, garder *Réglages › Général › Mise en veille après*
+  assez long, désactiver l'extinction CEC la nuit, ou la réveiller à la télécommande avant la fenêtre
+  de renouvellement. tvsign réessaie toutes les 45 minutes (10 près de l'expiration) et alerte à 24 h
+  et 6 h.
+- **L'app est sur l'Apple TV mais ne s'ouvre pas.** Son profil a peut-être expiré (voir sa carte), son
+  certificat a peut-être été révoqué par un autre outil sur le même Apple ID (tvsign la re-signe au
+  contrôle suivant), ou l'installation attend encore parce que l'app est ouverte. Essayer *Renouveler
+  maintenant*, puis redémarrer l'Apple TV. L'app apparaît sur l'écran d'accueil quelques secondes
+  après que l'installation annonce son succès.
+- **Erreurs de connexion Apple.** Vérifier l'horloge (Diagnostic), le serveur anisette (celui par
+  défaut, `ani.sidestore.app`, est partagé : une panne passagère est retentée seule) et que le compte
+  n'est pas connecté dans un autre tvsign.
+- **Signaler un bogue.** Ouvrir un ticket sur <https://github.com/esalwey/tvsign/issues> en joignant
+  le **dossier de support** (Réglages → Diagnostic → Assistance → Télécharger) : versions,
+  vérifications, apps, journal, historique des renouvellements et dernières sorties de plumesign, avec
+  adresses e-mail, adresses IP, identifiants d'appareil et secrets masqués (ni base, ni session Apple,
+  ni clé). *Copier les informations de support* en donne la version courte ; *Télécharger le journal*
+  (dans le bloc Journal) le journal seul.
 
 Compiler soi-même : voir [docs/building.md](docs/building.md).
 
