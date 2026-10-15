@@ -25,6 +25,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app import backup, db, devices, diag, ipa, main, notifier, plume, proc, renew, settings, support  # noqa: E402
 from app.config import DB_PATH, IPA_DIR, PLUME_HOME  # noqa: E402
+from app.util import ContentError  # noqa: E402
 
 HEADERS = {"X-Tvsign": "1"}
 STORE = PLUME_HOME / "PlumeImpactor"
@@ -229,7 +230,7 @@ class Rollback(RenewCase):
     def test_two_signing_failures_restore_the_previous_release(self):
         app_id = self.add_app()
         self.new_release()
-        self.sign_error = RuntimeError("signature : App ID limit reached")
+        self.sign_error = ContentError("signature : invalid Info.plist in bundle")
         self.run_renew(app_id, "nouvelle version")
         self.assertEqual(self.app(app_id)["source_tag"], "v2")              # un échec isolé : on réessaie
         self.run_renew(app_id, "auto")
@@ -1029,7 +1030,7 @@ class NotificationApi(unittest.TestCase):
         notifier.send = failing
         r = self.client.post("/api/notifications/test", headers=HEADERS,
                              json={"type": "gotify", "url": "https://g.example", "token": "zzz-token-1"})
-        self.assertEqual((r.status_code, r.json()["detail"]), (502, "notify_failed:HTTP 401"))
+        self.assertEqual((r.status_code, r.json()["detail"]), (502, "notify_http_401:HTTP 401"))
 
     def test_legacy_ntfy_is_listed_and_editable(self):
         self.client.patch("/api/settings", headers=HEADERS, json={"ntfy_url": "my-topic"})
