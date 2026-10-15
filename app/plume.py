@@ -18,7 +18,7 @@ LOCK = asyncio.Lock()
 STORE = PLUME_HOME / "PlumeImpactor"
 
 
-def env() -> dict:
+def env(anisette: str | None = None) -> dict:
     e = os.environ.copy()
     # plumesign range ses données dans %APPDATA% (Windows) ou $XDG_CONFIG_HOME (Linux)
     e["APPDATA" if os.name == "nt" else "XDG_CONFIG_HOME"] = str(PLUME_HOME)
@@ -26,20 +26,67 @@ def env() -> dict:
     e.pop("PLUMESIGN_PASSWORD", None)        # jamais hérité : passé seulement à « account login »
     for secret in ("TVSIGN_PASSWORD", "TVSIGN_LAUNCH_TOKEN", "TVSIGN_GITHUB_TOKEN"):
         e.pop(secret, None)                  # secrets de tvsign : inutiles à plumesign
-    anisette = settings.anisette_url()
+    if anisette is None:
+        urls = _anisette_urls()
+        anisette = urls[0] if urls else ""
     if anisette:
         e["PLUMESIGN_ANISETTE_URL"] = anisette
     return e
 
 
+# ---------- serveurs anisette : le dernier qui a répondu d'abord, les autres en secours ----------
+
+_ANISETTE_OK: str | None = None
+_ANISETTE_FAIL = re.compile(r"anisette", re.I)
+
+
+def _anisette_urls() -> list[str]:
+    """Adresses configurées, la dernière qui a fonctionné en tête. Vide : serveur par défaut de plumesign."""
+    urls = settings.anisette_urls()
+    if _ANISETTE_OK in urls:
+        urls = [_ANISETTE_OK] + [u for u in urls if u != _ANISETTE_OK]
+    return urls
+
+
+async def _plume(*args, extra_env: dict | None = None, **kw) -> Result:
+    """`plumesign …` avec bascule sur le serveur anisette suivant quand celui-ci est en panne
+    (une seule passe sur la liste). Sans liste de plusieurs adresses : un simple run()."""
+    global _ANISETTE_OK
+    urls = _anisette_urls()
+    res = None
+    for i, url in enumerate(urls or [None]):
+        e = env(url)
+        if extra_env:
+            e.update(extra_env)
+        res = await run(PLUMESIGN, *args, env=e, **kw)
+        if res.ok:
+            if url and len(urls) > 1:
+                _ANISETTE_OK = url
+            return res
+        if i + 1 >= len(urls) or not _ANISETTE_FAIL.search(res.output + res.err):
+            return res
+        db.log(f"serveur anisette {url} en échec, essai avec {urls[i + 1]}", "warn")
+    return res
+
+
+class Busy(RuntimeError):
+    """plumesign est tenu par une autre opération depuis trop longtemps (connexion Apple en attente ?)."""
+
+
 @asynccontextmanager
-async def _locked():
-    """Verrou plumesign borné : un détenteur bloqué devient une erreur visible, pas un blocage muet."""
+async def _locked(state=None):
+    """Verrou plumesign borné : un détenteur bloqué devient une erreur visible, pas un blocage muet.
+    state("waiting") est appelé si le verrou est pris par une autre opération (connexion Apple, autre
+    signature), state("acquired") une fois obtenu : l'interface n'affiche « signature » que pour de bon."""
+    if state and LOCK.locked():
+        state("waiting")
     try:
         await asyncio.wait_for(LOCK.acquire(), PLUME_LOCK_TIMEOUT)
     except TimeoutError:
-        raise RuntimeError("plumesign occupé depuis trop longtemps (connexion Apple en attente ?)") from None
+        raise Busy("plumesign occupé depuis trop longtemps (connexion Apple en attente ?)") from None
     try:
+        if state:
+            state("acquired")
         yield
     finally:
         LOCK.release()
@@ -68,6 +115,19 @@ def import_existing_store() -> None:
 
 
 # ---------- comptes ----------
+
+# Appelées (e-mail) quand une session Apple redevient valide : reconnexion réussie ou vérification
+# qui réussit après un échec. Enregistrées par renew (qui importe plume, pas l'inverse).
+ON_VALID: list = []
+
+
+def _valid(email: str) -> None:
+    for hook in ON_VALID:
+        try:
+            hook(email)
+        except Exception as e:  # noqa: BLE001 - accessoire
+            db.log(f"reprise après reconnexion de {email} : {e}", "warn")
+
 
 _LAST: dict = {}
 
@@ -121,10 +181,28 @@ def accounts() -> list[dict]:
     return out
 
 
-def default_account() -> str | None:
-    accs = accounts()
+def pick_default(accs: list[dict]) -> str | None:
+    """Compte choisi par défaut, sinon le premier par ordre alphabétique : jamais l'ordre du fichier
+    (plumesign l'écrit dans un ordre qui change d'un lancement à l'autre)."""
     sel = [a["email"] for a in accs if a["selected"]]
-    return sel[0] if sel else (accs[0]["email"] if accs else None)
+    if sel:
+        return sel[0]
+    return min((a["email"] for a in accs), key=lambda e: (e.casefold(), e), default=None)
+
+
+def default_account() -> str | None:
+    return pick_default(accounts())
+
+
+def find_account(email: str | None) -> str | None:
+    """Compte du store qui correspond à cette adresse, sans tenir compte de la casse (Apple ne la
+    distingue pas) ; None s'il n'y en a pas. Renvoie l'écriture du store, celle qui sert de clé."""
+    wanted = (email or "").strip().casefold()
+    if not wanted:
+        return None
+    found = sorted((a["email"] for a in accounts() if a["email"].casefold() == wanted),
+                   key=lambda e: (e != (email or "").strip(), e))
+    return found[0] if found else None
 
 
 class UnknownAccount(RuntimeError):
@@ -136,7 +214,7 @@ async def _switch(email: str) -> None:
         return  # évite une réécriture inutile de accounts.json
     if email not in (_store().get("accounts") or {}):
         raise UnknownAccount(f"compte {email} introuvable")
-    res = await run(PLUMESIGN, "account", "switch", email, env=env(), timeout=30)
+    res = await _plume("account", "switch", email, timeout=30)
     if not res.ok:
         raise RuntimeError(f"compte {email} introuvable : {res.tail()}")
 
@@ -178,13 +256,18 @@ _SESSION_TXT = re.compile(r"session (has )?expired|please (log|sign) in|not auth
                           r"No account (selected|currently)", re.I)
 _TRANSIENT = re.compile(r"Anisette error|Reqwest error|Request to developer session failed|"
                         r"délai dépassé|panicked|timed out|dns error|connection (refused|reset)", re.I)
+# Le portail répond 401 : jeton refusé, quel que soit le code Apple qui l'accompagne.
+_HTTP_401 = re.compile(r"Developer API error -?\d+ \(HTTP Some\(401\)\)")
+# Panne réseau / anisette : ne prouve rien sur la session, même si le texte mentionne un 401 ou « SRP ».
+_NETWORK_TXT = re.compile(r"Anisette error|Reqwest error|dns error|connection (refused|reset|closed)|timed out|"
+                          r"délai dépassé|panicked", re.I)
 
 
 def session_expired(output: str) -> bool:
     codes = set(_API_CODE.findall(output))
-    if codes & _SESSION_CODES:
+    if codes & _SESSION_CODES or _HTTP_401.search(output):
         return True
-    return not codes and bool(_SESSION_TXT.search(output))
+    return not codes and bool(_SESSION_TXT.search(output)) and not _NETWORK_TXT.search(output)
 
 
 def _classify(res: Result) -> bool | None:
@@ -204,6 +287,21 @@ class Transient(RuntimeError):
     """Anisette, réseau ou Apple momentanément indisponibles : nouvel essai rapproché."""
 
 
+class LimitReached(RuntimeError):
+    """Limite du compte gratuit atteinte (3 apps actives par appareil, 10 App ID par 7 jours) :
+    réessayer tout de suite ne sert à rien et consomme des App ID."""
+
+
+# Messages d'Apple (portail) et de l'Apple TV (installd) quand la limite du compte gratuit est atteinte.
+_LIMIT = re.compile(
+    r"maximum number of (installed )?(apps|app ?ids?)|too many (installed )?(apps|app ?ids?)|app ?id limit|"
+    r"limit of \d+ (apps|app ?ids)|reached the maximum number|cannot create .{0,20}app ?id", re.I)
+
+
+def is_limit(text: str) -> bool:
+    return bool(_LIMIT.search(text or ""))
+
+
 def _failure(email: str, what: str, res: Result) -> RuntimeError:
     """Erreur d'une commande plumesign du compte, classée : session expirée (bouton Reconnecter),
     passagère (anisette, réseau), ou autre."""
@@ -211,9 +309,17 @@ def _failure(email: str, what: str, res: Result) -> RuntimeError:
         _set_status(email, False, "session expirée, reconnexion nécessaire")
         return SessionExpired(f"session Apple de {email} expirée : reconnecte-le (bouton Reconnecter) "
                               f"[{what} : {res.tail(2)}]")
+    if is_limit(res.output):
+        return LimitReached(limit_message(what, res.tail(2)))
     if re.search(r"anisette|panicked", res.output, re.I) or _TRANSIENT.search(res.output) or res.code == -1:
         return Transient(f"{what} : {_why(res)} (passager, nouvel essai automatique)")
     return RuntimeError(f"{what} : {res.tail()}")
+
+
+def limit_message(what: str, detail: str = "") -> str:
+    return (f"limite du compte gratuit atteinte ({what}) : 3 apps actives par Apple TV et 10 App ID par 7 jours, "
+            "les apps installées avec d'autres outils comptent aussi. Retire une app ou attends"
+            + (f" [{detail}]" if detail else ""))
 
 
 def _why(res: Result) -> str:
@@ -229,9 +335,14 @@ def _why(res: Result) -> str:
 async def check_account(email: str) -> bool | None:
     """Vérifie que la session Apple est encore valide (appel au portail développeur).
     Renvoie None si on ne peut pas conclure (anisette, réseau) : pas de reconnexion à réclamer."""
+    known = find_account(email)
+    if not known:
+        return None          # compte inconnu : rien à vérifier, et pas de ligne d'état pour un compte absent
+    email = known
+    before = next((a["ok"] for a in accounts() if a["email"] == email), None)
     try:
         async with _locked(), _as(email):
-            res = await run(PLUMESIGN, "account", "devices", env=env(), timeout=90)
+            res = await _plume("account", "devices", timeout=90)
     except Exception as e:  # noqa: BLE001
         _set_status(email, None, f"vérification impossible : {e}")
         return None
@@ -240,20 +351,27 @@ async def check_account(email: str) -> bool | None:
         _set_status(email, None, _why(res))
     else:
         _set_status(email, ok, "session valide" if ok else f"session expirée, reconnexion nécessaire : {res.tail(2)}")
+        if ok and before != 1:
+            _valid(email)       # session de nouveau valide : les apps en attente peuvent repartir tout de suite
     return ok
 
 
 def start_login(email: str, password: str) -> Session:
     """Connexion Apple. La session passe en « waiting » quand Apple demande le code 2FA."""
+    # Apple ne distingue pas la casse : si ce compte est déjà connu (autre écriture), on garde celle du store
+    email = find_account(email) or email.strip()
     session = register(Session("login", re.compile(r"Enter (2FA code|the code sent)", re.I)))
     session.result["email"] = email
 
     async def done(s: Session) -> None:
-        if s.state == "done":
+        if s.exit_ok:
             _set_status(email, True, "connecté")
             _backup_store()
             db.execute("DELETE FROM account_devices WHERE email = ?", email)
             db.log(f"Compte Apple {email} connecté")
+            _valid(email)
+        elif s.user_cancelled:
+            db.log(f"Connexion Apple {email} annulée")
         else:
             db.log(f"Connexion Apple {email} échouée : {' | '.join(s.lines[-2:])}", "error")
 
@@ -304,13 +422,22 @@ def start_login(email: str, password: str) -> Session:
 async def logout(email: str) -> None:
     try:
         async with _locked(), _as(email):
-            res = await run(PLUMESIGN, "account", "logout", env=env(), timeout=30)
+            res = await _plume("account", "logout", timeout=30)
     except UnknownAccount:
         db.execute("DELETE FROM account_status WHERE email = ?", email)   # déjà retiré du store
         raise
     if not res.ok:
         raise RuntimeError(f"plumesign account logout : {res.tail(2)}")
     db.execute("DELETE FROM account_status WHERE email = ?", email)
+    # plumesign ne désigne plus de compte par défaut : on en choisit un de façon stable (ordre alphabétique)
+    # plutôt que de laisser l'ordre du fichier décider d'un redémarrage à l'autre
+    remaining = accounts()
+    if remaining and not any(a["selected"] for a in remaining):
+        try:
+            async with _locked():
+                await _switch(pick_default(remaining))
+        except Exception as e:  # noqa: BLE001 - non bloquant
+            db.log(f"compte par défaut non rétabli : {e}", "warn")
 
 
 async def select(email: str) -> None:
@@ -323,15 +450,16 @@ async def select(email: str) -> None:
 _DUPLICATE = re.compile(r"already exists|existe déjà|déjà enregistr", re.I)
 
 
-async def ensure_device(email: str, udid: str, name: str) -> None:
+async def ensure_device(email: str, udid: str, name: str, on_lock=None) -> None:
     # Pas de cache : sur un compte gratuit l'enregistrement expire au bout de 7 jours
     # (erreur 8220 « no devices » ensuite), et le réenregistrer le prolonge.
-    async with _locked(), _as(email):
-        res = await run(PLUMESIGN, "account", "register-device", "-u", udid, "-n", name, env=env(), timeout=90)
+    # on_lock("waiting"|"acquired") : voir _locked().
+    async with _locked(on_lock), _as(email):
+        res = await _plume("account", "register-device", "-u", udid, "-n", name, timeout=90)
         listed = None
         if not res.ok and not _DUPLICATE.search(res.output):
             # Réponse ambiguë : on vérifie dans la liste des appareils plutôt que de deviner.
-            listed = await run(PLUMESIGN, "account", "devices", env=env(), timeout=90)
+            listed = await _plume("account", "devices", timeout=90)
     if not res.ok and not _DUPLICATE.search(res.output):
         if not (listed and listed.ok and udid.lower() in listed.output.lower()):
             raise _failure(email, f"enregistrement de l'appareil sur {email}", res)
@@ -339,16 +467,15 @@ async def ensure_device(email: str, udid: str, name: str) -> None:
     db.execute("INSERT OR IGNORE INTO account_devices (email, udid) VALUES (?, ?)", email, udid)
 
 
-async def sign(email: str, ipa: Path, out: Path) -> bool:
+async def sign(email: str, ipa: Path, out: Path, on_lock=None) -> bool:
     """Signe ipa vers out (remplacé seulement en cas de succès).
     Renvoie True si plumesign a dû révoquer un ancien certificat du compte."""
     tmp = out.with_name(out.stem + ".tmp.ipa")
     tmp.unlink(missing_ok=True)
     try:
-        async with _locked(), _as(email):
-            e = env()
-            e["RUST_LOG"] = "warn"
-            res = await run(PLUMESIGN, "sign", "-p", ipa, "--apple-id", "-o", tmp, env=e, timeout=600)
+        async with _locked(on_lock), _as(email):
+            res = await _plume("sign", "-p", ipa, "--apple-id", "-o", tmp, extra_env={"RUST_LOG": "warn"},
+                               timeout=600)
         if not res.ok or not tmp.exists():
             raise _failure(email, "signature", res)
         replace_retry(tmp, out)
@@ -358,14 +485,27 @@ async def sign(email: str, ipa: Path, out: Path) -> bool:
     return "Revoked certificate" in res.output
 
 
+def signing_key(email: str) -> str | None:
+    """Clé privée PEM avec laquelle plumesign signe pour ce compte (keys/<équipe>/key.pem du store),
+    ou None si on ne la trouve pas (équipe inconnue et plusieurs clés possibles)."""
+    team = next((a["team_id"] for a in accounts() if a["email"] == email), None)
+    keys = STORE / "keys"
+    paths = [keys / team / "key.pem"] if team else sorted(keys.glob("*/key.pem"))
+    if len(paths) != 1:
+        return None
+    try:
+        return paths[0].read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
 async def issued_cert_serials(email: str) -> set[str] | None:
     """Numéros de série (hex, sans zéros de tête) des certificats encore valides du compte.
     None en cas d'échec : une erreur réseau ne doit jamais forcer un renouvellement."""
     try:
         async with _locked(), _as(email):
-            e = env()
-            e["RUST_LOG"] = "info"   # la liste est écrite dans le journal info (format Debug Rust)
-            res = await run(PLUMESIGN, "account", "certificates", env=e, timeout=90)
+            # la liste est écrite dans le journal info (format Debug Rust)
+            res = await _plume("account", "certificates", extra_env={"RUST_LOG": "info"}, timeout=90)
     except Exception:  # noqa: BLE001
         return None
     if not res.ok:

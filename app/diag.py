@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 
 from . import plume, settings
-from .config import DATA_DIR, PLUMESIGN, VERSION, WINDOWS
+from .config import DATA_DIR, PASSWORD_FILE_ERROR, PLUMESIGN, VERSION, WINDOWS
 
 DEFAULT_ANISETTE = "https://ani.sidestore.app"
 
@@ -85,6 +85,34 @@ async def _reach(id_: str, url: str) -> tuple[dict, float | None]:
     return _check(id_, "ok", f"{url} (HTTP {code})", code), ts
 
 
+async def _anisette() -> tuple[dict, None]:
+    """Chaque serveur anisette configuré, avec sa latence : le premier sert, les suivants prennent le relais.
+    Pas de liste : le serveur par défaut de plumesign."""
+    urls = settings.anisette_urls() or [DEFAULT_ANISETTE]
+
+    async def probe(url: str) -> tuple[str, int | None, str, float]:
+        t0 = time.time()
+        code, _, err = await asyncio.to_thread(_head, url)
+        return url, code, err, time.time() - t0
+
+    rows = await asyncio.gather(*(probe(u) for u in urls))
+    up = [r for r in rows if r[1] is not None]
+    detail = " ; ".join(f"{u} ({'HTTP ' + str(c) + ', ' + format(dt * 1000, '.0f') + ' ms' if c is not None else err})"
+                        for u, c, err, dt in rows)
+    if not up:
+        return _check("anisette", "error", detail, 0), None
+    # le premier est en panne mais un autre répond : le renouvellement fonctionne, à surveiller
+    status = "ok" if rows[0][1] is not None else "warn"
+    return _check("anisette", status, detail, len(up)), None
+
+
+def _password_file() -> dict | None:
+    """TVSIGN_PASSWORD_FILE défini mais inutilisable : le mot de passe prévu n'est pas appliqué."""
+    if not PASSWORD_FILE_ERROR:
+        return None
+    return _check("password_file", "error", PASSWORD_FILE_ERROR)
+
+
 def _disk() -> dict:
     free = shutil.disk_usage(DATA_DIR).free
     gb = free / 1e9
@@ -102,12 +130,11 @@ def _loop() -> dict:
 
 
 async def run_all() -> dict:
-    anisette = settings.anisette_url() or DEFAULT_ANISETTE
     started = time.time()
     results = await asyncio.gather(
         _plumesign(), _mdns(),
         _apple(),
-        _reach("anisette", anisette),
+        _anisette(),
         _reach("github", "https://api.github.com/"),
     )
     plumesign_, mdns, (apple, apple_date), (anis, _), (github, gh_date) = results
@@ -119,6 +146,9 @@ async def run_all() -> dict:
         status = "ok" if abs(skew) < 120 else "error"
         clock = _check("clock", status, f"écart {skew:+.0f} s avec l'heure d'Apple", round(skew))
     checks = [plumesign_, mdns, apple, anis, github, clock, _disk(), _loop()]
+    pw = _password_file()
+    if pw:
+        checks.insert(0, pw)
     return {
         "checks": checks,
         "ok": all(c["status"] != "error" for c in checks),
