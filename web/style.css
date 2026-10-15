@@ -283,6 +283,7 @@ h3 { margin: 0; }
 .journal time { font-family: var(--font-num); font-size: var(--t-foot); color: var(--label-2); white-space: nowrap; padding-top: 2px; min-width: 3.2em; }
 .journal__texte { flex: 1; min-width: 0; font-size: var(--t-subhead); }
 .journal__texte p { margin: 0; overflow-wrap: anywhere; }
+.journal__texte > p.journal__rep { font-size: var(--t-foot); color: var(--label-2); }
 .journal__ligne--error .journal__texte > p { color: var(--red-text); }
 .journal__ligne--warn .journal__texte > p { color: var(--orange-text); }
 .journal__ligne--error time::after, .journal__ligne--warn time::after { content: ' •'; }
