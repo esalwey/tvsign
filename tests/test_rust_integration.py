@@ -54,7 +54,8 @@ class CertRevokeSetting(unittest.TestCase):
         os.environ.pop("PLUMESIGN_REVOKE", None)      # avant update() : une variable la verrouille
         settings.update({"cert_revoke": None})
 
-    def test_default_never_touches_foreign_certificates(self):
+    def test_default_policy_given_to_plumesign_is_own(self):
+        # La logique de révocation elle-même est testée côté Rust (plume_core, utils/certificate.rs).
         self.assertEqual(settings.cert_revoke(), "own")
         self.assertEqual(plume.env()["PLUMESIGN_REVOKE"], "own")
 
@@ -112,18 +113,45 @@ class CertificateExpiry(unittest.TestCase):
         self.assertEqual((out_dir / "out.ipa").read_bytes(), b"signed")
         self.assertEqual(settings.raw_get("cert_expires:sign@example.com"), "2027-05-06")
 
-    def test_sign_still_reports_a_revoked_certificate(self):
+    def _sign_with_output(self, output: str) -> bool:
         db.init()
         out_dir = Path(tempfile.mkdtemp(prefix="tvsign-sign-"))
 
         async def fake_run(*args, **kwargs):
             Path(args[6]).write_bytes(b"x")
-            return SimpleNamespace(ok=True, output="WARN Revoked certificate with serial number 12\n",
-                                   tail=lambda n=1: "")
+            return SimpleNamespace(ok=True, output=output, tail=lambda n=1: "")
 
         restore = patched(_locked=lambda: FakeLock(), _as=lambda e: FakeLock(), run=fake_run)
         try:
-            self.assertTrue(asyncio.run(plume.sign("sign@example.com", out_dir / "in.ipa", out_dir / "o.ipa")))
+            return asyncio.run(plume.sign("sign@example.com", out_dir / "in.ipa", out_dir / "o.ipa"))
+        finally:
+            restore()
+
+    def test_sign_reports_a_foreign_certificate_revoked(self):
+        self.assertTrue(self._sign_with_output(
+            "WARN Revoked certificate (FOREIGN) with serial number 12 [Xcode]\n"))
+
+    def test_sign_ignores_dead_and_own_certificate_removals(self):
+        # Seule la révocation d'un certificat étranger casse d'autres apps : pas de fausse alerte.
+        self.assertFalse(self._sign_with_output(
+            "WARN Removed dead certificate with serial number 12 [x]\n"
+            "WARN Revoked own certificate with serial number 34 [y]\n"))
+
+    def test_logout_and_team_change_forget_the_certificate_date(self):
+        db.init()
+        email = "forget@example.com"
+
+        async def fake_run(*args, **kwargs):
+            return SimpleNamespace(ok=True, output="", tail=lambda n=1: "")
+
+        restore = patched(_locked=lambda: FakeLock(), _as=lambda e: FakeLock(), run=fake_run)
+        try:
+            settings.raw_set("cert_expires:" + email, "2027-01-01")
+            asyncio.run(plume.set_team(email, "ABCDE12345"))
+            self.assertIsNone(settings.raw_get("cert_expires:" + email))
+            settings.raw_set("cert_expires:" + email, "2027-01-01")
+            asyncio.run(plume.logout(email))
+            self.assertIsNone(settings.raw_get("cert_expires:" + email))
         finally:
             restore()
 
@@ -157,6 +185,21 @@ class Teams(unittest.TestCase):
             restore()
         self.assertEqual(seen, [("account", "teams", "--json")])
         self.assertEqual(len(teams), 2)
+
+    def test_listing_failure_is_classified_from_the_log_too(self):
+        # La session expirée s'écrit sur stderr : sans fusion avec stdout, elle serait une erreur générique.
+        async def fake_run(*args, **kwargs):
+            self.assertFalse(kwargs.get("split"))
+            return SimpleNamespace(ok=False, code=1, tail=lambda n=1: "x",
+                                   output="ERROR Developer API error 1100: session expired\n")
+
+        restore = patched(_locked=lambda: FakeLock(), _as=lambda e: FakeLock(), run=fake_run)
+        try:
+            db.init()
+            with self.assertRaises(plume.SessionExpired):
+                asyncio.run(plume.teams("a@b.c"))
+        finally:
+            restore()
 
     def test_set_team_rejects_a_malformed_id_before_running_anything(self):
         calls = []

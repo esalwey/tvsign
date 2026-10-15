@@ -157,6 +157,8 @@ def accounts() -> list[dict]:
 
 
 _CERT_KEY = "cert_expires:"
+# Ligne de journal de plumesign : seul un certificat étranger révoqué casse d'autres apps sideloadées.
+FOREIGN_REVOKED = "Revoked certificate (FOREIGN)"
 _CERT_LINE = re.compile(r"^CERT\s+([0-9A-Fa-f]+)\s+(\d{4}-\d{2}-\d{2})\s*$", re.M)
 
 
@@ -164,6 +166,14 @@ def cert_expiry(output: str) -> str | None:
     """Fin de validité du certificat de signature, d'après la ligne « CERT <série> <date> » de plumesign."""
     found = _CERT_LINE.findall(output or "")
     return found[-1][1] if found else None
+
+
+def _forget_cert_expiry(email: str) -> None:
+    """Oublie la date de fin du certificat : elle appartient à l'ancienne session ou équipe."""
+    try:
+        settings.raw_set(_CERT_KEY + email, None)
+    except Exception:  # noqa: BLE001 - l'affichage d'une date ne doit jamais bloquer
+        pass
 
 
 def default_account() -> str | None:
@@ -352,10 +362,12 @@ async def logout(email: str) -> None:
             res = await run(PLUMESIGN, "account", "logout", env=env(), timeout=30)
     except UnknownAccount:
         db.execute("DELETE FROM account_status WHERE email = ?", email)   # déjà retiré du store
+        _forget_cert_expiry(email)
         raise
     if not res.ok:
         raise RuntimeError(f"plumesign account logout : {res.tail(2)}")
     db.execute("DELETE FROM account_status WHERE email = ?", email)
+    _forget_cert_expiry(email)
 
 
 async def select(email: str) -> None:
@@ -391,7 +403,9 @@ async def teams(email: str) -> list[dict]:
     async with _locked(), _as(email):
         e = env()
         e["RUST_LOG"] = "warn"
-        res = await run(PLUMESIGN, "account", "teams", "--json", env=e, timeout=90, split=True)
+        # stdout et stderr ensemble : _failure classe la session expirée / l'anisette d'après le journal
+        # (stderr) ; parse_teams ignore les lignes qui ne sont pas du JSON.
+        res = await run(PLUMESIGN, "account", "teams", "--json", env=e, timeout=90)
     if not res.ok:
         raise _failure(email, "liste des équipes", res)
     return parse_teams(res.output)
@@ -405,6 +419,7 @@ async def set_team(email: str, team_id: str) -> None:
         res = await run(PLUMESIGN, "account", "set-team", team_id, env=env(), timeout=90)
     if not res.ok:
         raise _failure(email, "choix de l'équipe", res)
+    _forget_cert_expiry(email)   # le certificat dépend de l'équipe : la date affichée n'est plus la bonne
     db.log(f"Équipe {team_id} choisie pour {email} : les prochaines signatures l'utilisent")
 
 
@@ -431,7 +446,8 @@ async def ensure_device(email: str, udid: str, name: str) -> None:
 
 async def sign(email: str, ipa: Path, out: Path) -> bool:
     """Signe ipa vers out (remplacé seulement en cas de succès).
-    Renvoie True si plumesign a dû révoquer un ancien certificat du compte."""
+    Renvoie True si plumesign a dû révoquer un certificat d'une autre application ou installation
+    (Xcode, SideStore, un autre tvsign) : les certificats morts ou ceux de cette installation ne comptent pas."""
     tmp = out.with_name(out.stem + ".tmp.ipa")
     tmp.unlink(missing_ok=True)
     try:
@@ -449,7 +465,7 @@ async def sign(email: str, ipa: Path, out: Path) -> bool:
     expiry = cert_expiry(res.output)
     if expiry:
         settings.raw_set(_CERT_KEY + email, expiry)
-    return "Revoked certificate" in res.output
+    return FOREIGN_REVOKED in res.output
 
 
 async def issued_cert_serials(email: str) -> set[str] | None:
