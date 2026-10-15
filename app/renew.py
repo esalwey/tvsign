@@ -1,12 +1,14 @@
 """Renouvellement : mise à jour de la source, signature, installation, et boucle de planification."""
 import asyncio
 import base64
+import hashlib
 import json
+import re
 import time
 import urllib.parse
 import urllib.request
 
-from . import db, devices, ipa, plume, proc, settings
+from . import db, devices, ipa, plume, proc, selfupdate, settings, util
 from .config import (ACCOUNT_CHECK_HOURS, APP_WAIT_MINUTES, CHECK_INTERVAL, IPA_DIR,
                      RELEASE_CHECK_MINUTES, RENEW_TIMEOUT_MINUTES, RETRY_MINUTES)
 
@@ -21,6 +23,15 @@ _RERUN: set[int] = set()                # destination changée pendant un renouv
 _ACC_ALERTED: set[str] = set()          # comptes déjà signalés déconnectés (une alerte par épisode)
 _EXPIRED_LOGGED: set[int] = set()       # apps dont l'expiration est déjà au journal (une fois par épisode)
 _NO_MATCH_LOGGED: set[int] = set()      # apps dont l'absence de release correspondante est déjà au journal
+_RELEASE_ERR: dict[int, str] = {}       # apps dont la recherche de version échoue : message (une ligne de journal par épisode)
+_LINK_CHECKED: dict[int, float] = {}    # liens sans marqueur de version : dernière comparaison d'empreinte
+_OS_REFRESHED: dict[int, float] = {}    # Apple TV dont la version de tvOS a été relue pour lever un blocage
+
+# Déclencheurs d'une mise à jour facultative : l'app installée reste valable, un échec ne la fait pas passer en erreur.
+UPDATE_TRIGGERS = ("nouvelle version", "mise à jour", "nouvelle IPA", "nouvelle source", "retour arrière")
+# Renouvellements qui re-signent toujours et appliquent la version demandée même si la mise à jour auto est coupée.
+FORCE_SIGN = ("manuel", "nouvelle destination", "nouvelle IPA", "retour arrière")
+FORCE_UPDATE = ("mise à jour", "nouvelle source")
 
 # État de la boucle, exposé dans /api/state pour l'interface.
 HEALTH: dict = {
@@ -31,6 +42,7 @@ HEALTH: dict = {
     "last_account_check_at": None,
     "last_release_check_at": None,
     "notify_error": None,               # dernier échec d'envoi ntfy
+    "release_check_error": None,        # dernier échec de la recherche de nouvelles versions (GitHub)
 }
 
 
@@ -133,18 +145,102 @@ def _unchanged(app: dict, tag: str, key: str | None) -> bool:
 
 
 def _rejected(app: dict, tag: str, key: str | None) -> bool:
-    """Cette release (ce contenu) a-t-elle déjà été refusée ?"""
-    return tag == app.get("bad_tag") and (key is None or app.get("bad_key") in (None, key))
+    """Cette release (ce contenu) a-t-elle déjà été refusée ? Une clé inconnue (NULL) n'est pas un joker :
+    un refus sans clé ne doit pas bloquer tous les fichiers futurs du même lien."""
+    return tag == app.get("bad_tag") and app.get("bad_key") == key
 
 
-async def refresh_source(app: dict) -> bool:
+def _sha256_file(path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def pending_update(app: dict) -> bool:
+    """Une IPA plus récente que celle installée attend-elle d'être installée ? (téléchargée, mais le dernier
+    essai a échoué ou n'a pas encore eu lieu). Faux tant que l'empreinte de l'installée est inconnue."""
+    return bool(app.get("installed_ipa") and app.get("source_sha256")
+                and app["installed_ipa"] != app["source_sha256"])
+
+
+def has_previous(app_id: int) -> bool:
+    return (app_dir(app_id) / "original.prev.ipa").exists()
+
+
+def _swap_files(app_id: int) -> None:
+    """Échange original.ipa et original.prev.ipa."""
+    d = app_dir(app_id)
+    tmp = d / "original.swap"
+    tmp.unlink(missing_ok=True)
+    util.replace_retry(d / "original.ipa", tmp)
+    util.replace_retry(d / "original.prev.ipa", d / "original.ipa")
+    util.replace_retry(tmp, d / "original.prev.ipa")
+
+
+def _device_os(app: dict) -> str | None:
+    if not app.get("device_id"):
+        return None
+    d = db.row("SELECT os_version FROM devices WHERE id = ?", app["device_id"])
+    return d["os_version"] if d else None
+
+
+def _blocked_by_os(app: dict) -> str | None:
+    """tvOS minimal demandé par la version refusée, si le refus vient de là (« tvos:26.1 »)."""
+    block = str(app.get("update_block") or "")
+    return block[5:] if block.startswith("tvos:") else None
+
+
+async def _lift_os_block(app: dict) -> None:
+    """Version refusée parce que la TV était trop ancienne : si la TV a été mise à jour depuis, on la
+    redevient candidate. La version de tvOS enregistrée peut être périmée : on la relit (au plus
+    toutes les 6 h par TV) tant qu'un blocage existe."""
+    need = _blocked_by_os(app)
+    if not need or not app.get("device_id"):
+        return
+    have = _device_os(app)
+    if ipa.os_older(have, need) and time.time() - _OS_REFRESHED.get(app["device_id"], 0) > 6 * 3600:
+        _OS_REFRESHED[app["device_id"]] = time.time()
+        try:
+            await devices.refresh_info(app["device_id"])
+        except Exception:  # noqa: BLE001 - TV éteinte : on réessaiera plus tard
+            return
+        have = _device_os(app)
+    if not ipa.os_older(have, need):
+        fields = dict(bad_tag=None, bad_key=None, update_tag=None, update_notes=None, update_block=None)
+        db.update("apps", app["id"], **fields)
+        app.update(fields)
+        db.log(f"{app['name']} : tvOS {have} sur l'Apple TV, la version refusée (tvOS {need} minimum) est de nouveau candidate",
+               app_id=app["id"])
+
+
+def _note_update(app: dict, tag: str | None, notes: str | None, block: str | None) -> None:
+    """Mémorise (ou efface, avec tag None) la mise à jour disponible mais non installée, pour l'interface."""
+    want = dict(update_tag=tag, update_notes=notes or None if tag else None, update_block=block if tag else None)
+    fields = {k: v for k, v in want.items() if app.get(k) != v}
+    if fields:
+        db.update("apps", app["id"], **fields)
+        app.update(fields)
+
+
+def _link_label(app: dict, tag: str | None) -> str:
+    return ipa.redact(tag) if app["source_type"] == "url" and tag else str(tag)
+
+
+async def refresh_source(app: dict, force: bool = False) -> bool:
     """Télécharge une nouvelle version si la source en publie une ; True si l'IPA a changé.
-    Si une IPA utilisable existe déjà, un problème de source ne bloque pas le renouvellement."""
+    Si une IPA utilisable existe déjà, un problème de source ne bloque pas le renouvellement.
+    force : mise à jour demandée par l'utilisateur (ignore « mise à jour auto » coupée et les refus passés)."""
     if app["source_type"] == "upload":
         return False
     dest = app_dir(app["id"]) / "original.ipa"
-    tag, key, sha256 = None, None, None
+    prev = app_dir(app["id"]) / "original.prev.ipa"
+    hold = dest.with_suffix(".hold")
+    tag, key, sha256, notes = None, None, None, None
     try:
+        if dest.exists():
+            await _lift_os_block(app)
         if app["source_type"] == "github":
             found = await asyncio.to_thread(_latest, app)
             if not found:
@@ -153,8 +249,9 @@ async def refresh_source(app: dict) -> bool:
                     prefixes, _ = ipa.release_rule(app)
                     which = f", tags {' / '.join(x + '*' for x in prefixes)}" if prefixes else ""
                     hint = await _beta_hint(app) if channel == "stable" else ""
+                    pin = f" (version épinglée : {app['pinned_tag']})" if app.get("pinned_tag") else ""
                     raise RuntimeError(f"aucune IPA trouvée dans les releases ({channel}{which}) de "
-                                       f"{app['source']}{hint}")
+                                       f"{app['source']}{pin}{hint}")
                 if app["id"] not in _NO_MATCH_LOGGED:
                     _NO_MATCH_LOGGED.add(app["id"])
                     db.log(f"{app['name']} : aucune release ne correspond plus dans {app['source']} "
@@ -163,39 +260,92 @@ async def refresh_source(app: dict) -> bool:
                 return False
             _NO_MATCH_LOGGED.discard(app["id"])
             tag, url, sha256, key = found["tag"], found["url"], found["sha256"], found.get("key")
+            notes = found.get("notes")
         else:
             tag = url = app["source"]
             key = await asyncio.to_thread(ipa.url_key, url)
+        unchanged_sha = None
         if dest.exists():
-            if _rejected(app, tag, key):
+            if not force and _rejected(app, tag, key):
                 return False
             if _unchanged(app, tag, key):
                 if key and app.get("source_key") is None:
                     db.update("apps", app["id"], source_key=key)   # première lecture de la clé (ancienne base)
+                if app["source_type"] == "url" and key is None and app.get("source_sha256") \
+                        and app.get("auto_update", 1) and tag not in (app.get("bad_tag"),) \
+                        and (force or time.time() - _LINK_CHECKED.get(app["id"], 0) > 6 * 3600):
+                    # serveur sans ETag, date ni taille : seul un nouveau téléchargement dit si le fichier a changé
+                    unchanged_sha = app["source_sha256"]
+                else:
+                    if app["source_type"] == "github":
+                        _note_update(app, None, None, None)
+                    return False
+            elif not force and not app.get("auto_update", 1):
+                # mise à jour automatique coupée : on signale la nouvelle version sans l'installer
+                _note_update(app, tag, notes, "manual")
                 return False
-        db.log(f"{app['name']} : téléchargement de {tag}"
-               + (" (fichier mis à jour sous le même nom)" if tag == app["source_tag"] and dest.exists() else "")
-               + (" (empreinte SHA-256 vérifiée)" if sha256 else ""), app_id=app["id"])
+        if not unchanged_sha:
+            db.log(f"{app['name']} : téléchargement de {_link_label(app, tag)}"
+                   + (" (fichier mis à jour sous le même nom)" if tag == app["source_tag"] and dest.exists() else "")
+                   + (" (empreinte SHA-256 vérifiée)" if sha256 else ""), app_id=app["id"])
         # dest remplacé seulement si valide ; un bundle ID différent de l'app suivie est refusé
         expect = app.get("bundle_id") if dest.exists() else None
-        info = await asyncio.to_thread(ipa.download, url, dest, sha256, expect)
+        extra = {}
+        have_os = _device_os(app)
+        if have_os:
+            extra["max_os"] = have_os             # une release qui demande un tvOS plus récent que la TV est refusée
+        if unchanged_sha:
+            extra["unchanged_sha"] = unchanged_sha
+        # dernière IPA installée gardée à côté (retour en arrière) ; si une mise à jour jamais installée
+        # attend déjà, la copie existante (la dernière installée) reste en place
+        keep = dest.exists() and not pending_update(app)
+        if keep:
+            ipa.keep_copy(dest, hold, copy=not unchanged_sha)
+        info = await asyncio.to_thread(ipa.download, url, dest, sha256, expect, **extra)
+        if unchanged_sha:
+            _LINK_CHECKED[app["id"]] = time.time()
+        if info is None:
+            return False                          # même empreinte : le fichier du lien n'a pas changé
+        if keep and hold.exists():
+            util.replace_retry(hold, prev)
+            db.update("apps", app["id"], prev_tag=app.get("source_tag"), prev_key=app.get("source_key"),
+                      prev_version=app.get("version"), prev_sha256=app.get("source_sha256"))
+    except ipa.OsTooOld as e:
+        if not dest.exists():
+            raise
+        # TV trop ancienne pour cette version : app installée intacte, version non retéléchargée à chaque
+        # passage, et reprise dès que la TV est mise à jour (_lift_os_block)
+        db.update("apps", app["id"], bad_tag=tag, bad_key=key, update_tag=tag, update_notes=notes or None,
+                  update_block=f"tvos:{e.min_os}")
+        msg = (f"{app['name']} : la version {_link_label(app, tag)} demande tvOS {e.min_os} ou plus, "
+               f"l'Apple TV est en tvOS {e.have} : version actuelle conservée")
+        db.log(msg, "warn", app_id=app["id"])
+        await notify(msg)
+        return False
     except Exception as e:  # noqa: BLE001
         if not dest.exists():
             raise
-        # SourceRejected (IPA invalide, empreinte fausse, bundle ID changé) est un ValueError
-        if tag and isinstance(e, ValueError) and not isinstance(e, json.JSONDecodeError):
+        # SourceRejected (IPA invalide, empreinte fausse, bundle ID changé) est un ValueError.
+        # Un lien dont on n'a pas pu lire de clé (erreur dès url_key, serveur sans marqueur) ne mémorise pas
+        # de refus : il bloquerait aussi les fichiers corrigés. Dans ce cas c'est une panne passagère.
+        key_known = key is not None or app["source_type"] == "github"
+        if tag and isinstance(e, ValueError) and not isinstance(e, json.JSONDecodeError) and key_known:
             # IPA invalide (pas une IPA, pas tvOS) : ne pas la retélécharger à chaque essai.
             # Le reste (coupure, réponse tronquée, JSON GitHub illisible) est passager : on réessaiera.
             db.update("apps", app["id"], bad_tag=tag, bad_key=key)
-            db.log(f"{app['name']} : version {tag} inutilisable ({e}), version précédente conservée",
+            db.log(f"{app['name']} : version {_link_label(app, tag)} inutilisable ({e}), version précédente conservée",
                    "warn", app_id=app["id"])
-            await notify(f"{app['name']} : nouvelle version {tag} inutilisable ({e}), version précédente conservée")
+            await notify(f"{app['name']} : nouvelle version {_link_label(app, tag)} inutilisable ({e}), "
+                         "version précédente conservée")
         else:
             db.log(f"{app['name']} : source indisponible ({e}), version précédente conservée",
                    "warn", app_id=app["id"])
         return False
+    finally:
+        hold.unlink(missing_ok=True)
     db.update("apps", app["id"], source_tag=tag, source_key=key, version=info["version"],
-              bundle_id=info["bundle_id"], bad_tag=None, bad_key=None, source_sha256=info.get("sha256"))
+              bundle_id=info["bundle_id"], bad_tag=None, bad_key=None, source_sha256=info.get("sha256"),
+              notes=notes or None, update_tag=None, update_notes=None, update_block=None)
     return True
 
 
@@ -212,27 +362,54 @@ async def _beta_hint(app: dict) -> str:
 
 def _latest(app: dict) -> dict | None:
     prefixes, prereleases = ipa.release_rule(app)
-    return ipa.latest_github(app["source"], prefixes, prereleases, app.get("asset_name"))
+    return ipa.latest_github(app["source"], prefixes, prereleases, app.get("asset_name"),
+                             app.get("pinned_tag") or None)
+
+
+def _release_error(app: dict, e: Exception) -> None:
+    """La recherche de version échoue (quota GitHub, dépôt renommé…) : une ligne de journal par épisode,
+    et l'état exposé à l'interface, au lieu d'un silence qui arrête les mises à jour sans trace."""
+    msg = str(e) or e.__class__.__name__
+    if _RELEASE_ERR.get(app["id"]) != f"{app['name']} : {msg}":
+        db.log(f"{app['name']} : recherche de nouvelle version impossible ({msg})", "warn", app_id=app["id"])
+    _RELEASE_ERR[app["id"]] = f"{app['name']} : {msg}"
+    HEALTH["release_check_error"] = next(iter(_RELEASE_ERR.values()))
+
+
+def _release_ok(app: dict) -> None:
+    if _RELEASE_ERR.pop(app["id"], None) is not None:
+        HEALTH["release_check_error"] = next(iter(_RELEASE_ERR.values()), None)
 
 
 async def new_release(app: dict) -> bool:
     """Vrai si la source GitHub publie une version différente de celle installée (autre tag, ou
-    même tag dont l'IPA a été remplacée) et pas déjà refusée. Les liens ne sont relus qu'au
-    renouvellement (refresh_source)."""
+    même tag dont l'IPA a été remplacée), pas déjà refusée, et si la mise à jour automatique est active.
+    Sinon, une version disponible mais non installée est mémorisée pour l'interface. Les liens ne sont
+    relus qu'au renouvellement (refresh_source)."""
     if app["source_type"] != "github":
         return False
     try:
         found = await asyncio.to_thread(_latest, app)
-    except Exception:  # noqa: BLE001 - GitHub indisponible : on réessaiera
+    except Exception as e:  # noqa: BLE001 - GitHub indisponible : on réessaiera, mais on le dit
+        _release_error(app, e)
         return False
+    _release_ok(app)
     if not found:
         return False
+    await _lift_os_block(app)
     tag, key = found["tag"], found.get("key")
-    if _rejected(app, tag, key):
+    differs = tag != app["source_tag"] or (bool(key) and app.get("source_key") not in (None, key))
+    if not differs:
+        _note_update(app, None, None, None)
         return False
-    if tag != app["source_tag"]:
-        return True
-    return bool(key) and app.get("source_key") not in (None, key)
+    if _rejected(app, tag, key):
+        if not _blocked_by_os(app) and app.get("update_block") != "rollback":
+            _note_update(app, None, None, None)
+        return False
+    if not app.get("auto_update", 1):
+        _note_update(app, tag, found.get("notes"), "manual")
+        return False
+    return True
 
 
 # ---------- renouvellement ----------
@@ -275,15 +452,50 @@ def rerun(app_id: int) -> None:
         _RERUN.add(app_id)
 
 
-def _retry_at(app: dict, now: float, transient: bool = False) -> float:
-    """Prochain essai : plus rapproché quand l'expiration approche (ou pour une panne passagère :
-    anisette, réseau), jamais après elle."""
-    delay = RETRY_MINUTES * 60
-    if transient:
-        delay = min(delay, 15 * 60)
-    exp = app["expires_at"]
-    if exp and exp - now < 12 * 3600:
-        delay = min(delay, 10 * 60)
+# Causes qui ne se règlent que par une action de l'utilisateur (compte plein, pas d'équipe, tvOS trop ancien) :
+# réessayer toutes les heures ne ferait que solliciter Apple pour rien.
+_PERMANENT = re.compile(r"NO_TEAM|MULTIPLE_TEAMS|maximum (number )?of (apps|app ids)|too many (apps|app ids)|"
+                        r"app id limit|limit of \d+ (apps|app ids)|demande tvOS", re.I)
+# Échecs locaux, avant tout appel à Apple : sans coût pour Apple, mais inutiles tant que rien n'a changé.
+_LOCAL = re.compile(r"aucune Apple TV|aucun compte Apple|déconnecté|reconnecte-le|appairage perdu|"
+                    r"compte .*(introuvable|retiré)", re.I)
+
+
+def error_kind(e: Exception) -> str:
+    """unreachable (TV introuvable) | local (compte, appairage…) | transient (réseau, anisette, app ouverte) |
+    permanent (action de l'utilisateur requise) | other."""
+    if isinstance(e, devices.Unreachable):
+        return "unreachable"
+    if isinstance(e, (devices.PairingLost, plume.SessionExpired, plume.UnknownAccount)) or _LOCAL.search(str(e)):
+        return "local"
+    if isinstance(e, (plume.Transient, devices.AppInUse)):
+        return "transient"
+    if isinstance(e, TvosTooOld) or _PERMANENT.search(str(e)):
+        return "permanent"
+    return "other"
+
+
+# (premier délai, plafond) en minutes par nature d'échec ; le délai double à chaque échec consécutif.
+_BACKOFF = {"unreachable": (10, 60), "local": (10, 60), "transient": (10, 180), "permanent": (1440, 1440)}
+# plafond quand l'échéance est dans moins de 12 h : on insiste davantage, sauf pour ce qui demande l'utilisateur
+_NEAR_EXPIRY = {"unreachable": 10, "local": 10, "transient": 30, "other": 60, "permanent": 360}
+
+
+def _retry_at(app: dict, now: float, transient: bool = False, kind: str | None = None,
+              fails: int | None = None) -> float:
+    """Prochain essai après un échec : recul exponentiel selon le nombre d'échecs consécutifs (fail_count),
+    plafonné. Les échecs qui ne touchent pas Apple (TV éteinte, compte déconnecté) reviennent plus vite ;
+    ceux qui exigent l'utilisateur, une fois par jour. Plus rapproché à l'approche de l'échéance (jamais après
+    elle), mais sans insister après l'expiration : Apple ne doit pas être sollicité toutes les 10 min."""
+    kind = kind or ("transient" if transient else "other")
+    n = max(1, fails if fails is not None else (app.get("fail_count") or 0) + 1)
+    first, cap = _BACKOFF.get(kind, (RETRY_MINUTES, 360))
+    delay = min(first * 2 ** min(n - 1, 12), cap) * 60
+    exp = app.get("expires_at")
+    if exp and 0 < exp - now < 12 * 3600:
+        delay = min(delay, _NEAR_EXPIRY[kind] * 60)
+    elif exp and exp <= now and kind in ("unreachable", "local"):
+        delay = min(delay, 30 * 60)
     if exp and now < exp < now + delay:
         delay = max(exp - now - 60, 60)
     return now + delay
@@ -306,8 +518,9 @@ def _reusable_signature(app: dict, original, signed, now: float) -> float | None
 
 
 def _serials(signed) -> str | None:
+    """Certificat de la signature : celui qui a réellement signé (lu dans l'exécutable) ; à défaut, ceux du profil."""
     try:
-        return ",".join(sorted(ipa.profile_cert_serials(signed))) or None
+        return ipa.signer_serial(signed) or ",".join(sorted(ipa.profile_cert_serials(signed))) or None
     except Exception:  # noqa: BLE001
         return None
 
@@ -330,6 +543,62 @@ async def drain(seconds: float) -> None:
         await asyncio.sleep(1)
 
 
+class TvosTooOld(RuntimeError):
+    """L'IPA demande un tvOS plus récent que celui de l'Apple TV : rien à signer ni envoyer."""
+
+
+async def _preflight_os(device: dict, original) -> None:
+    """MinimumOSVersion de l'IPA contre le tvOS de l'Apple TV, avant tout appel à Apple. La version
+    enregistrée peut être périmée (TV mise à jour depuis) : elle est relue avant de refuser."""
+    try:
+        need = (await asyncio.to_thread(ipa.app_info, original)).get("min_os")
+    except Exception:  # noqa: BLE001 - IPA illisible : la signature le dira
+        return
+    if not need or not ipa.os_older(device.get("os_version"), need):
+        return
+    try:
+        await devices.refresh_info(device["id"])
+        device = db.row("SELECT * FROM devices WHERE id = ?", device["id"]) or device
+    except Exception:  # noqa: BLE001
+        pass
+    if ipa.os_older(device.get("os_version"), need):
+        raise TvosTooOld(f"cette app demande tvOS {need} ou plus, « {device['name']} » est en tvOS "
+                         f"{device.get('os_version')} : mets l'Apple TV à jour ou choisis une version plus ancienne")
+
+
+async def _fall_back(app_id: int, first: Exception, deliver, signed) -> float:
+    """La mise à jour téléchargée n'a pas pu être signée ou installée : on essaie la version précédente.
+    Si elle s'installe, la nouvelle est écartée (refusée jusqu'à une autre release) ; si elle échoue aussi,
+    le problème ne vient pas de la nouvelle version : tout est remis en place et l'erreur d'origine remonte."""
+    cur = db.row("SELECT * FROM apps WHERE id = ?", app_id)
+    if not (cur and error_kind(first) == "other" and pending_update(cur) and has_previous(app_id)):
+        raise first
+    name = cur["name"]
+    new_label = cur["source_tag"] or cur["version"] or "la nouvelle version"
+    db.log(f"{name} : la version {new_label} n'a pas pu être installée ({first}), nouvel essai avec la version "
+           f"précédente {cur['prev_tag'] or cur['prev_version'] or ''}".rstrip(), "warn", app_id=app_id)
+    signed.unlink(missing_ok=True)
+    _swap_files(app_id)
+    try:
+        expires = await deliver()
+    except BaseException as e:
+        _swap_files(app_id)
+        signed.unlink(missing_ok=True)
+        if isinstance(e, Exception):
+            raise first from None
+        raise
+    (app_dir(app_id) / "original.prev.ipa").unlink(missing_ok=True)       # la version écartée
+    db.update("apps", app_id, source_tag=cur["prev_tag"], source_key=cur["prev_key"], version=cur["prev_version"],
+              source_sha256=cur["prev_sha256"], bad_tag=cur["source_tag"], bad_key=cur["source_key"],
+              update_tag=None, update_notes=None, update_block=None, notes=None,
+              prev_tag=None, prev_key=None, prev_version=None, prev_sha256=None)
+    msg = (f"{name} : la version {new_label} n'a pas pu être installée ({first}) ; la version précédente "
+           "est réinstallée et la nouvelle ignorée")
+    db.log(msg, "warn", app_id=app_id)
+    await notify(msg)
+    return expires
+
+
 async def _renew(app_id: int, trigger: str) -> None:
     app = db.row("SELECT * FROM apps WHERE id = ?", app_id)
     if not app:
@@ -337,6 +606,7 @@ async def _renew(app_id: int, trigger: str) -> None:
     if trigger == "auto" and not app["enabled"]:
         return  # mise en pause pendant que la boucle traitait une autre app
     started = time.time()
+    was_ok = app["status"] == "ok"
     db.update("apps", app_id, status="running", last_error=None, last_attempt_at=started,
               last_trigger=trigger)
     try:
@@ -365,59 +635,83 @@ async def _renew(app_id: int, trigger: str) -> None:
         else:
             await devices.check_reachable(device)
 
-        updated = await refresh_source(app)
-        if trigger == "nouvelle version" and not updated and app["status"] == "ok":
-            # téléchargement raté ou version refusée : inutile de re-signer l'ancienne version
+        updated = await refresh_source(app, force=trigger in FORCE_UPDATE)
+        cur = db.row("SELECT * FROM apps WHERE id = ?", app_id) or app
+        if trigger in ("nouvelle version", "mise à jour") and not updated and was_ok and not pending_update(cur):
+            # téléchargement raté, version refusée ou rien de nouveau : inutile de re-signer l'ancienne version
             db.update("apps", app_id, status="ok", last_error=None)
+            if trigger == "mise à jour" and not cur.get("update_tag"):
+                db.log(f"{app['name']} : déjà à jour", app_id=app_id)
             return
         original = app_dir(app_id) / "original.ipa"
         signed = app_dir(app_id) / "signed.ipa"
         if not original.exists():
             raise RuntimeError("IPA d'origine absente : réimporte l'app")
+        if not cur.get("source_sha256"):
+            cur["source_sha256"] = await asyncio.to_thread(_sha256_file, original)   # ancienne base ou import
+            db.update("apps", app_id, source_sha256=cur["source_sha256"])
+        await _preflight_os(device, original)
 
-        # 2. Signature (réutilise une signature récente jamais installée, sauf demande manuelle).
-        force = trigger in ("manuel", "nouvelle destination")
-        expires = None if force else _reusable_signature(app, original, signed, time.time())
-        if expires:
-            db.log(f"{app['name']} : signature du {_fmt(signed.stat().st_mtime)} réutilisée", app_id=app_id)
-        else:
-            _phase(app_id, "signing")
-            await plume.ensure_device(email, device["udid"], device["name"])
-            db.log(f"{app['name']} : signature avec {email}", app_id=app_id)
-            if await plume.sign(email, original, signed):
-                msg = (f"un ancien certificat de {email} a été révoqué pour signer {app['name']} : "
-                       "les autres apps sideloadées avec ce compte (iPhone…) vont cesser de fonctionner")
-                db.log(msg, "warn", app_id=app_id)
-                await notify(msg)
-                # les autres apps tvsign du compte, signées avec le certificat révoqué, sont à refaire
-                # tout de suite plutôt qu'au prochain contrôle périodique
-                await _guarded("contrôle des certificats", _check_certificates(email))
-            expires = ipa.profile_expiry(signed) or time.time() + 7 * 86400
+        force = trigger in FORCE_SIGN
 
-        # 3. Installation. Si l'app est ouverte sur la TV, installd attend qu'elle soit fermée :
-        # l'interface le signale, et on abandonne au bout de APP_WAIT_MINUTES.
-        db.log(f"{app['name']} : installation sur « {device['name']} »", app_id=app_id)
-        wait_cap = APP_WAIT_MINUTES * 60
-        logged = set()
-
-        def on_event(step: str, percent=None, since=None) -> None:
-            if step == "waiting":
-                _phase(app_id, "waiting_app", percent=percent, waiting_since=since,
-                       deadline=(since or time.time()) + wait_cap)
-                if "waiting" not in logged:
-                    logged.add("waiting")
-                    db.log(f"{app['name']} : installation en attente, l'app est sans doute ouverte sur "
-                           f"« {device['name']} » ; elle se terminera dès sa fermeture", "warn", app_id=app_id)
+        async def deliver() -> float:
+            # 2. Signature (réutilise une signature récente jamais installée, sauf demande manuelle).
+            expires = None if force else _reusable_signature(app, original, signed, time.time())
+            if expires:
+                db.log(f"{app['name']} : signature du {_fmt(signed.stat().st_mtime)} réutilisée", app_id=app_id)
             else:
-                _phase(app_id, step, percent=percent)
+                _phase(app_id, "signing")
+                await plume.ensure_device(email, device["udid"], device["name"])
+                db.log(f"{app['name']} : signature avec {email}", app_id=app_id)
+                if await plume.sign(email, original, signed):
+                    msg = (f"un ancien certificat de {email} a été révoqué pour signer {app['name']} : "
+                           "les autres apps sideloadées avec ce compte (iPhone…) vont cesser de fonctionner")
+                    db.log(msg, "warn", app_id=app_id)
+                    await notify(msg)
+                    # les autres apps tvsign du compte, signées avec le certificat révoqué, sont à refaire
+                    # tout de suite plutôt qu'au prochain contrôle périodique
+                    await _guarded("contrôle des certificats", _check_certificates(email))
+                expires = ipa.profile_expiry(signed) or time.time() + 7 * 86400
 
-        _phase(app_id, "uploading")
-        await devices.install(device, [signed], on_event=on_event, wait_cap=wait_cap, app_name=app["name"])
+            # 3. Installation. Si l'app est ouverte sur la TV, installd attend qu'elle soit fermée :
+            # l'interface le signale, et on abandonne au bout de APP_WAIT_MINUTES.
+            db.log(f"{app['name']} : installation sur « {device['name']} »", app_id=app_id)
+            wait_cap = APP_WAIT_MINUTES * 60
+            logged = set()
 
-        fields = dict(status="ok", signed_at=time.time(), expires_at=expires, next_attempt_at=None,
-                      last_error=None, notified_level=None, cert_serial=_serials(signed))
-        cur = db.row("SELECT account_email FROM apps WHERE id = ?", app_id)
-        if cur and not cur["account_email"]:
+            def on_event(step: str, percent=None, since=None) -> None:
+                if step == "waiting":
+                    _phase(app_id, "waiting_app", percent=percent, waiting_since=since,
+                           deadline=(since or time.time()) + wait_cap)
+                    if "waiting" not in logged:
+                        logged.add("waiting")
+                        db.log(f"{app['name']} : installation en attente, l'app est sans doute ouverte sur "
+                               f"« {device['name']} » ; elle se terminera dès sa fermeture", "warn", app_id=app_id)
+                else:
+                    _phase(app_id, step, percent=percent)
+
+            _phase(app_id, "uploading")
+            await devices.install(device, [signed], on_event=on_event, wait_cap=wait_cap, app_name=app["name"])
+            return expires
+
+        try:
+            expires = await deliver()
+        except Exception as first:  # noqa: BLE001
+            expires = await _fall_back(app_id, first, deliver, signed)
+
+        now = time.time()
+        installed = db.row("SELECT source_sha256 FROM apps WHERE id = ?", app_id) or cur
+        fields = dict(status="ok", signed_at=now, expires_at=expires, next_attempt_at=None,
+                      last_error=None, notified_level=None, cert_serial=_serials(signed), fail_count=0,
+                      update_error=None, installed_ipa=installed["source_sha256"])
+        if expires - now <= settings.renew_before_hours() * 3600 + CHECK_INTERVAL:
+            # profil déjà dans la fenêtre de renouvellement (réglage au maximum, profil plus court que prévu) :
+            # sans ce délai, la boucle re-signerait et réinstallerait à chaque passage
+            fields["next_attempt_at"] = now + 6 * 3600
+            db.log(f"{app['name']} : le profil obtenu expire le {_fmt(expires)}, dans la fenêtre de renouvellement "
+                   f"({settings.renew_before_hours():g} h) : prochain essai dans 6 h", "warn", app_id=app_id)
+        cur_account = db.row("SELECT account_email FROM apps WHERE id = ?", app_id)
+        if cur_account and not cur_account["account_email"]:
             # fige le compte : un autre compte = autre équipe = autre bundle ID (2e copie).
             # Pas d'écrasement d'un compte choisi pendant l'opération.
             fields["account_email"] = email
@@ -434,22 +728,32 @@ async def _renew(app_id: int, trigger: str) -> None:
             db.update("apps", app_id, status="pending", last_error=None, next_attempt_at=None)
         else:
             db.update("apps", app_id, status="error", last_error="renouvellement trop long, abandonné",
-                      next_attempt_at=_retry_at(app, time.time()))
+                      next_attempt_at=_retry_at(app, time.time()), fail_count=(app.get("fail_count") or 0) + 1)
         raise
     except Exception as e:  # noqa: BLE001 - l'erreur est remontée dans l'interface
         now = time.time()
-        unreachable = isinstance(e, devices.Unreachable)
-        transient = isinstance(e, (plume.Transient, devices.AppInUse)) or unreachable
-        if unreachable and trigger == "nouvelle version" and app["status"] == "ok":
-            # TV en veille : l'app installée reste valable, la mise à jour attend simplement la TV
-            db.update("apps", app_id, status="ok", last_error=None, next_attempt_at=_retry_at(app, now, True))
-            db.log(f"{app['name']} : mise à jour en attente, {e}", "warn", app_id=app_id)
+        kind = error_kind(e)
+        fails = (app.get("fail_count") or 0) + 1
+        retry = _retry_at(app, now, kind=kind, fails=fails)
+        exp = app["expires_at"]
+        if trigger in UPDATE_TRIGGERS and was_ok and exp and exp - now > settings.renew_before_hours() * 3600:
+            # Mise à jour facultative impossible alors que l'app installée est valable pour longtemps :
+            # elle reste « ok » (pas de rouge, pas d'alerte). La mise à jour est retentée plus tard, avec recul ;
+            # le message est montré sur la carte.
+            db.update("apps", app_id, status="ok", last_error=None, update_error=str(e)[:500],
+                      next_attempt_at=retry, fail_count=fails)
+            waiting = kind in ("unreachable", "transient", "local")
+            db.log(f"{app['name']} : mise à jour {'en attente' if waiting else 'impossible'}, {e}",
+                   "warn", app_id=app_id)
+            if not waiting and not app.get("update_error"):
+                await notify(f"{app['name']} : la mise à jour n'a pas pu être installée ({e}), "
+                             "la version actuelle reste valable")
             return
-        db.update("apps", app_id, status="error", last_error=str(e),
-                  next_attempt_at=_retry_at(app, now, transient))
+        db.update("apps", app_id, status="error", last_error=str(e), next_attempt_at=retry, fail_count=fails)
         db.log(f"{app['name']} : échec, {e}", "error", app_id=app_id)
         # une TV en veille loin de l'expiration est banale : pas de notification avant le niveau 24h
-        await alert(db.row("SELECT * FROM apps WHERE id = ?", app_id) or app, str(e), now, quiet_fail=unreachable)
+        await alert(db.row("SELECT * FROM apps WHERE id = ?", app_id) or app, str(e), now,
+                    quiet_fail=kind == "unreachable")
 
 
 def due(app: dict, now: float) -> bool:
@@ -531,6 +835,15 @@ def startup() -> None:
     db.execute("UPDATE apps SET status = 'pending' WHERE status = 'running'")
     # ancien report « app ouverte » : supprimé, ne plus l'afficher
     db.execute("UPDATE apps SET deferred_reason = NULL, deferred_since = NULL WHERE deferred_reason IS NOT NULL")
+    # Base d'avant le suivi de la version installée : l'IPA présente est celle qui a été installée
+    for app in db.rows("SELECT id, source_sha256 FROM apps WHERE installed_ipa IS NULL AND signed_at IS NOT NULL"):
+        original = app_dir(app["id"]) / "original.ipa"
+        try:
+            digest = app["source_sha256"] or (original.exists() and _sha256_file(original)) or None
+        except OSError:
+            digest = None
+        if digest:
+            db.update("apps", app["id"], installed_ipa=digest, source_sha256=digest)
     for app in db.rows("SELECT * FROM apps WHERE status = 'ok' AND signed_at IS NOT NULL"):
         signed = app_dir(app["id"]) / "signed.ipa"
         try:
@@ -543,8 +856,9 @@ def startup() -> None:
         fields = {}
         if exp and app["expires_at"] and abs(exp - app["expires_at"]) > 60:
             fields["expires_at"] = exp       # anciennes dates lues en heure locale au lieu d'UTC
-        if not app["cert_serial"]:
-            fields["cert_serial"] = _serials(signed)
+        serial = _serials(signed)
+        if serial and serial != app["cert_serial"]:
+            fields["cert_serial"] = serial       # le certificat signataire, plus précis que la liste du profil
         db.update("apps", app["id"], **fields)
 
 
@@ -592,7 +906,11 @@ async def loop() -> None:
                     await _guarded(f"renouvellement de {app['name']}", renew(app["id"], "auto"))
                 elif check_releases and idle(app, now) and await new_release(app):
                     await _guarded(f"renouvellement de {app['name']}", renew(app["id"], "nouvelle version"))
+                elif app.get("auto_update", 1) and idle(app, now) and pending_update(app) and app["status"] == "ok":
+                    # mise à jour téléchargée mais pas encore installée (TV en veille, échec) : nouvel essai
+                    await _guarded(f"renouvellement de {app['name']}", renew(app["id"], "nouvelle version"))
             await _check_expired(time.time())
+            await _guarded("recherche de mise à jour de tvsign", selfupdate.check())
         except Exception as e:  # noqa: BLE001 - la boucle ne doit jamais s'arrêter
             HEALTH["loop_error"] = str(e)
             db.log(f"boucle de renouvellement : {e}", "error")

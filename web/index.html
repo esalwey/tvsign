@@ -126,8 +126,11 @@
             </select></label>
           <label class="field"><span data-i18n="renew_before">Renew before expiry</span>
             <span class="field__unite"><input name="renew_before_hours" type="number" min="12" max="150" step="1" inputmode="numeric"><span aria-hidden="true">h</span></span></label>
+          <label class="field"><span data-i18n="update_check">Check for tvsign updates</span>
+            <select name="update_check"><option value="on" data-i18n="on">On</option><option value="off" data-i18n="off">Off</option></select></label>
         </div>
         <p class="group__footer" data-i18n="renew_before_note">A free Apple ID profile lasts 7 days (168 h). The default, 60 h, leaves two and a half days of margin if the Apple TV or this computer is off.</p>
+        <p class="group__footer" data-i18n="update_check_note">One request a day to GitHub (tvsign releases), nothing else is sent. When off, no request at all.</p>
       </section>
 
       <section class="group">
@@ -185,6 +188,10 @@
           <span class="chevron" aria-hidden="true">›</span>
         </a>
         <div class="row"><div class="row__label"><p class="row__title" data-i18n="version">Version</p></div><span class="row__valeur mono" id="version">—</span></div>
+        <div class="row">
+          <div class="row__label"><p class="row__title" data-i18n="tvsign_updates">tvsign updates</p><p class="row__sub" id="update-status" aria-live="polite"></p></div>
+          <div class="row__buttons"><button class="row__action" type="button" id="update-check" data-i18n="check_now">Check now</button></div>
+        </div>
       </div>
     </section>
   </main>
@@ -280,6 +287,25 @@
           <p class="group__header espace" data-i18n="source">Source</p>
           <div class="list">
             <label class="field"><span data-i18n="address">Address</span><input name="source_url" type="url" autocomplete="off" spellcheck="false"></label>
+          </div>
+        </div>
+        <div data-for="github url">
+          <p class="group__header espace" data-i18n="updates">Updates</p>
+          <div class="list">
+            <label class="field"><span data-i18n="auto_update">New versions</span>
+              <select name="auto_update"><option value="1" data-i18n="auto_update_on">Installed automatically</option><option value="0" data-i18n="auto_update_off">Only when I ask</option></select></label>
+            <label class="field" data-for="github"><span data-i18n="pinned_version">Pinned version</span><input name="pinned_tag" data-i18n-placeholder="pinned_ph" placeholder="latest" autocomplete="off" spellcheck="false"></label>
+          </div>
+          <p class="group__footer"><span data-i18n="updates_note">When off, the app is still renewed before it expires, but new versions are not installed.</span>
+            <span data-for="github"><button class="lien lien--inline" type="button" id="pin-current" data-i18n="pin_current">Pin the installed version</button></span></p>
+        </div>
+        <div data-for="upload">
+          <p class="group__header espace" data-i18n="upload_ipa">Imported file</p>
+          <div class="list">
+            <div class="row">
+              <div class="row__label"><p class="row__title" data-i18n="replace_ipa">Replace the IPA</p><p class="row__sub" data-i18n="replace_ipa_sub">Upload a new version: the app keeps its history, Apple TV and account.</p></div>
+              <div class="row__buttons"><label class="row__action fichier"><input type="file" id="edit-replace" accept=".ipa,application/octet-stream"><span data-i18n="choose_file">Choose file…</span></label></div>
+            </div>
           </div>
         </div>
         <p class="erreur" id="edit-error" role="alert"></p>

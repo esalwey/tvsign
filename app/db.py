@@ -101,6 +101,20 @@ MIGRATIONS = [
     ("apps", "deferred_since", "REAL"),      # idem
     ("apps", "source_key", "TEXT"),          # identité du contenu téléchargé (empreinte, ETag…) : tag fixe, IPA remplacée
     ("apps", "bad_key", "TEXT"),             # identité de la release refusée (avec bad_tag)
+    # --- contrôle des mises à jour d'une app ---
+    ("apps", "auto_update", "INTEGER NOT NULL DEFAULT 1"),   # 0 : renouveler seulement, ne pas installer les nouvelles versions
+    ("apps", "pinned_tag", "TEXT"),          # version GitHub épinglée (seul ce tag est suivi)
+    ("apps", "notes", "TEXT"),               # notes de la release installée (GitHub)
+    ("apps", "update_tag", "TEXT"),          # version disponible mais non installée (mise à jour auto coupée, tvOS trop ancien…)
+    ("apps", "update_notes", "TEXT"),        # ses notes de version
+    ("apps", "update_block", "TEXT"),        # pourquoi elle n'est pas installée : manual | tvos:<minimum> | rollback
+    ("apps", "update_error", "TEXT"),        # dernier échec d'une mise à jour facultative (l'app installée reste valable)
+    ("apps", "installed_ipa", "TEXT"),       # empreinte SHA-256 de l'IPA réellement installée sur la TV
+    ("apps", "prev_tag", "TEXT"),            # version précédente gardée (original.prev.ipa) pour le retour arrière
+    ("apps", "prev_key", "TEXT"),
+    ("apps", "prev_version", "TEXT"),
+    ("apps", "prev_sha256", "TEXT"),
+    ("apps", "fail_count", "INTEGER NOT NULL DEFAULT 0"),    # échecs consécutifs : recul exponentiel des essais
 ]
 
 
