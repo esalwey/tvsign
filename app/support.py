@@ -27,14 +27,24 @@ _DISCORD = re.compile(r"(?i)(discord(?:app)?\.com/api/webhooks/)\S+")
 _AUTH_HEADER = re.compile(r"(?i)\b(bearer|basic)\s+[\w.=+/-]{8,}")
 
 
+def _homes() -> list[str]:
+    """Dossier personnel sous toutes ses écritures, la plus longue d'abord : tel quel, avec des barres
+    obliques, et avec les barres inverses doublées (json.dumps double les barres inverses d'un chemin
+    Windows avant que redact() ne voie le texte du dossier de support)."""
+    home = str(Path.home())
+    if len(home) <= 3:
+        return []
+    return sorted({home, home.replace("\\", "\\\\"), home.replace("\\", "/"), Path.home().as_posix()},
+                  key=len, reverse=True)
+
+
 def redact(value: str, secrets: list[str] | None = None) -> str:
     """Masque ce qui identifie l'utilisateur, son réseau ou ses comptes."""
     out = str(value)
     for secret in sorted(set(secrets or []), key=len, reverse=True):
         if len(secret) >= 4:
             out = out.replace(secret, "***")
-    home = str(Path.home())
-    if len(home) > 3:
+    for home in _homes():
         out = out.replace(home, "~")
     out = _USERINFO.sub(r"\1***@", out)
     out = _QUERY_SECRET.sub(r"\1***", out)
