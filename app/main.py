@@ -536,6 +536,9 @@ async def device_verify(device_id: int):
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, str(e))
     installed = {str(x.get("bundle_id") or "").lower() for x in listed if isinstance(x, dict)} - {""}
+    if not installed:
+        # une liste vide n'est pas crédible (journal parasite, TV à peine réveillée) : on n'écrit rien
+        raise HTTPException(502, "tv_listing_empty")
     now, out = time.time(), []
     for a in db.rows("SELECT id, bundle_id FROM apps WHERE device_id = ? AND bundle_id IS NOT NULL "
                      "AND status != 'adding'", device_id):
@@ -741,12 +744,22 @@ async def app_renew(app_id: int):
     return {"ok": True, "started": renew.spawn(app_id, "manuel")}
 
 
+_RENEW_ALL_PENDING: set[int] = set()      # apps encore en file d'un « Tout renouveler » (une restauration doit attendre)
+
+
 async def _renew_all(ids: list[int]) -> None:
     """Un à un : plumesign signe sous verrou, lancer tout d'un coup ne ferait qu'empiler des attentes."""
-    for app_id in ids:
-        if renew.STOPPING:
-            break
-        await renew.renew(app_id, "manuel")
+    try:
+        for app_id in ids:
+            if renew.STOPPING:
+                break
+            try:
+                if db.row("SELECT id FROM apps WHERE id = ?", app_id):      # supprimée entre-temps : on passe
+                    await renew.renew(app_id, "manuel")
+            finally:
+                _RENEW_ALL_PENDING.discard(app_id)
+    finally:
+        _RENEW_ALL_PENDING.difference_update(ids)
 
 
 @app.post("/api/apps/renew-all")
@@ -758,6 +771,7 @@ async def app_renew_all():
     for app_id in ids:
         db.update("apps", app_id, next_attempt_at=None)
     if ids:
+        _RENEW_ALL_PENDING.update(ids)
         proc.spawn(_renew_all(ids))
     return {"ok": True, "started": len(ids)}
 
@@ -773,7 +787,10 @@ async def app_retry_version(app_id: int):
 @app.post("/api/apps/{app_id}/accept-version")
 async def app_accept_version(app_id: int):
     """Accepte une version dont l'identifiant d'app a changé : l'ancien identifiant n'est plus exigé."""
-    app_or_404(app_id)
+    a = app_or_404(app_id)
+    if a["source_type"] == "upload" or not (a["bad_tag"] or a["bad_reason"]):
+        # rien à accepter : effacer l'identifiant d'une app saine (ou importée, jamais retéléchargée) ferait perdre la protection
+        raise HTTPException(409, "nothing_to_accept")
     db.update("apps", app_id, bundle_id=None, bad_tag=None, bad_key=None, bad_reason=None, next_attempt_at=None)
     db.log("Changement d'identifiant d'app accepté", app_id=app_id)
     return {"ok": True, "started": renew.spawn(app_id, "nouvelle version")}
@@ -798,12 +815,16 @@ async def app_replace_ipa(app_id: int, file: UploadFile = File(...)):
                 f.write(chunk)
         try:
             info = ipa.app_info(tmp)
-        except (zipfile.BadZipFile, ValueError):
+        except Exception:  # noqa: BLE001 - zip illisible, Info.plist mal formé (ExpatError), clé absente…
             raise HTTPException(400, "not_an_ipa") from None
         if info["platform"] != "appletvos":
             raise HTTPException(400, f"not_tvos:{info['platform'] or 'unknown'}")
         if a["bundle_id"] and info["bundle_id"] != a["bundle_id"]:
             raise HTTPException(409, "bundle_changed")
+        # un renouvellement a pu démarrer pendant l'envoi : il lit original.ipa, on ne le remplace pas sous lui
+        # (pas d'await entre cette vérification et renew.spawn : aucune course nouvelle)
+        if app_id in renew._RUNNING:
+            raise HTTPException(409, "app_busy")
         folder = renew.app_dir(app_id)
         shutil.move(str(tmp), str(folder / "original.ipa"))
         (folder / "signed.ipa").unlink(missing_ok=True)        # l'ancienne signature ne convient plus
@@ -884,7 +905,7 @@ async def backup_export(uploads: bool = False):
 
 @app.post("/api/backup/import")
 async def backup_import(file: UploadFile = File(...)):
-    if renew._RUNNING or proc.busy():
+    if renew._RUNNING or _RENEW_ALL_PENDING or proc.busy():
         raise HTTPException(409, "restore_busy")
     tmp = TMP_DIR / f"import-{int(time.time())}.zip"
     try:
@@ -900,6 +921,7 @@ async def backup_import(file: UploadFile = File(...)):
                 counts = await asyncio.to_thread(backup.restore, tmp)
             except ValueError as e:
                 raise HTTPException(400, str(e)) from None
+        _purge_half_added()      # une sauvegarde faite pendant un ajout contient une fiche « en cours d'ajout »
         renew.startup()
         await devices.sync_store()
         return {"ok": True, **counts}
