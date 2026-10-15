@@ -59,7 +59,7 @@ async def notifications_test(body: dict):
     except ValueError as e:
         raise _clean_error(e) from None
     except notifier.NotifyFailed as e:
-        raise HTTPException(502, f"notify_failed:{e}") from None
+        raise HTTPException(502, e.api_detail) from None
     return {"ok": True}
 
 

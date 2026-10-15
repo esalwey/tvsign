@@ -15,6 +15,8 @@ import base64
 import json
 import os
 import re
+import socket
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,7 +25,7 @@ from datetime import datetime
 
 from . import db, settings
 from .config import VERSION
-from .settings import NOTIFY_EVENTS, mask_url, ntfy_address, valid_url
+from .settings import NOTIFY_EVENTS, mask_url, ntfy_address, unmask_url, valid_url
 
 MASK = "********"
 TARGETS_KEY = "notify_targets"
@@ -153,9 +155,12 @@ def clean(raw: dict, existing: dict | None = None) -> dict:
     spec = PROVIDERS[kind]
     for field in spec["fields"]:
         value = str(raw.get(field) or "").strip()
-        if value == MASK or (kind == "ntfy" and field == "url" and same
-                             and value == mask_url(same.get("url", "")) != same.get("url", "")):
+        if value == MASK:
             value = (same or {}).get(field, "")
+        elif kind == "ntfy" and field == "url" and same:
+            # mot de passe masqué (« *** ») renvoyé par l'interface : on reprend celui de l'adresse
+            # enregistrée, même si l'hôte ou le sujet ont changé entre-temps
+            value = unmask_url(value, same.get("url", ""))
         out[field] = value
     if kind == "ntfy":
         out["url"] = ntfy_address(out["url"])
@@ -223,15 +228,33 @@ def get_target(target_id: str) -> dict | None:
     return next((t for t in targets() if t["id"] == target_id), None)
 
 
+def _check_builtin(raw: dict) -> None:
+    """La destination ntfy venue de l'adresse (réglage ntfy_url) n'a ni nom ni jeton : les accepter
+    puis les oublier ferait croire à une configuration qui n'existe pas."""
+    if str(raw.get("name") or "").strip() or str(raw.get("token") or "").strip():
+        raise ValueError("builtin_no_token")
+
+
 def save_target(raw: dict, target_id: str | None = None) -> dict:
     """Crée (target_id None) ou remplace une destination ; renvoie sa forme publique."""
     if target_id == "ntfy":
+        _check_builtin(raw)
         old = legacy_target() or {"id": "ntfy", "type": "ntfy", "events": list(NOTIFY_EVENTS)}
         new = clean({**raw, "type": "ntfy", "token": ""}, old)
         events = new["events"]
+        wanted = {"ntfy_url": new["url"],
+                  "ntfy_events": "" if len(events) == len(NOTIFY_EVENTS) else (",".join(events) or "none")}
+        shown = settings.describe()
+        for key in list(wanted):
+            if shown[key]["locked"]:
+                # fixé par l'environnement : l'adresse ne peut pas changer d'ici, mais les
+                # événements (s'ils ne sont pas fixés eux aussi) restent modifiables
+                current = legacy_target()
+                if current and (new["url"] != current["url"] if key == "ntfy_url" else events != current["events"]):
+                    raise ValueError(f"set_by_env:{shown[key]['env']}")
+                del wanted[key]
         try:
-            settings.update({"ntfy_url": new["url"],
-                             "ntfy_events": "" if len(events) == len(NOTIFY_EVENTS) else (",".join(events) or "none")})
+            settings.update(wanted)
         except ValueError as e:
             problems = e.args[0] if e.args and isinstance(e.args[0], dict) else {}
             raise ValueError(next(iter(problems.values()), "url_invalid")) from None
@@ -329,6 +352,25 @@ def _secrets(t: dict) -> list[str]:
     return [v for v in values if v and len(v) >= 4]
 
 
+def error_code(e: Exception) -> str:
+    """Cause d'un échec d'envoi sous forme de code stable (l'interface dit quoi vérifier) :
+    http_401, http_403, http_404, http_429, http_other, redirect, timeout, refused, dns, tls, other."""
+    if isinstance(e, urllib.error.HTTPError):
+        if 300 <= e.code < 400:
+            return "redirect"
+        return f"http_{e.code}" if e.code in (401, 403, 404, 429) else "http_other"
+    cause = e.reason if isinstance(e, urllib.error.URLError) else e
+    if isinstance(cause, (TimeoutError, socket.timeout)) or "timed out" in str(cause).lower():
+        return "timeout"
+    if isinstance(cause, ssl.SSLError) or "CERTIFICATE_VERIFY" in str(cause) or "SSL" in str(cause):
+        return "tls"
+    if isinstance(cause, ConnectionRefusedError):
+        return "refused"
+    if isinstance(cause, socket.gaierror):
+        return "dns"
+    return "other"
+
+
 def describe_error(e: Exception, t: dict | None = None) -> str:
     """Texte d'erreur court, sans secret, sans adresse complète."""
     if isinstance(e, urllib.error.HTTPError):
@@ -382,6 +424,8 @@ def last_error() -> str | None:
 async def test(draft: dict) -> None:
     """Message d'essai vers une destination saisie (pas forcément enregistrée) ; lève ErrorText."""
     existing = get_target(str(draft.get("id"))) if draft.get("id") else None
+    if existing and existing.get("builtin"):
+        _check_builtin(draft)
     t = clean(draft, existing)
     try:
         await asyncio.to_thread(send, t, "test", text("test"), "default", {"app": None})
@@ -389,10 +433,20 @@ async def test(draft: dict) -> None:
         err = describe_error(e, t)
         if existing:
             _ERRORS[existing["id"]] = err
-        raise NotifyFailed(err) from None
+        raise NotifyFailed(err, error_code(e)) from None
     if existing:
         _ERRORS.pop(existing["id"], None)
 
 
 class NotifyFailed(RuntimeError):
-    """Échec d'envoi, message déjà nettoyé de tout secret."""
+    """Échec d'envoi, message déjà nettoyé de tout secret. `code` : cause (voir error_code)."""
+
+    def __init__(self, message: str, code: str = "other"):
+        super().__init__(message)
+        self.code = code
+
+    @property
+    def api_detail(self) -> str:
+        """Détail renvoyé par l'API : « notify_<cause>:<texte> » (clés err_notify_* de l'interface),
+        ou « notify_failed:<texte> » quand la cause est inconnue."""
+        return f"notify_{self.code}:{self}" if self.code != "other" else f"notify_failed:{self}"

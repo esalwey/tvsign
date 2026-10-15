@@ -783,7 +783,7 @@ async def settings_test_notification(body: NotifyTest):
     except ValueError as e:
         raise HTTPException(400, str(e)) from None
     except notifier.NotifyFailed as e:
-        raise HTTPException(502, f"notify_failed:{e}") from None
+        raise HTTPException(502, e.api_detail) from None
     return {"ok": True}
 
 

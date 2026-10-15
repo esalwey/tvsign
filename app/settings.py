@@ -61,6 +61,19 @@ def mask_url(url: str) -> str:
     return re.sub(r"^(\w+://[^/@:\s]*:)[^/@\s]*@", r"\1***@", url or "")
 
 
+_USERINFO_PASSWORD = re.compile(r"^(\w+://[^/@:\s]*:)([^/@\s]*)@")
+
+
+def unmask_url(posted: str, existing: str) -> str:
+    """Adresse saisie dont le mot de passe vaut « *** » (valeur masquée renvoyée par l'interface,
+    peut-être avec un autre hôte ou sujet) : reprend le mot de passe de l'adresse enregistrée."""
+    new = _USERINFO_PASSWORD.match(posted or "")
+    old = _USERINFO_PASSWORD.match(existing or "")
+    if new and old and new.group(2) == "***" and old.group(2) != "***":
+        return new.group(1) + old.group(2) + "@" + posted[new.end():]
+    return posted
+
+
 def _hours(value: float) -> None:
     # profil gratuit = 7 jours (168 h) ; garder au moins 12 h de marge et un renouvellement possible
     if not 12 <= value <= 150:
@@ -190,8 +203,10 @@ def update(values: dict) -> dict:
         if _env(spec):
             errors[key] = f"set_by_env:{_env(spec)[0]}"
             continue
-        if key == "ntfy_url" and isinstance(raw, str) and raw.strip() and raw.strip() != get(key)                 and raw.strip() == mask_url(get(key)):
-            continue        # valeur masquée renvoyée telle quelle par l'interface : on garde le secret
+        if key == "ntfy_url" and isinstance(raw, str) and raw.strip():
+            if raw.strip() != get(key) and raw.strip() == mask_url(get(key)):
+                continue        # valeur masquée renvoyée telle quelle par l'interface : on garde le secret
+            raw = unmask_url(raw.strip(), get(key))     # hôte ou sujet changé, mot de passe masqué conservé
         if raw is None or raw == "":
             todo[key] = None
             continue
