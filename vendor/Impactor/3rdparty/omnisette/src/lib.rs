@@ -53,11 +53,42 @@ pub enum AnisetteError {
     MissingLibraries,
     #[error("{0}")]
     Anyhow(#[from] anyhow::Error),
+    /// The anisette server answered, but not with usable headers.
+    #[error("anisette server error: {0}")]
+    ServerError(String),
+    /// Provisioning the device identity failed (websocket protocol, server timeout, closed socket).
+    #[error("anisette provisioning failed: {0}")]
+    ProvisioningFailed(String),
+    /// Apple's provisioning service (gsa.apple.com) answered HTTP `status` without a usable plist.
+    #[error("Apple answered HTTP {status} to the anisette provisioning: {message}")]
+    AppleRefused { status: u16, message: String },
+    /// The provider cannot synchronize with a SIM (hsc 434).
+    #[error("anisette resync is not supported by this provider")]
+    ResyncUnsupported,
+    /// Every candidate server failed (default server and its fallback).
+    #[error("no anisette server could be used: {0}")]
+    AllServersFailed(String),
 }
 
 pub const DEFAULT_ANISETTE_URL: &str = "https://ani.f1sh.me/";
 
-pub const DEFAULT_ANISETTE_URL_V3: &str = "https://ani.sidestore.app";
+/// Anisette v3 server that serves Windows (iTunes) anisette. Since 2026-10-12 Apple's GrandSlam
+/// refuses the data of the servers that generate Android anisette (error -80045, then HTTP 503).
+pub const DEFAULT_ANISETTE_URL_V3: &str = "https://ani.jkcoxson.com";
+
+/// Windows anisette server used when [`DEFAULT_ANISETTE_URL_V3`] cannot be reached.
+pub const FALLBACK_ANISETTE_URL_V3: &str = "https://ani2.stikstore.app";
+
+/// Anisette v3 servers that generate Android anisette: Apple refuses what they produce.
+/// A configured URL on one of these hosts is replaced by the default server.
+pub const ANDROID_ANISETTE_HOSTS: &[&str] = &[
+    "ani.sidestore.app",
+    "ani.stikstore.app",
+    "anisette.crystall1ne.dev",
+    "ani3server.fly.dev",
+    "ani.jaydenha.uk",
+    "omni.ethxn.xyz",
+];
 
 /// First non-empty URL among the given environment variables, in order.
 fn env_url(names: &[&str]) -> Option<String> {
@@ -69,10 +100,84 @@ fn env_url(names: &[&str]) -> Option<String> {
     })
 }
 
+/// Lower-case host of an http(s) URL (no scheme, credentials, port, path); `None` when empty.
+/// A bare `host[:port]` without scheme is accepted.
+pub fn url_host(url: &str) -> Option<String> {
+    let url = url.trim();
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or("");
+    let host = if authority.starts_with('[') {
+        // [::1]:8080
+        authority.split(']').next().map(|h| format!("{h}]"))?
+    } else {
+        authority.split(':').next().unwrap_or("").to_string()
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+/// True when `url` points at one of the [`ANDROID_ANISETTE_HOSTS`].
+pub fn is_android_anisette_server(url: &str) -> bool {
+    url_host(url).is_some_and(|host| ANDROID_ANISETTE_HOSTS.contains(&host.as_str()))
+}
+
+fn same_server(a: &str, b: &str) -> bool {
+    a.trim().trim_end_matches('/').eq_ignore_ascii_case(b.trim().trim_end_matches('/'))
+}
+
+/// The anisette v3 servers to use, in order, and what to tell the user about the choice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnisetteServers {
+    pub primary: String,
+    pub fallback: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Decide which servers to use.
+///
+/// - nothing requested: the default server, with the fallback server behind it;
+/// - a server that generates Android anisette: replaced by the default (Apple refuses its data);
+/// - the default server asked explicitly: same as nothing requested;
+/// - any other server: used alone (a private server is never silently swapped for a public one);
+/// - `fallback_override`: replaces the fallback (`none` or `off` removes it).
+pub fn resolve_servers(requested: Option<&str>, fallback_override: Option<&str>) -> AnisetteServers {
+    let mut warnings = Vec::new();
+    let mut primary = DEFAULT_ANISETTE_URL_V3.to_string();
+    let mut fallback = Some(FALLBACK_ANISETTE_URL_V3.to_string());
+
+    if let Some(url) = requested.map(str::trim).filter(|u| !u.is_empty()) {
+        if is_android_anisette_server(url) {
+            warnings.push(format!(
+                "anisette server {url} generates Android anisette, which Apple refuses since 2026-10-12 (error -80045): using {DEFAULT_ANISETTE_URL_V3} instead"
+            ));
+        } else if !same_server(url, DEFAULT_ANISETTE_URL_V3) {
+            primary = url.trim_end_matches('/').to_string();
+            fallback = None;
+        }
+    }
+
+    match fallback_override.map(str::trim) {
+        Some(f) if f.eq_ignore_ascii_case("none") || f.eq_ignore_ascii_case("off") => fallback = None,
+        Some(f) if !f.is_empty() => fallback = Some(f.trim_end_matches('/').to_string()),
+        _ => {}
+    }
+    if fallback.as_deref().is_some_and(|f| same_server(f, &primary)) {
+        fallback = None;
+    }
+
+    AnisetteServers {
+        primary,
+        fallback,
+        warnings,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AnisetteConfiguration {
     anisette_url: String,
     anisette_url_v3: String,
+    anisette_fallback_url_v3: Option<String>,
     configuration_path: PathBuf,
     macos_serial: String,
 }
@@ -85,11 +190,18 @@ impl Default for AnisetteConfiguration {
 
 impl AnisetteConfiguration {
     pub fn new() -> AnisetteConfiguration {
+        let servers = resolve_servers(
+            env_url(&["PLUMESIGN_ANISETTE_URL", "ANISETTE_URL_V3"]).as_deref(),
+            env_url(&["PLUMESIGN_ANISETTE_FALLBACK_URL"]).as_deref(),
+        );
+        for warning in &servers.warnings {
+            log::warn!("{warning}");
+        }
         AnisetteConfiguration {
             anisette_url: env_url(&["ANISETTE_URL"])
                 .unwrap_or_else(|| DEFAULT_ANISETTE_URL.to_string()),
-            anisette_url_v3: env_url(&["PLUMESIGN_ANISETTE_URL", "ANISETTE_URL_V3"])
-                .unwrap_or_else(|| DEFAULT_ANISETTE_URL_V3.to_string()),
+            anisette_url_v3: servers.primary,
+            anisette_fallback_url_v3: servers.fallback,
             configuration_path: PathBuf::new(),
             macos_serial: "0".to_string(),
         }
@@ -99,8 +211,30 @@ impl AnisetteConfiguration {
         &self.anisette_url
     }
 
+    /// Anisette v3 server tried first.
+    pub fn anisette_url_v3(&self) -> &String {
+        &self.anisette_url_v3
+    }
+
+    /// Anisette v3 server tried when the first one fails.
+    pub fn fallback_url_v3(&self) -> Option<&String> {
+        self.anisette_fallback_url_v3.as_ref()
+    }
+
     pub fn configuration_path(&self) -> &PathBuf {
         &self.configuration_path
+    }
+
+    /// Use this anisette v3 server (and no fallback unless one is set afterwards).
+    pub fn set_anisette_url_v3(mut self, url: String) -> AnisetteConfiguration {
+        self.anisette_url_v3 = url.trim_end_matches('/').to_string();
+        self.anisette_fallback_url_v3 = None;
+        self
+    }
+
+    pub fn set_fallback_url_v3(mut self, url: Option<String>) -> AnisetteConfiguration {
+        self.anisette_fallback_url_v3 = url;
+        self
     }
 
     pub fn set_anisette_url(mut self, anisette_url: String) -> AnisetteConfiguration {
@@ -162,7 +296,8 @@ impl AnisetteHeaders {
                 configuration.anisette_url_v3,
                 configuration.configuration_path.clone(),
                 configuration.macos_serial.clone(),
-            ),
+            )
+            .with_fallback(configuration.anisette_fallback_url_v3),
         )));
     }
 
@@ -179,6 +314,95 @@ impl AnisetteHeaders {
         Ok(AnisetteHeadersProviderRes::local(Box::new(
             ADIProxyAnisetteProvider::new(ssc_adi_proxy, config_path.to_path_buf())?,
         )))
+    }
+}
+
+/// Forget the provisioning of the anisette identity (the identity itself is kept) so that the next
+/// request provisions it again. Used when Apple or the server says the provisioning is not valid.
+#[cfg(feature = "remote-anisette-v3")]
+pub fn invalidate_provisioning(configuration_path: &std::path::Path) -> Result<(), AnisetteError> {
+    remote_anisette_v3::invalidate_provisioning(configuration_path)
+}
+
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+
+    #[test]
+    fn host_of_a_url() {
+        assert_eq!(url_host("https://ani.sidestore.app").as_deref(), Some("ani.sidestore.app"));
+        assert_eq!(url_host("https://ANI.SideStore.app:443/v3/x?y#z").as_deref(), Some("ani.sidestore.app"));
+        assert_eq!(url_host("http://user:pw@ani.sidestore.app/").as_deref(), Some("ani.sidestore.app"));
+        assert_eq!(url_host("ani.sidestore.app").as_deref(), Some("ani.sidestore.app"));
+        assert_eq!(url_host("ani.sidestore.app:8080/x").as_deref(), Some("ani.sidestore.app"));
+        assert_eq!(url_host("https://ani.sidestore.app./").as_deref(), Some("ani.sidestore.app"));
+        assert_eq!(url_host("http://[::1]:6969/").as_deref(), Some("[::1]"));
+        assert_eq!(url_host(""), None);
+        assert_eq!(url_host("https://"), None);
+    }
+
+    #[test]
+    fn android_servers_are_recognised_by_host_only() {
+        for host in ANDROID_ANISETTE_HOSTS {
+            assert!(is_android_anisette_server(&format!("https://{host}")));
+            assert!(is_android_anisette_server(&format!("https://{host}/")));
+            assert!(is_android_anisette_server(&format!("HTTP://{}:443", host.to_uppercase())));
+        }
+        assert!(!is_android_anisette_server("https://ani.jkcoxson.com"));
+        assert!(!is_android_anisette_server("https://ani2.stikstore.app"));
+        // a lookalike is not the real thing
+        assert!(!is_android_anisette_server("https://ani.sidestore.app.example.com"));
+        assert!(!is_android_anisette_server("https://example.com/ani.sidestore.app"));
+        assert!(!is_android_anisette_server("https://myani.sidestore.app"));
+    }
+
+    #[test]
+    fn nothing_requested_uses_the_default_and_its_fallback() {
+        let s = resolve_servers(None, None);
+        assert_eq!(s.primary, DEFAULT_ANISETTE_URL_V3);
+        assert_eq!(s.fallback.as_deref(), Some(FALLBACK_ANISETTE_URL_V3));
+        assert!(s.warnings.is_empty());
+        assert_eq!(resolve_servers(Some("  "), None), s);
+    }
+
+    #[test]
+    fn android_server_is_replaced_by_the_default() {
+        let s = resolve_servers(Some("https://ani.sidestore.app"), None);
+        assert_eq!(s.primary, DEFAULT_ANISETTE_URL_V3);
+        assert_eq!(s.fallback.as_deref(), Some(FALLBACK_ANISETTE_URL_V3));
+        assert_eq!(s.warnings.len(), 1);
+        assert!(s.warnings[0].contains("ani.sidestore.app") && s.warnings[0].contains(DEFAULT_ANISETTE_URL_V3));
+    }
+
+    #[test]
+    fn default_asked_explicitly_keeps_the_fallback() {
+        for url in ["https://ani.jkcoxson.com", "https://ani.jkcoxson.com/", "HTTPS://ANI.JKCOXSON.COM"] {
+            let s = resolve_servers(Some(url), None);
+            assert_eq!(s.primary, DEFAULT_ANISETTE_URL_V3, "{url}");
+            assert_eq!(s.fallback.as_deref(), Some(FALLBACK_ANISETTE_URL_V3), "{url}");
+            assert!(s.warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn custom_server_is_kept_alone() {
+        let s = resolve_servers(Some("https://anisette.example.org/"), None);
+        assert_eq!(s.primary, "https://anisette.example.org");
+        assert_eq!(s.fallback, None);
+        assert!(s.warnings.is_empty());
+    }
+
+    #[test]
+    fn fallback_override() {
+        let s = resolve_servers(None, Some("https://other.example.org/"));
+        assert_eq!(s.fallback.as_deref(), Some("https://other.example.org"));
+        for off in ["none", "NONE", "off"] {
+            assert_eq!(resolve_servers(None, Some(off)).fallback, None, "{off}");
+        }
+        let custom = resolve_servers(Some("https://anisette.example.org"), Some("https://ani2.stikstore.app"));
+        assert_eq!(custom.fallback.as_deref(), Some("https://ani2.stikstore.app"));
+        // a fallback equal to the primary is no fallback
+        assert_eq!(resolve_servers(Some("https://ani2.stikstore.app"), Some("https://ani2.stikstore.app/")).fallback, None);
     }
 }
 

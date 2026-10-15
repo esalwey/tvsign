@@ -28,4 +28,26 @@ pub trait AnisetteHeadersProvider: Send + Sync {
 
         headers
     }
+
+    /// User-Agent that goes with the `X-Mme-Client-Info` of the headers: Apple checks that the two
+    /// describe the same device. `None` when the provider has no opinion.
+    fn user_agent(&self) -> Option<String> {
+        None
+    }
+
+    /// True when the device identity was provisioned while producing the last headers, so Apple has
+    /// not seen it synchronize yet.
+    fn identity_is_new(&self) -> bool {
+        false
+    }
+
+    /// Headers again, after GrandSlam asked for a synchronization (`hsc` 434 with an
+    /// `X-Apple-I-MD-DATA` value, passed as `sim`).
+    #[cfg_attr(not(feature = "async"), remove_async_await::remove_async_await)]
+    async fn resync_anisette_headers(
+        &mut self,
+        _sim: &str,
+    ) -> Result<HashMap<String, String>, AnisetteError> {
+        Err(AnisetteError::ResyncUnsupported)
+    }
 }
