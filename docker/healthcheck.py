@@ -13,8 +13,11 @@ if host in ("0.0.0.0", "::"):
 if ":" in host:
     host = f"[{host}]"
 port = os.environ.get("TVSIGN_PORT", "").strip() or "8765"
+# No proxy: HTTP(S)_PROXY from the container environment must not capture a loopback request
+# (the proxy would answer 4xx/5xx and the container would be reported unhealthy).
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 try:
-    with urllib.request.urlopen(f"http://{host}:{port}/api/livez", timeout=4) as r:
+    with opener.open(f"http://{host}:{port}/api/livez", timeout=4) as r:
         sys.exit(0 if r.status == 200 else 1)
 except Exception as exc:  # noqa: BLE001
     print(f"unhealthy: {exc}", file=sys.stderr)
