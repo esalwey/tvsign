@@ -158,6 +158,7 @@ def restore(archive: Path) -> dict:
         if v is not None or k in AUTH_LOCAL:
             settings.raw_set(k, v)
     settings.raw_set("onboarded", "1")
+    settings.migrate()      # la sauvegarde peut venir d'avant l'abandon des serveurs anisette Android
     # Apps importées dont l'IPA n'est pas dans la sauvegarde : inutilisables, on le dit tout de suite
     # (sinon l'échec n'apparaît qu'à la fenêtre de renouvellement, des jours plus tard).
     missing = []

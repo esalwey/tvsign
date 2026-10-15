@@ -7,7 +7,7 @@ import urllib.parse
 import urllib.request
 
 from . import db, devices, ipa, plume, proc, settings
-from .config import (ACCOUNT_CHECK_HOURS, APP_WAIT_MINUTES, CHECK_INTERVAL, IPA_DIR,
+from .config import (ACCOUNT_CHECK_HOURS, APP_WAIT_MINUTES, APPLE_BACKOFF_MINUTES, CHECK_INTERVAL, IPA_DIR,
                      RELEASE_CHECK_MINUTES, RENEW_TIMEOUT_MINUTES, RETRY_MINUTES)
 
 # Arrêt du service en cours : plus aucun renouvellement ne démarre, ceux en cours peuvent finir.
@@ -18,7 +18,6 @@ _RUNNING: set[int] = set()
 # {"step": checking|signing|uploading|installing|waiting_app, "since": ts, ...}
 PHASE: dict[int, dict] = {}
 _RERUN: set[int] = set()                # destination changée pendant un renouvellement : on relance après
-_ACC_ALERTED: set[str] = set()          # comptes déjà signalés déconnectés (une alerte par épisode)
 _EXPIRED_LOGGED: set[int] = set()       # apps dont l'expiration est déjà au journal (une fois par épisode)
 _NO_MATCH_LOGGED: set[int] = set()      # apps dont l'absence de release correspondante est déjà au journal
 
@@ -275,15 +274,18 @@ def rerun(app_id: int) -> None:
         _RERUN.add(app_id)
 
 
-def _retry_at(app: dict, now: float, transient: bool = False) -> float:
+def _retry_at(app: dict, now: float, transient: bool = False, slow: bool = False) -> float:
     """Prochain essai : plus rapproché quand l'expiration approche (ou pour une panne passagère :
-    anisette, réseau), jamais après elle."""
+    anisette, réseau), jamais après elle. `slow` : Apple a refusé la requête (-80045, 503) et limite
+    les essais, on espace beaucoup (et moins serré que d'habitude près de l'expiration)."""
     delay = RETRY_MINUTES * 60
     if transient:
         delay = min(delay, 15 * 60)
+    if slow:
+        delay = max(delay, APPLE_BACKOFF_MINUTES * 60)
     exp = app["expires_at"]
     if exp and exp - now < 12 * 3600:
-        delay = min(delay, 10 * 60)
+        delay = min(delay, (30 if slow else 10) * 60)
     if exp and now < exp < now + delay:
         delay = max(exp - now - 60, 60)
     return now + delay
@@ -352,7 +354,7 @@ async def _renew(app_id: int, trigger: str) -> None:
                                "(en choisir un autre installerait une 2e copie de l'app)")
         if accounts[email]["ok"] == 0:
             # session déjà connue comme expirée : inutile de solliciter Apple
-            raise plume.SessionExpired(f"session Apple de {email} expirée : reconnecte-le (bouton Reconnecter)")
+            raise plume.SessionExpired(f"session Apple de {email} expirée : reconnecte-le (bouton Reconnecter)", email)
 
         # 1. Apple TV joignable ? On échoue vite, avant tout appel à Apple.
         # Pas de report sur la seule présence d'un processus : tvOS garde en mémoire les apps
@@ -440,16 +442,22 @@ async def _renew(app_id: int, trigger: str) -> None:
         now = time.time()
         unreachable = isinstance(e, devices.Unreachable)
         transient = isinstance(e, (plume.Transient, devices.AppInUse)) or unreachable
+        slow = isinstance(e, plume.AppleRefused) and e.slow     # -80045 : Apple limite les essais
+        reconnect = isinstance(e, plume.SessionExpired)
         if unreachable and trigger == "nouvelle version" and app["status"] == "ok":
             # TV en veille : l'app installée reste valable, la mise à jour attend simplement la TV
             db.update("apps", app_id, status="ok", last_error=None, next_attempt_at=_retry_at(app, now, True))
             db.log(f"{app['name']} : mise à jour en attente, {e}", "warn", app_id=app_id)
             return
         db.update("apps", app_id, status="error", last_error=str(e),
-                  next_attempt_at=_retry_at(app, now, transient))
+                  next_attempt_at=_retry_at(app, now, transient, slow))
         db.log(f"{app['name']} : échec, {e}", "error", app_id=app_id)
+        if reconnect:
+            # une seule alerte pour le compte, pas une par app : les niveaux 24h / 6h / expiré restent notifiés
+            await account_down(e.email or app.get("account_email") or plume.default_account(), plume.REAUTH_REASON)
         # une TV en veille loin de l'expiration est banale : pas de notification avant le niveau 24h
-        await alert(db.row("SELECT * FROM apps WHERE id = ?", app_id) or app, str(e), now, quiet_fail=unreachable)
+        await alert(db.row("SELECT * FROM apps WHERE id = ?", app_id) or app, str(e), now,
+                    quiet_fail=unreachable or reconnect)
 
 
 def due(app: dict, now: float) -> bool:
@@ -498,18 +506,26 @@ async def _check_certificates(email: str) -> None:
                          "re-signature en cours", "high")
 
 
+async def account_down(email: str | None, reason: str) -> None:
+    """Compte à reconnecter : une alerte (journal + notification) par épisode, que la déconnexion soit
+    découverte par le contrôle périodique ou par un renouvellement. L'état « Déconnecté » et sa raison
+    sont posés par plume (account_status)."""
+    if not email or email in plume.ALERTED:
+        return
+    plume.ALERTED.add(email)
+    db.log(f"Compte Apple {email} déconnecté : reconnexion nécessaire ({reason})", "error")
+    await notify(f"Compte Apple {email} déconnecté : reconnecte-le dans tvsign. {reason}", "high")
+
+
 async def _check_accounts() -> None:
     for acc in plume.accounts():
         email = acc["email"]
+        was_down = email in plume.ALERTED
         ok = await plume.check_account(email)       # ne lève pas : None si indéterminé
         if ok is False:
-            if email not in _ACC_ALERTED:
-                _ACC_ALERTED.add(email)
-                db.log(f"Compte Apple {email} déconnecté : reconnexion nécessaire", "error")
-                await notify(f"Compte Apple {email} déconnecté : reconnecte-le dans tvsign", "high")
+            await account_down(email, plume.REAUTH_REASON)
         elif ok:
-            if email in _ACC_ALERTED:
-                _ACC_ALERTED.discard(email)
+            if was_down:
                 db.log(f"Compte Apple {email} de nouveau valide")
             await _check_certificates(email)
 

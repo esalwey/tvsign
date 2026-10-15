@@ -100,6 +100,9 @@ IMPORT_PLUME = _flag("TVSIGN_IMPORT_PLUME", False)   # opt-in: an existing sessi
 CHECK_INTERVAL = int(_env("TVSIGN_CHECK_INTERVAL", "600"))
 # Delay before retrying a failed app (Apple TV asleep, ...), in minutes.
 RETRY_MINUTES = int(_env("TVSIGN_RETRY_MINUTES", "45"))
+# Pause before trying again after Apple refused a request outright (error -80045, HTTP 503/429): it
+# limits the attempts, and every new one can lengthen the block. In minutes.
+APPLE_BACKOFF_MINUTES = int(_env("TVSIGN_APPLE_BACKOFF_MINUTES", "180"))
 # Apple session check, in hours.
 ACCOUNT_CHECK_HOURS = float(_env("TVSIGN_ACCOUNT_CHECK_HOURS", "6"))
 # GitHub release check between renewals, in minutes (0 = never).

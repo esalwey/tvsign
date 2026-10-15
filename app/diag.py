@@ -5,6 +5,7 @@ Each check returns {id, status: ok|warn|error, detail, value}; the UI translates
 """
 import asyncio
 import email.utils
+import json
 import os
 import shutil
 import socket
@@ -16,7 +17,7 @@ import urllib.request
 from . import plume, settings
 from .config import DATA_DIR, PLUMESIGN, VERSION, WINDOWS
 
-DEFAULT_ANISETTE = "https://ani.sidestore.app"
+DEFAULT_ANISETTE = settings.DEFAULT_ANISETTE
 
 
 def _check(id_: str, status: str, detail: str = "", value=None) -> dict:
@@ -85,6 +86,49 @@ async def _reach(id_: str, url: str) -> tuple[dict, float | None]:
     return _check(id_, "ok", f"{url} (HTTP {code})", code), ts
 
 
+def _client_info(url: str) -> tuple[dict | None, str]:
+    """GET <serveur>/v3/client_info : (réponse JSON, erreur). Un serveur anisette v3 répond le client_info
+    et le user_agent qu'il faut présenter à Apple."""
+    req = urllib.request.Request(url.rstrip("/") + "/v3/client_info", headers={"User-Agent": f"tvsign/{VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read(65536).decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        return None, f"HTTP {e.code}"
+    except Exception as e:  # noqa: BLE001
+        return None, str(getattr(e, "reason", e))
+    if not isinstance(data, dict) or not data.get("client_info"):
+        return None, "réponse inattendue (ce n'est pas un serveur anisette v3 ?)"
+    return data, ""
+
+
+def _windows(data: dict | None) -> bool:
+    return bool(data) and "windows" in data["client_info"].lower()
+
+
+async def _anisette() -> dict:
+    """Serveur anisette : joignable, et il fournit des données Windows (les seules qu'Apple accepte).
+    Avec le serveur par défaut, le serveur de repli prend le relais quand il ne répond pas."""
+    found = []
+    for url in settings.anisette_servers():
+        data, err = await asyncio.to_thread(_client_info, url)
+        found.append((url, data, err))
+        if _windows(data):
+            break
+    url, data, err = found[-1]
+    if _windows(data):
+        if len(found) > 1:
+            first_url, first_data, first_err = found[0]
+            why = first_err or f"répond « {first_data['client_info']} »"
+            return _check("anisette", "warn", f"{first_url} inutilisable ({why}) : repli sur {url}", url)
+        return _check("anisette", "ok", f"{url} : {data['client_info']}", url)
+    if data:
+        return _check("anisette", "warn",
+                      f"{url} répond « {data['client_info']} » : Apple n'accepte que des données Windows "
+                      "(laisser le réglage vide pour le serveur par défaut)", url)
+    return _check("anisette", "error", " ; ".join(f"{u} : {e or 'données non Windows'}" for u, _, e in found), url)
+
+
 def _disk() -> dict:
     free = shutil.disk_usage(DATA_DIR).free
     gb = free / 1e9
@@ -102,15 +146,14 @@ def _loop() -> dict:
 
 
 async def run_all() -> dict:
-    anisette = settings.anisette_url() or DEFAULT_ANISETTE
     started = time.time()
     results = await asyncio.gather(
         _plumesign(), _mdns(),
         _apple(),
-        _reach("anisette", anisette),
+        _anisette(),
         _reach("github", "https://api.github.com/"),
     )
-    plumesign_, mdns, (apple, apple_date), (anis, _), (github, gh_date) = results
+    plumesign_, mdns, (apple, apple_date), anis, (github, gh_date) = results
     server_date = apple_date or gh_date
     if server_date is None:
         clock = _check("clock", "warn", "aucune date serveur disponible pour comparer")

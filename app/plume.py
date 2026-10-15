@@ -26,6 +26,10 @@ def env() -> dict:
     e.pop("PLUMESIGN_PASSWORD", None)        # jamais hérité : passé seulement à « account login »
     for secret in ("TVSIGN_PASSWORD", "TVSIGN_LAUNCH_TOKEN", "TVSIGN_GITHUB_TOKEN"):
         e.pop(secret, None)                  # secrets de tvsign : inutiles à plumesign
+    # Le serveur anisette vient des réglages seulement : jamais hérité tel quel de l'environnement (il
+    # pourrait désigner un serveur Android). Vide = serveur par défaut de plumesign, avec son repli.
+    for name in ("PLUMESIGN_ANISETTE_URL", "ANISETTE_URL_V3"):
+        e.pop(name, None)
     anisette = settings.anisette_url()
     if anisette:
         e["PLUMESIGN_ANISETTE_URL"] = anisette
@@ -65,6 +69,17 @@ def import_existing_store() -> None:
     if (legacy / "remotepairing").is_dir() and not (pairings.is_dir() and any(pairings.iterdir())):
         shutil.copytree(legacy / "remotepairing", pairings, dirs_exist_ok=True)
         db.log(f"Appairages Apple TV importés depuis {legacy}")
+
+
+def note_legacy_anisette() -> bool:
+    """Au démarrage : une identité anisette de l'ancienne version (state.plist, Android) est inutile,
+    Apple refuse ses données. plumesign la supprime et en crée une Windows au prochain contact avec
+    Apple ; on le dit une fois dans le journal. True si l'ancienne était encore là."""
+    if not (STORE / "state.plist").exists() or (STORE / ANISETTE_STATE).exists():
+        return False
+    db.log("Identité anisette Android abandonnée (Apple refuse ses données depuis le 12 octobre 2026) : "
+           "une identité Windows sera créée au prochain contact avec Apple")
+    return True
 
 
 # ---------- comptes ----------
@@ -157,8 +172,16 @@ async def _as(email: str):
                 db.log(f"compte par défaut {prev} non rétabli : {e}", "warn")
 
 
+# Comptes dont la déconnexion a déjà été signalée (une alerte par épisode, quel que soit le chemin qui
+# la découvre : contrôle périodique ou renouvellement). Un compte redevenu valide (ou reconnecté) sort
+# de l'ensemble.
+ALERTED: set[str] = set()
+
+
 def _set_status(email: str, ok: bool | None, message: str) -> None:
     """ok=None : état indéterminé (réseau, anisette) ; on garde le dernier état connu."""
+    if ok:
+        ALERTED.discard(email)
     if ok is None:
         db.execute("INSERT INTO account_status (email, ok, message, checked_at) VALUES (?, NULL, ?, ?) "
                    "ON CONFLICT(email) DO UPDATE SET message = excluded.message, "
@@ -179,8 +202,62 @@ _SESSION_TXT = re.compile(r"session (has )?expired|please (log|sign) in|not auth
 _TRANSIENT = re.compile(r"Anisette error|Reqwest error|Request to developer session failed|"
                         r"délai dépassé|panicked|timed out|dns error|connection (refused|reset)", re.I)
 
+# Lignes de journal de plumesign (« [2026-10-15T19:40:36Z WARN  omnisette::remote_anisette_v3] … ») : elles
+# racontent ce qui s'est passé (repli sur un autre serveur anisette…), pas pourquoi la commande échoue.
+_LOG_LINE = re.compile(r"^\[\d{4}-\d\d-\d\dT[\d:.]+Z\s+(INFO|WARN|DEBUG|TRACE)\b")
+
+
+def _errors(output: str) -> str:
+    """La sortie de plumesign sans ses lignes de journal : les erreurs, les paniques, les invites."""
+    return "\n".join(line for line in output.splitlines() if not _LOG_LINE.match(line))
+
+
+# Refus d'Apple qui ne disent rien de la session et qu'il ne sert à rien de répéter :
+# - -80045 « This action cannot be completed at this time » : refus de l'ouverture de session (SRP init),
+#   côté compte ou adresse IP, même avec des données anisette Windows valides ;
+# - HTTP 503 (page HTML) : données anisette ou identité d'appareil refusées (serveur Android, identité
+#   périmée), ou charge momentanée du serveur d'Apple ; HTTP 429 : trop de requêtes.
+_APPLE_REFUSED = re.compile(r"-80045\b|cannot be completed at this time", re.I)
+_APPLE_503 = re.compile(r"(GrandSlam|GSA) (answered|returned) HTTP (429|50[234])|"
+                        r"Apple answered HTTP (429|50[234]) to the anisette|"
+                        r"50[234] (Service Temporarily Unavailable|Bad Gateway|Gateway Time-?out)|"
+                        r"Too Many Requests", re.I)
+# Envoi ou contrôle d'un code par SMS refusé (HTTP 403 « Access to this Apple Developer Service was denied »)
+_SMS_DENIED = re.compile(r"SMS 2FA refused|Access to this Apple Developer Service was denied", re.I)
+# -22411 : Apple ID jamais utilisé sur un appareil Apple
+_NEVER_SIGNED_IN = re.compile(r"-22411\b")
+# -22421 (hsc 434), -22409, -80009 : données anisette désynchronisées ou refusées ;
+# -45061 : identité anisette non provisionnée (plumesign la provisionne de nouveau tout seul)
+_ANISETTE_REFUSED = re.compile(r"-22421\b|-22409\b|-80009\b|MID is invalid", re.I)
+_REPROVISION = re.compile(r"-45061\b|Anisette not provisioned", re.I)
+
+# Ce qu'il faut faire d'une erreur : « apple_refused » (-80045) attend longtemps, Apple limite les essais ;
+# « apple_503 » et « anisette_* » sont réessayées à l'allure habituelle ; « sms_denied » et
+# « never_signed_in » demandent une action de l'utilisateur (aucun essai automatique n'y change rien).
+USER_KINDS = frozenset({"sms_denied", "never_signed_in"})
+
+
+def classify(output: str) -> str | None:
+    """Nature d'un refus d'Apple ou d'un problème d'anisette reconnu dans la sortie de plumesign, ou None.
+    Jamais « session expirée » : ces erreurs ne disent rien de l'état de la session.
+    Les lignes de journal (repli sur un autre serveur, nouvel essai…) ne comptent pas : seule l'erreur finale."""
+    output = _errors(output)
+    for kind, rx in (("apple_refused", _APPLE_REFUSED), ("apple_503", _APPLE_503), ("sms_denied", _SMS_DENIED),
+                     ("never_signed_in", _NEVER_SIGNED_IN), ("anisette_refused", _ANISETTE_REFUSED),
+                     ("anisette_reprovision", _REPROVISION)):
+        if rx.search(output):
+            return kind
+    return None
+
+
+# Message du compte « à reconnecter » : ce qu'Apple exige et pourquoi
+REAUTH_REASON = ("Apple n'accepte plus la session enregistrée : reconnecte le compte (mot de passe, puis code "
+                 "à deux facteurs affiché sur un appareil Apple de confiance)")
+
 
 def session_expired(output: str) -> bool:
+    if classify(output):
+        return False        # -80045, 503, SMS refusé, -22411… : aucun rapport avec la session
     codes = set(_API_CODE.findall(output))
     if codes & _SESSION_CODES:
         return True
@@ -199,29 +276,103 @@ def _classify(res: Result) -> bool | None:
 class SessionExpired(RuntimeError):
     """Apple a fermé la session : reconnexion du compte nécessaire."""
 
+    def __init__(self, message: str, email: str | None = None):
+        super().__init__(message)
+        self.email = email
+
 
 class Transient(RuntimeError):
     """Anisette, réseau ou Apple momentanément indisponibles : nouvel essai rapproché."""
 
 
+class AppleRefused(RuntimeError):
+    """Apple refuse la requête (-80045, HTTP 503/429). Avec -80045 (kind « apple_refused ») Apple limite
+    les essais : pas de nouvel essai rapproché, ça prolongerait le blocage (voir renew._retry_at)."""
+
+    def __init__(self, message: str, kind: str = "apple_refused"):
+        super().__init__(message)
+        self.kind = kind
+
+    @property
+    def slow(self) -> bool:
+        return self.kind == "apple_refused"
+
+
+ANISETTE_STATE = "anisette-state-windows.plist"      # identité anisette de plumesign (voir PATCHES.md)
+_RESET_AT = 0.0
+
+
+def reset_anisette(reason: str) -> bool:
+    """Oublie l'identité anisette : plumesign en crée et en provisionne une nouvelle à la commande suivante.
+    Pour des données qu'Apple refuse alors que le serveur répond (-22409, -80009, -22421 après resynchronisation).
+    Au plus une fois par heure : chaque identité provisionnée est une requête de plus chez Apple."""
+    global _RESET_AT
+    if time.time() - _RESET_AT < 3600:
+        return False
+    try:
+        (STORE / ANISETTE_STATE).unlink()
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        db.log(f"identité anisette non réinitialisée : {e}", "warn")
+        return False
+    _RESET_AT = time.time()
+    db.log(f"Identité anisette réinitialisée ({reason}) : une nouvelle sera créée au prochain essai", "warn")
+    return True
+
+
 def _failure(email: str, what: str, res: Result) -> RuntimeError:
     """Erreur d'une commande plumesign du compte, classée : session expirée (bouton Reconnecter),
-    passagère (anisette, réseau), ou autre."""
+    refus d'Apple (attendre), passagère (anisette, réseau), ou autre."""
+    kind = classify(res.output)
+    if kind in ("apple_refused", "apple_503"):
+        return AppleRefused(f"{what} : {_why(res)}", kind)
+    if kind in USER_KINDS:
+        return RuntimeError(f"{what} : {_why(res)}")
     if session_expired(res.output):
-        _set_status(email, False, "session expirée, reconnexion nécessaire")
+        _set_status(email, False, f"session expirée, reconnexion nécessaire : {REAUTH_REASON}")
         return SessionExpired(f"session Apple de {email} expirée : reconnecte-le (bouton Reconnecter) "
-                              f"[{what} : {res.tail(2)}]")
-    if re.search(r"anisette|panicked", res.output, re.I) or _TRANSIENT.search(res.output) or res.code == -1:
+                              f"[{what} : {res.tail(2)}]", email)
+    if kind == "anisette_refused":
+        reset_anisette(f"Apple refuse les données anisette : {what}")
+    errors = _errors(res.output)
+    if kind or re.search(r"anisette|panicked", errors, re.I) or _TRANSIENT.search(errors) or res.code == -1:
         return Transient(f"{what} : {_why(res)} (passager, nouvel essai automatique)")
     return RuntimeError(f"{what} : {res.tail()}")
 
 
+def explain(kind: str | None, detail: str = "") -> str | None:
+    """Phrase en français pour un refus reconnu par classify() (None : rien de particulier à dire).
+    detail : la dernière ligne de plumesign, gardée pour le diagnostic."""
+    tail = f" | {detail}" if detail else ""
+    if kind == "apple_refused":
+        return ("Apple refuse temporairement la connexion (erreur -80045, côté compte ou réseau) : n'insiste pas, "
+                "Apple limite les essais et chaque nouvel essai peut prolonger le blocage ; attends plusieurs "
+                f"heures{tail}")
+    if kind == "apple_503":
+        return ("Apple répond HTTP 503 : données anisette refusées (serveur anisette Android ?) ou serveur d'Apple "
+                f"surchargé, l'essai suivant est espacé{tail}")
+    if kind == "sms_denied":
+        return f"Apple refuse les codes par SMS : utilise le code d'un appareil Apple de confiance{tail}"
+    if kind == "never_signed_in":
+        return f"Apple refuse cet Apple ID (-22411) : il n'a jamais été connecté sur un appareil Apple{tail}"
+    if kind == "anisette_refused":
+        return f"Apple refuse les données anisette (-22421/-22409) : identité anisette à réinitialiser{tail}"
+    if kind == "anisette_reprovision":
+        return f"identité anisette invalide (-45061), provisionnée de nouveau automatiquement{tail}"
+    return None
+
+
 def _why(res: Result) -> str:
-    if re.search(r"anisette", res.output, re.I):
+    known = explain(classify(res.output), res.tail(1))
+    if known:
+        return known
+    errors = _errors(res.output)
+    if re.search(r"anisette", errors, re.I):
         return f"serveur anisette indisponible : {res.tail(2)}"
-    if re.search(r"panicked", res.output, re.I):
+    if re.search(r"panicked", errors, re.I):
         return f"plumesign a planté (réponse inattendue d'Apple ?) : {res.tail(2)}"
-    if _TRANSIENT.search(res.output):
+    if _TRANSIENT.search(errors):
         return f"réseau ou Apple injoignable : {res.tail(2)}"
     return f"vérification impossible : {res.tail(2)}"
 
@@ -239,7 +390,7 @@ async def check_account(email: str) -> bool | None:
     if ok is None:
         _set_status(email, None, _why(res))
     else:
-        _set_status(email, ok, "session valide" if ok else f"session expirée, reconnexion nécessaire : {res.tail(2)}")
+        _set_status(email, ok, "session valide" if ok else f"session expirée, reconnexion nécessaire : {REAUTH_REASON}")
     return ok
 
 
@@ -255,7 +406,14 @@ def start_login(email: str, password: str) -> Session:
             db.execute("DELETE FROM account_devices WHERE email = ?", email)
             db.log(f"Compte Apple {email} connecté")
         else:
-            db.log(f"Connexion Apple {email} échouée : {' | '.join(s.lines[-2:])}", "error")
+            output = "\n".join(s.lines)
+            kind = classify(output)
+            errors = [l for l in _errors(output).splitlines() if l.strip()]      # sans les lignes de journal
+            last = next((l for l in reversed(errors) if l.startswith("Error")), errors[-1] if errors else "")
+            db.log(f"Connexion Apple {email} échouée : "
+                   f"{explain(kind, last) or ' | '.join(errors[-2:] or s.lines[-2:])}", "error")
+            if kind == "anisette_refused":
+                reset_anisette("connexion refusée pour des données anisette invalides")
 
     async def go() -> None:
         try:

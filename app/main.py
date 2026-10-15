@@ -24,10 +24,12 @@ from .proc import SESSIONS
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     db.init()
+    settings.migrate()         # serveur anisette Android enregistré -> serveur par défaut
     backup.prune_old()
     auth.init()
     renew.startup()            # un renouvellement interrompu ne reste pas « en cours »
     plume.import_existing_store()
+    plume.note_legacy_anisette()
     await devices.sync_store()
     if settings.raw_get("onboarded") is None and (db.rows("SELECT id FROM apps LIMIT 1")
                                                   or db.rows("SELECT id FROM devices LIMIT 1")):
