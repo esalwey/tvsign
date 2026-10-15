@@ -40,8 +40,11 @@ host or distribute any app content.
 - A Linux host, **amd64 or arm64** (Raspberry Pi needs a 64-bit OS). Docker Engine with Compose v2.
 - **The same local network (same L2 segment / VLAN) as the Apple TV.** tvsign finds Apple TVs with
   mDNS/Bonjour (`_remotepairing._tcp`, UDP 5353), which does not cross routers or VLANs. Across VLANs
-  you need an mDNS reflector (UniFi "Multicast DNS", `avahi-daemon` with `enable-reflector=yes`).
-- `network_mode: host` (multicast does not reach a bridge network).
+  you can use an mDNS reflector (UniFi "Multicast DNS", `avahi-daemon` with `enable-reflector=yes`),
+  **or skip it**: give tvsign the TV's IP address (see "When discovery is blocked" below) and it
+  queries the TV directly, which only needs UDP/TCP to be routed between the two.
+- `network_mode: host` (multicast does not reach a bridge network; with a bridge network the
+  address fallback below still works).
 - Outgoing Internet access: Apple (`gsa.apple.com`, `developerservices2.apple.com`), the anisette
   server (`ani.sidestore.app` by default, changeable in Settings), `api.github.com` for releases.
 - A correct clock (NTP).
@@ -108,6 +111,31 @@ bridge of the TV's LAN, not a NATed network. Unprivileged LXC is fine: no TUN de
 
 The Diagnostics page re-runs the environment checks at any time.
 
+### Several Apple TVs
+
+Pair every TV once (Apple TV section › Pair). To keep the same app on a second TV, open the app's
+**Settings**, choose the TV under "Same app on another Apple TV" and press *Add to this TV*: a
+separate card is created for that TV, with its own status, signature and expiry (the downloaded
+file is reused, and both TVs use the same Apple ID and the same App ID). Adding the same app twice
+for the same account **and the same TV** is refused. Removing a TV is refused while an app is being
+installed on it; if its pairing is already gone from the plumesign store, it is simply removed.
+
+### When discovery is blocked (VLAN, Docker bridge network, firewall)
+
+Symptoms: *No Apple TV waiting to be paired*, or renewals failing with "unreachable" although the TV
+is on. The Diagnostics page says whether the cause looks like a Docker bridge network or a blocked
+multicast, and whether the TV still answers directly.
+
+- **Pairing:** in the pair dialog, open *The TV isn't found? Enter its address*, type the TV's IP
+  address (Apple TV: Settings › Network) and press *Search at this address*.
+- **Already paired TVs:** tvsign remembers each TV's last address and queries it directly before
+  browsing the network, so renewals keep working when multicast is filtered. If the TV gets a new
+  address, press *Address* on its row, enter the new one and *Save and test*. Leave it empty to go
+  back to automatic discovery.
+- The direct query is a plain unicast mDNS question to UDP 5353 on the TV; the tunnel itself is TCP to the
+  ports the TV announces. Both must be allowed between tvsign and the TV. `TVSIGN_UNICAST_HINT=0`
+  turns the direct query off.
+
 ### Backups
 
 `/data` (`./tvsign-data` on the host) holds the Apple session, the development certificate's
@@ -156,6 +184,12 @@ Everything is optional. The main variables: `TZ`, `PUID`, `PGID`, `TVSIGN_PORT` 
 `TVSIGN_RENEW_BEFORE_HOURS` (60), `TVSIGN_ANISETTE_URL`, `TVSIGN_GITHUB_TOKEN`, `TVSIGN_LANGUAGE`.
 Settings set in the web UI are stored in the database; an environment variable always wins.
 
+An app is only shown as valid when the Apple TV really has it: after each installation tvsign checks
+the TV's app list, and every `TVSIGN_INSTALL_CHECK_HOURS` (6, 0 = never) it checks again. An app
+uninstalled from the TV (or lost in a TV reset) turns red and is reinstalled at once. A sleeping TV
+is simply checked again later. Renewals of different TVs run in parallel; an install waiting for an
+open app only holds up its own TV.
+
 App open on the Apple TV: tvsign installs on schedule and never tries to guess whether the app is
 open (tvOS keeps closed apps in memory, so a running process says nothing). When the app really is
 on screen, the Apple TV itself holds the update until it is closed: the app card then asks to close
@@ -202,8 +236,12 @@ n'héberge ni ne distribue aucun contenu.
 - Un hôte Linux **amd64 ou arm64** (Raspberry Pi : OS 64 bits). Docker Engine avec Compose v2.
 - **Le même réseau local (même segment L2 / VLAN) que l'Apple TV.** tvsign trouve les Apple TV par
   mDNS/Bonjour (`_remotepairing._tcp`, UDP 5353), qui ne traverse ni routeur ni VLAN. Entre VLAN,
-  il faut un réflecteur mDNS (UniFi « Multicast DNS », `avahi-daemon` avec `enable-reflector=yes`).
-- `network_mode: host` (le multicast n'atteint pas un réseau bridge).
+  on peut utiliser un réflecteur mDNS (UniFi « Multicast DNS », `avahi-daemon` avec
+  `enable-reflector=yes`), **ou s'en passer** : donner à tvsign l'adresse IP de la TV (voir « Quand la
+  découverte est bloquée » plus bas) pour qu'il l'interroge directement ; il suffit que l'UDP et le
+  TCP soient routés entre les deux.
+- `network_mode: host` (le multicast n'atteint pas un réseau bridge ; avec un réseau bridge, la
+  saisie de l'adresse ci-dessous fonctionne quand même).
 - Accès Internet sortant : Apple (`gsa.apple.com`, `developerservices2.apple.com`), le serveur
   anisette (`ani.sidestore.app` par défaut, modifiable dans les Réglages), `api.github.com`.
 - Une horloge à l'heure (NTP).
@@ -273,6 +311,32 @@ n'est nécessaire.
 
 La page Diagnostic relance les vérifications à tout moment.
 
+### Plusieurs Apple TV
+
+Appairer chaque TV une fois (section Apple TV › Appairer). Pour garder la même app sur une seconde
+TV, ouvrir les **Réglages** de l'app, choisir la TV sous « La même app sur une autre Apple TV » puis
+*Ajouter sur cette TV* : une fiche séparée est créée pour cette TV, avec son état, sa signature et
+son échéance (le fichier téléchargé est repris ; les deux TV utilisent le même Apple ID et le même
+identifiant d'app). Ajouter deux fois la même app pour le même compte **et la même TV** est refusé.
+Retirer une TV est refusé pendant qu'une app s'y installe ; si son appairage a déjà disparu du store
+plumesign, elle est simplement retirée.
+
+### Quand la découverte est bloquée (VLAN, Docker en pont, pare-feu)
+
+Symptômes : *Aucune Apple TV en attente d'appairage*, ou renouvellements en échec « injoignable »
+alors que la TV est allumée. La page Diagnostic indique si la cause ressemble à un réseau Docker en
+pont ou à un multicast bloqué, et si la TV répond encore en direct.
+
+- **Appairage :** dans la fenêtre d'appairage, ouvrir *TV introuvable ? Saisis son adresse*, saisir
+  l'adresse IP de la TV (Apple TV : Réglages › Réseau) puis *Rechercher à cette adresse*.
+- **TV déjà appairées :** tvsign retient la dernière adresse de chaque TV et l'interroge directement
+  avant de parcourir le réseau : les renouvellements continuent quand le multicast est filtré. Si la
+  TV change d'adresse, utiliser *Adresse* sur sa ligne, saisir la nouvelle puis *Enregistrer et
+  tester* ; vide, on revient à la découverte automatique.
+- La requête directe est une simple question mDNS en unicast vers le port UDP 5353 de la TV ; le tunnel
+  est en TCP vers les ports annoncés par la TV. Les deux doivent être autorisés entre tvsign et la TV.
+  `TVSIGN_UNICAST_HINT=0` désactive la requête directe.
+
 ### Sauvegardes
 
 `/data` (`./tvsign-data` sur l'hôte) contient la session Apple, la clé privée du certificat de
@@ -323,6 +387,12 @@ Tout est facultatif. Variables principales : `TZ`, `PUID`, `PGID`, `TVSIGN_PORT`
 `TVSIGN_RENEW_BEFORE_HOURS` (60), `TVSIGN_ANISETTE_URL`, `TVSIGN_GITHUB_TOKEN`, `TVSIGN_LANGUAGE`.
 Les réglages faits dans l'interface sont enregistrés en base ; une variable d'environnement a
 toujours la priorité.
+
+Une app n'est affichée « valide » que si l'Apple TV l'a vraiment : après chaque installation, tvsign
+relit la liste des apps de la TV, puis la recontrôle toutes les `TVSIGN_INSTALL_CHECK_HOURS` (6, 0 =
+jamais). Une app désinstallée de la TV (ou perdue lors d'une réinitialisation) passe en rouge et est
+réinstallée aussitôt. Une TV en veille est simplement revue plus tard. Les renouvellements de TV
+différentes s'exécutent en parallèle ; une installation qui attend une app ouverte ne retient que sa TV.
 
 App ouverte sur l'Apple TV : tvsign installe à l'heure prévue et ne cherche pas à deviner si l'app
 est ouverte (tvOS garde en mémoire les apps quittées : un processus ne prouve rien). Quand l'app est
