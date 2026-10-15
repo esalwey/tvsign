@@ -108,9 +108,15 @@ impl CertSummary {
         self.status.eq_ignore_ascii_case("issued")
     }
 
-    /// Revoque, expire ou inutilisable : le revoquer ne casse plus aucune app.
+    /// Deja revoque : le revoquer de nouveau ne libere aucune place.
+    fn is_revoked(&self) -> bool {
+        self.status.eq_ignore_ascii_case("revoked")
+    }
+
+    /// Revoque ou expire (statut ou date) : le revoquer ne casse plus aucune app. Un statut inconnu
+    /// n'est PAS mort : on ne prend pas un champ Apple mal orthographie pour une autorisation.
     pub(crate) fn is_dead(&self, now: SystemTime) -> bool {
-        !self.is_issued() || self.expires <= now
+        self.is_revoked() || self.status.eq_ignore_ascii_case("expired") || self.expires <= now
     }
 
     /// Utilisable pour signer, avec au moins `margin` de validite restante.
@@ -151,48 +157,153 @@ pub(crate) fn format_date(time: SystemTime) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// Rang d'un certificat pour la revocation, du moins grave au plus grave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CertTier {
+    /// Expire ou revoque : rien ne casse.
+    Dead,
+    /// Cree par cette installation.
+    Own,
+    /// Cree par une autre installation de la meme famille (un autre tvsign).
+    Family,
+    /// Xcode, SideStore, AltStore...
+    Foreign,
+}
+
+fn tier_of(
+    c: &CertSummary,
+    own_machine: &str,
+    family: Option<&str>,
+    now: SystemTime,
+) -> CertTier {
+    if c.is_dead(now) {
+        CertTier::Dead
+    } else if c.machine_name.as_deref() == Some(own_machine) {
+        CertTier::Own
+    } else if family.is_some_and(|prefix| {
+        c.machine_name
+            .as_deref()
+            .is_some_and(|m| m.to_ascii_lowercase().starts_with(prefix))
+    }) {
+        CertTier::Family
+    } else {
+        CertTier::Foreign
+    }
+}
+
 /// Certificats que la politique autorise a revoquer, dans l'ordre : morts d'abord, puis les notres,
 /// puis ceux d'une autre installation de la famille, puis les etrangers (Xcode, SideStore...).
-/// Dans chaque groupe, le plus proche de l'expiration d'abord.
+/// Dans chaque groupe, le plus proche de l'expiration d'abord. Les certificats deja « Revoked » sont
+/// exclus : les revoquer encore ne libererait rien.
 pub(crate) fn revocation_candidates(
     certs: &[CertSummary],
     own_machine: &str,
     policy: &CertificatePolicy,
     now: SystemTime,
-) -> Vec<CertSummary> {
+) -> Vec<(CertTier, CertSummary)> {
     let family = policy
         .family_prefix
         .as_deref()
         .filter(|p| !p.is_empty())
         .map(str::to_ascii_lowercase);
 
-    let tier = |c: &CertSummary| -> u8 {
-        if c.is_dead(now) {
-            0
-        } else if c.machine_name.as_deref() == Some(own_machine) {
-            1
-        } else if family.as_ref().is_some_and(|prefix| {
-            c.machine_name
-                .as_deref()
-                .is_some_and(|m| m.to_ascii_lowercase().starts_with(prefix.as_str()))
-        }) {
-            2
-        } else {
-            3
-        }
-    };
-
-    let mut out: Vec<(u8, CertSummary)> = certs
+    let mut out: Vec<(CertTier, CertSummary)> = certs
         .iter()
-        .map(|c| (tier(c), c.clone()))
+        .filter(|c| !c.is_revoked())
+        .map(|c| (tier_of(c, own_machine, family.as_deref(), now), c.clone()))
         .filter(|(t, _)| match policy.revoke {
-            RevokeMode::Never => *t == 0,
-            RevokeMode::OwnOnly => *t <= 1,
+            RevokeMode::Never => *t == CertTier::Dead,
+            RevokeMode::OwnOnly => *t <= CertTier::Own,
             RevokeMode::Any => true,
         })
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.expires.cmp(&b.1.expires)));
-    out.into_iter().map(|(_, c)| c).collect()
+    out
+}
+
+/// File des revocations a tenter. Seuls les certificats vivants comptent dans la limite
+/// `MAX_REVOKE_ATTEMPTS` : retirer un certificat mort ne risque rien et ne doit pas empecher de
+/// remplacer un de nos certificats vivants.
+pub(crate) struct RevokePlan {
+    candidates: VecDeque<(CertTier, CertSummary)>,
+    live_attempts: usize,
+}
+
+impl RevokePlan {
+    pub(crate) fn new(candidates: Vec<(CertTier, CertSummary)>) -> Self {
+        Self {
+            candidates: candidates.into(),
+            live_attempts: 0,
+        }
+    }
+
+    /// Le prochain certificat a revoquer, ou `None` quand il n'y en a plus ou que la limite est atteinte.
+    pub(crate) fn next(&mut self) -> Option<(CertTier, CertSummary)> {
+        let (tier, _) = self.candidates.front()?;
+        if *tier != CertTier::Dead {
+            if self.live_attempts >= MAX_REVOKE_ATTEMPTS {
+                return None;
+            }
+            self.live_attempts += 1;
+        }
+        self.candidates.pop_front()
+    }
+}
+
+/// Ligne de journal d'une revocation. Seule la mention « (FOREIGN) » signale qu'un certificat d'une
+/// autre application est tombe : tvsign (app/plume.py) previent alors l'utilisateur.
+fn revocation_message(tier: CertTier, candidate: &CertSummary) -> String {
+    let what = match tier {
+        CertTier::Dead => "Removed dead certificate",
+        CertTier::Own => "Revoked own certificate",
+        CertTier::Family | CertTier::Foreign => "Revoked certificate (FOREIGN)",
+    };
+    format!(
+        "{what} with serial number {} [{}]",
+        candidate.serial,
+        candidate.describe()
+    )
+}
+
+/// Etat d'une cle locale face aux certificats du compte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyState {
+    /// Certificat « Issued » et loin de l'expiration : on le reutilise.
+    Reusable,
+    /// Encore valide mais proche de la fin : on tente de le remplacer, sinon on le garde.
+    Expiring,
+    /// Revoque, expire ou statut inconnu : inutilisable.
+    Unusable,
+}
+
+pub(crate) fn key_state(cert: &CertSummary, now: SystemTime) -> KeyState {
+    if cert.usable_for(now, RENEW_MARGIN) {
+        KeyState::Reusable
+    } else if cert.usable_for(now, Duration::ZERO) {
+        KeyState::Expiring
+    } else {
+        KeyState::Unusable
+    }
+}
+
+/// Parmi les cles locales retrouvees (dans l'ordre : `key.pem` puis la cle en attente), laquelle
+/// reutiliser et laquelle a renouveler. Retourne les indices `(reutilisable, a renouveler)`.
+/// Le premier reutilisable l'emporte ; une cle en attente reutilisable est donc adoptee.
+pub(crate) fn pick_existing_key(
+    found: &[CertSummary],
+    now: SystemTime,
+) -> (Option<usize>, Option<usize>) {
+    let mut expiring = None;
+    for (i, summary) in found.iter().enumerate() {
+        match key_state(summary, now) {
+            KeyState::Reusable => return (Some(i), expiring),
+            KeyState::Expiring => {
+                expiring.get_or_insert(i);
+            }
+            KeyState::Unusable => {}
+        }
+    }
+    (None, expiring)
 }
 
 /// Ecrit `data` dans `path` sans jamais laisser un fichier tronque : fichier temporaire voisin, puis renommage.
@@ -317,8 +428,7 @@ impl CertificateIdentity {
         // Only the key will be written to disk, certificate can just be gotten via the request
         // request we've made, by trying to match our public key with the requests public key.
         // Un certificat n'est reutilise que s'il est « Issued » et loin de son expiration.
-        let mut reusable: Option<(RsaPrivateKey, Cert, bool)> = None;
-        let mut expiring: Option<(RsaPrivateKey, Cert)> = None;
+        let mut found: Vec<(RsaPrivateKey, Cert, bool)> = Vec::new();
         for (path, is_pending) in [(&key_path, false), (&pending_path, true)] {
             if !path.exists() {
                 continue;
@@ -336,26 +446,35 @@ impl CertificateIdentity {
             let Some(cert) = Self::find_certificate(&certs, &priv_key)? else {
                 continue;
             };
-            let summary = CertSummary::from_cert(&cert);
-            if summary.usable_for(now, RENEW_MARGIN) {
-                reusable = Some((priv_key, cert, is_pending));
-                break;
-            } else if summary.usable_for(now, Duration::ZERO) {
-                log::warn!(
+            found.push((priv_key, cert, is_pending));
+        }
+        let summaries: Vec<CertSummary> = found
+            .iter()
+            .map(|(_, cert, _)| CertSummary::from_cert(cert))
+            .collect();
+        for summary in &summaries {
+            match key_state(summary, now) {
+                KeyState::Reusable => {}
+                KeyState::Expiring => log::warn!(
                     "certificate {} expires on {}, replacing it",
                     summary.serial,
                     format_date(summary.expires)
-                );
-                expiring.get_or_insert((priv_key, cert));
-            } else {
-                log::warn!(
+                ),
+                KeyState::Unusable => log::warn!(
                     "certificate {} is no longer usable ({} / {}), requesting a new one",
                     summary.serial,
                     summary.status,
                     format_date(summary.expires)
-                );
+                ),
             }
         }
+        let (reusable_index, expiring_index) = pick_existing_key(&summaries, now);
+        let mut found: Vec<Option<(RsaPrivateKey, Cert, bool)>> =
+            found.into_iter().map(Some).collect();
+        let reusable = reusable_index.and_then(|i| found[i].take());
+        let expiring = expiring_index
+            .and_then(|i| found[i].take())
+            .map(|(priv_key, cert, _)| (priv_key, cert));
 
         let (cert, priv_key) = if let Some((priv_key, cert, is_pending)) = reusable {
             if is_pending {
@@ -586,15 +705,18 @@ impl CertificateIdentity {
         let cert_csr = rcgen::Certificate::from_params(params)?.serialize_request_pem()?;
 
         let summaries: Vec<CertSummary> = certs.iter().map(CertSummary::from_cert).collect();
-        let mut candidates: VecDeque<CertSummary> =
-            revocation_candidates(&summaries, machine_name, policy, SystemTime::now()).into();
+        let mut plan = RevokePlan::new(revocation_candidates(
+            &summaries,
+            machine_name,
+            policy,
+            SystemTime::now(),
+        ));
         let mut warned_about_reset = false;
-        let mut revoke_attempts = 0usize;
 
         // When we submit a CSR theres a high chance of it failing, at least
         // on free developer accounts. On error 7460 (too many certificates) we revoke one
-        // certificate the policy allows, then retry; each serial is tried once, at most
-        // MAX_REVOKE_ATTEMPTS times in all. With nothing left to revoke we stop with CERT_LIMIT.
+        // certificate the policy allows, then retry; each serial is tried once, live certificates at
+        // most MAX_REVOKE_ATTEMPTS times in all (dead ones do not count). With nothing left to revoke we stop with CERT_LIMIT.
         let cert_id = loop {
             match session
                 .qh_submit_cert_csr(&team_id, cert_csr.clone(), machine_name)
@@ -617,18 +739,10 @@ impl CertificateIdentity {
                         }
 
                         let mut revoked_any = false;
-                        while revoke_attempts < MAX_REVOKE_ATTEMPTS {
-                            let Some(candidate) = candidates.pop_front() else {
-                                break;
-                            };
-                            revoke_attempts += 1;
+                        while let Some((tier, candidate)) = plan.next() {
                             match session.qh_revoke_cert(&team_id, &candidate.serial).await {
                                 Ok(_) => {
-                                    log::warn!(
-                                        "Revoked certificate with serial number {} [{}]",
-                                        candidate.serial,
-                                        candidate.describe()
-                                    );
+                                    log::warn!("{}", revocation_message(tier, &candidate));
                                     revoked_any = true;
                                     break;
                                 }
@@ -757,8 +871,8 @@ mod tests {
         }
     }
 
-    fn serials(list: &[CertSummary]) -> Vec<&str> {
-        list.iter().map(|c| c.serial.as_str()).collect()
+    fn serials(list: &[(CertTier, CertSummary)]) -> Vec<&str> {
+        list.iter().map(|(_, c)| c.serial.as_str()).collect()
     }
 
     #[test]
@@ -767,6 +881,7 @@ mod tests {
         let certs = vec![
             cert("X", Some("Xcode"), "Issued", 1500),
             cert("EXP", Some("AltStore"), "Issued", 900),
+            cert("EXS", Some("Xcode"), "Expired", 2000),
             cert("REV", Some("Xcode"), "Revoked", 2000),
         ];
         let policy = CertificatePolicy {
@@ -774,7 +889,94 @@ mod tests {
             family_prefix: None,
         };
         let list = revocation_candidates(&certs, "tvsign-1", &policy, now);
-        assert_eq!(serials(&list), vec!["EXP", "REV"]);
+        // An already revoked certificate frees nothing, so it is not a candidate.
+        assert_eq!(serials(&list), vec!["EXP", "EXS"]);
+    }
+
+    #[test]
+    fn an_unknown_status_is_never_taken_for_dead() {
+        let now = at(1000);
+        let certs = vec![
+            cert("ODD", Some("Xcode"), "Pending", 1500),
+            cert("ODD2", Some("tvsign-1"), "", 1500),
+        ];
+        assert!(!certs[0].is_dead(now));
+        for revoke in [RevokeMode::Never, RevokeMode::OwnOnly] {
+            let policy = CertificatePolicy {
+                revoke,
+                family_prefix: None,
+            };
+            let list = revocation_candidates(&certs, "tvsign-1", &policy, now);
+            if revoke == RevokeMode::Never {
+                assert!(list.is_empty());
+            } else {
+                // Only the certificate of this install, never the foreign one.
+                assert_eq!(serials(&list), vec!["ODD2"]);
+            }
+        }
+        assert_eq!(key_state(&certs[0], now), KeyState::Unusable);
+        assert!(cert("E", None, "EXPIRED", 1500).is_dead(now));
+        assert!(cert("R", None, "revoked", 1500).is_dead(now));
+    }
+
+    #[test]
+    fn dead_certificates_do_not_use_up_the_revoke_attempts() {
+        let now = at(1000);
+        let mut certs: Vec<CertSummary> = (0..8)
+            .map(|i| cert(&format!("D{i}"), Some("Xcode"), "Expired", 900 + i))
+            .collect();
+        certs.push(cert("MINE", Some("tvsign-1"), "Issued", 1500));
+        certs.push(cert("OTHER", Some("Xcode"), "Issued", 1500));
+        let policy = CertificatePolicy::default();
+        let mut plan = RevokePlan::new(revocation_candidates(&certs, "tvsign-1", &policy, now));
+        let mut got = Vec::new();
+        while let Some((tier, c)) = plan.next() {
+            got.push((tier, c.serial));
+        }
+        assert_eq!(got.len(), 9);
+        assert_eq!(got[8], (CertTier::Own, "MINE".to_string()));
+    }
+
+    #[test]
+    fn live_revocations_are_capped() {
+        let now = at(1000);
+        let certs: Vec<CertSummary> = (0..10)
+            .map(|i| cert(&format!("L{i}"), Some("tvsign-1"), "Issued", 1100 + i))
+            .collect();
+        let policy = CertificatePolicy::default();
+        let mut plan = RevokePlan::new(revocation_candidates(&certs, "tvsign-1", &policy, now));
+        let mut count = 0;
+        while plan.next().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, MAX_REVOKE_ATTEMPTS);
+    }
+
+    #[test]
+    fn only_foreign_revocations_carry_the_foreign_marker() {
+        let c = cert("S", Some("Xcode"), "Issued", 1500);
+        assert!(!revocation_message(CertTier::Dead, &c).contains("Revoked certificate"));
+        assert!(!revocation_message(CertTier::Own, &c).contains("Revoked certificate"));
+        assert!(revocation_message(CertTier::Foreign, &c).contains("Revoked certificate (FOREIGN)"));
+        assert!(revocation_message(CertTier::Family, &c).contains("Revoked certificate (FOREIGN)"));
+    }
+
+    #[test]
+    fn existing_key_choice() {
+        let now = at(1000);
+        let valid = cert("V", None, "Issued", 1100);
+        let soon = cert("S", None, "Issued", 1010);
+        let gone = cert("G", None, "Revoked", 1100);
+        // A valid key.pem wins.
+        assert_eq!(pick_existing_key(&[valid.clone(), gone.clone()], now), (Some(0), None));
+        // key.pem unusable: the pending key is adopted.
+        assert_eq!(pick_existing_key(&[gone.clone(), valid.clone()], now), (Some(1), None));
+        // Expiring, with no reusable one: renewal is attempted.
+        assert_eq!(pick_existing_key(&[soon.clone(), gone.clone()], now), (None, Some(0)));
+        // Expiring key.pem but a valid pending key: the pending key is used.
+        assert_eq!(pick_existing_key(&[soon, valid], now), (Some(1), Some(0)));
+        assert_eq!(pick_existing_key(&[gone], now), (None, None));
+        assert_eq!(pick_existing_key(&[], now), (None, None));
     }
 
     #[test]

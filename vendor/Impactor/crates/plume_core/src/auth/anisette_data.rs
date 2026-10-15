@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use omnisette::{AnisetteConfiguration, AnisetteHeaders};
 
@@ -10,7 +10,13 @@ pub struct AnisetteData {
     pub base_headers: HashMap<String, String>,
     pub generated_at: SystemTime,
     pub config: AnisetteConfiguration,
+    /// Dernier renouvellement abandonne apres ses essais : pendant `REFRESH_BACKOFF` on garde les
+    /// anciennes donnees au lieu de retenter (et d'attendre) a chaque requete Apple.
+    refresh_failed_at: Option<Instant>,
 }
+
+/// Pause apres un renouvellement abandonne.
+const REFRESH_BACKOFF: Duration = Duration::from_secs(30);
 
 impl AnisetteData {
     pub async fn new(config: AnisetteConfiguration) -> Result<Self, Error> {
@@ -21,6 +27,7 @@ impl AnisetteData {
             base_headers,
             generated_at: SystemTime::now(),
             config,
+            refresh_failed_at: None,
         })
     }
 
@@ -42,6 +49,9 @@ impl AnisetteData {
     /// Renouvelle les donnees anisette en place : 3 essais espaces, puis on garde les anciennes
     /// (Apple refusera peut-etre la requete, mais plumesign ne s'arrete plus sur une erreur passagere).
     pub async fn refresh_in_place(&mut self) {
+        if self.in_backoff(Instant::now()) {
+            return;
+        }
         let mut delay = std::time::Duration::from_secs(1);
         for attempt in 1..=3 {
             match self.refresh().await {
@@ -59,6 +69,13 @@ impl AnisetteData {
             }
         }
         log::warn!("anisette refresh abandoned, keeping the previous data");
+        self.refresh_failed_at = Some(Instant::now());
+    }
+
+    /// Un renouvellement vient d'etre abandonne : inutile de retenter avant `REFRESH_BACKOFF`.
+    fn in_backoff(&self, now: Instant) -> bool {
+        self.refresh_failed_at
+            .is_some_and(|failed| now.saturating_duration_since(failed) < REFRESH_BACKOFF)
     }
 
     pub fn generate_headers(
@@ -135,5 +152,34 @@ impl AnisetteData {
             Some(v) => Ok(v.to_string()),
             None => Err(Error::DeveloperSessionRequestFailed),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> AnisetteData {
+        AnisetteData {
+            base_headers: HashMap::new(),
+            generated_at: SystemTime::now(),
+            config: AnisetteConfiguration::default(),
+            refresh_failed_at: None,
+        }
+    }
+
+    #[test]
+    fn no_backoff_before_any_failure() {
+        assert!(!sample().in_backoff(Instant::now()));
+    }
+
+    #[test]
+    fn a_failed_refresh_pauses_new_attempts_for_a_while() {
+        let mut data = sample();
+        let failed = Instant::now();
+        data.refresh_failed_at = Some(failed);
+        assert!(data.in_backoff(failed + Duration::from_secs(5)));
+        assert!(data.in_backoff(failed + REFRESH_BACKOFF - Duration::from_secs(1)));
+        assert!(!data.in_backoff(failed + REFRESH_BACKOFF));
     }
 }

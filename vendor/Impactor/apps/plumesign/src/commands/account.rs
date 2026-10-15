@@ -365,7 +365,8 @@ pub(crate) enum TeamSource {
 
 /// Choix de l'equipe, sans reseau : explicite > `PLUMESIGN_TEAM_ID` > equipe memorisee > seule equipe.
 /// Une equipe demandee ou memorisee qui n'existe plus est une erreur, jamais un changement silencieux
-/// (l'identifiant de l'app contient l'equipe : une autre equipe installerait une seconde copie).
+/// (l'identifiant de l'app contient l'equipe : une autre equipe installerait une seconde copie),
+/// sauf quand le compte n'en a plus qu'une : la memorisee a disparu, la seule restante est reprise.
 /// `Ok(None)` : plusieurs equipes sans choix, a trancher (terminal) ou a defaut la premiere.
 pub(crate) fn choose_team(
     teams: &[(String, String)],
@@ -415,6 +416,10 @@ pub(crate) fn choose_team(
     if let Some(wanted) = clean(stored) {
         return if exists(wanted) {
             Ok(Some((wanted.to_string(), TeamSource::Stored)))
+        } else if teams.len() == 1 {
+            // Equipe memorisee disparue (compte retire de l'equipe invitee choisie a la connexion) mais
+            // il n'en reste qu'une : il n'y a pas d'ambiguite, on la reprend (resolve_team la memorise).
+            Ok(Some((teams[0].0.clone(), TeamSource::Only)))
         } else {
             Err(format!(
                 "TEAM_NOT_FOUND: the team {wanted} chosen for this account is no longer listed by Apple: {}. \
@@ -497,7 +502,8 @@ pub async fn resolve_team(session: &DeveloperSession, explicit: Option<&str>) ->
         }
     };
 
-    if stored.is_none() {
+    // Memorise quand rien ne l'etait, ou quand la memorisee a disparu et que la seule restante la remplace.
+    if stored.is_none() || (source == TeamSource::Only && stored.as_deref() != Some(team_id.as_str())) {
         if let Some(email) = email {
             pin_team(&email, &team_id).await;
         }
@@ -518,11 +524,13 @@ async fn list_teams(args: TeamsArgs) -> Result<()> {
         .iter()
         .map(|t| (t.team_id.clone(), t.name.clone()))
         .collect();
-    let current = choose_team(&pairs, None, env_team.as_deref(), stored.as_deref())
-        .ok()
-        .flatten()
-        .map(|(id, _)| id)
-        .or_else(|| pairs.first().map(|(id, _)| id.clone()));
+    // Si le choix echoue (equipe memorisee disparue, plusieurs equipes), aucune n'est marquee : la
+    // signature echouerait aussi.
+    let current = match choose_team(&pairs, None, env_team.as_deref(), stored.as_deref()) {
+        std::result::Result::Ok(Some((id, _))) => Some(id),
+        std::result::Result::Ok(None) => pairs.first().map(|(id, _)| id.clone()),
+        Err(_) => None,
+    };
 
     for team in &teams {
         let selected = current.as_deref() == Some(team.team_id.as_str());
@@ -672,6 +680,18 @@ mod tests {
         assert!(err.starts_with("TEAM_NOT_FOUND"));
         let err = choose_team(&two(), None, None, Some("CCCCCCCCCC")).unwrap_err();
         assert!(err.starts_with("TEAM_NOT_FOUND") && err.contains("set-team"));
+    }
+
+    #[test]
+    fn a_vanished_stored_team_falls_back_to_the_only_remaining_one() {
+        let one = vec![("AAAAAAAAAA".to_string(), "Alpha".to_string())];
+        assert_eq!(
+            choose_team(&one, None, None, Some("CCCCCCCCCC")).unwrap(),
+            Some(("AAAAAAAAAA".into(), TeamSource::Only))
+        );
+        // An explicit request or PLUMESIGN_TEAM_ID that does not exist stays an error.
+        assert!(choose_team(&one, Some("CCCCCCCCCC"), None, None).is_err());
+        assert!(choose_team(&one, None, Some("CCCCCCCCCC"), None).is_err());
     }
 
     #[test]

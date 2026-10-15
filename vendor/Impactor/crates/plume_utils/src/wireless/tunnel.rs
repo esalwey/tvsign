@@ -56,18 +56,16 @@ pub async fn locate(
         return Err(Error::PairingNotFound(identifier.to_string()));
     }
 
-    let wanted_udid = records
+    let wanted_record = records
         .iter()
-        .find(|record| record.udid.eq_ignore_ascii_case(identifier))
-        .map(|record| record.udid.clone());
-    let wanted_name = records
-        .iter()
-        .find(|record| record.udid.eq_ignore_ascii_case(identifier))
-        .map(|record| record.name.clone());
-    // Un appareil du meme nom dont le tag ne correspond a aucune de nos cles : peut etre un autre
-    // appareil (le nom est librement modifiable, « Apple TV » par defaut). Simple indice dans le
-    // message, jamais une preuve que l'appairage est perdu.
-    let mut same_name_seen: Option<String> = None;
+        .find(|record| record.udid.eq_ignore_ascii_case(identifier));
+    let wanted_udid = wanted_record.map(|record| record.udid.clone());
+    let wanted_name = wanted_record.map(|record| record.name.clone());
+    // Identifiant mDNS memorise la derniere fois que l'appareil a ete vu : permet de reconnaitre
+    // son service meme quand l'appelant passe l'UDID d'appairage et que le tag ne correspond plus.
+    let stored_identifier = wanted_record.and_then(|record| record.service_identifier.clone());
+    // Services dont le tag ne correspond a aucune de nos cles (autre hote, ou appareil qui a oublie le notre).
+    let mut foreign: Vec<ForeignService> = Vec::new();
 
     let daemon = ServiceDaemon::new()?;
     let browse = daemon.browse(ServiceKind::RemotePairing.service_type())?;
@@ -93,7 +91,10 @@ pub async fn locate(
             continue;
         };
 
-        let mentioned = service_identifier.eq_ignore_ascii_case(identifier);
+        let mentioned = service_identifier.eq_ignore_ascii_case(identifier)
+            || stored_identifier
+                .as_deref()
+                .is_some_and(|stored| stored.eq_ignore_ascii_case(service_identifier));
 
         match store.find(service_identifier, auth_tag).await? {
             Some(record)
@@ -108,6 +109,14 @@ pub async fn locate(
                     record.udid,
                     device.address
                 );
+                if stored_identifier.as_deref() != Some(service_identifier.as_str()) {
+                    if let Err(e) = store
+                        .remember_identifier(&record.udid, service_identifier)
+                        .await
+                    {
+                        log::debug!("could not remember the advertised identifier: {e}");
+                    }
+                }
                 result = Ok(LocatedDevice {
                     record,
                     service_identifier: service_identifier.clone(),
@@ -121,26 +130,34 @@ pub async fn locate(
                 result = Err(Error::PairingNotAccepted);
                 break;
             }
-            None => {
-                if let (Some(wanted), Some(name)) = (&wanted_name, &device.name) {
-                    if wanted.eq_ignore_ascii_case(name) {
-                        same_name_seen = Some(name.clone());
-                    }
-                }
-            }
+            None => foreign.push(ForeignService {
+                identifier: service_identifier.clone(),
+                name: device.name.clone(),
+            }),
             _ => {}
         }
     }
 
-    if let Some(name) = same_name_seen {
-        if matches!(result, Err(Error::DeviceNotFound(_))) {
-            log::warn!(
-                "a device named {name:?} is on the network but is not paired with this host; \
-                 not treating the pairing as lost (it may be another device with the same name)"
-            );
-            result = Err(Error::DeviceNotFound(format!(
-                "{identifier} (a different device named {name:?} is visible but not paired with this host)"
-            )));
+    if matches!(result, Err(Error::DeviceNotFound(_))) {
+        match judge_foreign(wanted_name.as_deref(), &foreign) {
+            Verdict::Lost(name) => {
+                log::warn!(
+                    "the only device named {name:?} on the network no longer accepts this host's \
+                     keys: treating the pairing as lost (if it is another device with the same \
+                     name, pair this one again anyway)"
+                );
+                result = Err(Error::PairingNotAccepted);
+            }
+            Verdict::Ambiguous(name) => {
+                log::warn!(
+                    "several devices named {name:?} are on the network and none is paired with \
+                     this host; not treating the pairing as lost"
+                );
+                result = Err(Error::DeviceNotFound(format!(
+                    "{identifier} (other devices named {name:?} are visible but not paired with this host)"
+                )));
+            }
+            Verdict::Nothing => {}
         }
     }
 
@@ -149,6 +166,51 @@ pub async fn locate(
     }
 
     result
+}
+
+/// A `_remotepairing._tcp` service whose `authTag` none of our keys produce.
+#[derive(Debug, Clone)]
+struct ForeignService {
+    identifier: String,
+    name: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Exactly one distinct device carries our device's name and rejects our keys: it forgot this host.
+    Lost(String),
+    /// Several distinct devices carry that name: impossible to know which one is ours.
+    Ambiguous(String),
+    Nothing,
+}
+
+/// Decides, once the device was never matched, whether the unmatched services prove the pairing lost.
+/// Le nom est librement modifiable (« Apple TV » par defaut), donc seul un nom porte par un seul
+/// identifiant distinct est retenu ; plusieurs identifiants donnent un simple indice.
+fn judge_foreign(wanted_name: Option<&str>, foreign: &[ForeignService]) -> Verdict {
+    let Some(wanted) = wanted_name else {
+        return Verdict::Nothing;
+    };
+    let mut ids: Vec<String> = Vec::new();
+    let mut shown = None;
+    for service in foreign {
+        let Some(name) = service.name.as_deref() else {
+            continue;
+        };
+        if !wanted.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        let id = service.identifier.to_ascii_lowercase();
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+        shown.get_or_insert_with(|| name.to_string());
+    }
+    match (ids.len(), shown) {
+        (1, Some(name)) => Verdict::Lost(name),
+        (n, Some(name)) if n > 1 => Verdict::Ambiguous(name),
+        _ => Verdict::Nothing,
+    }
 }
 
 /// Pair-verifies with `device` and opens a tunnel to its RSD service.
@@ -301,6 +363,47 @@ mod tests {
     fn tunnel_address_replaces_the_port_for_ipv4() {
         let v4: SocketAddr = "192.168.1.20:49152".parse().unwrap();
         assert_eq!(tunnel_address(v4, 1234).to_string(), "192.168.1.20:1234");
+    }
+
+    fn foreign(identifier: &str, name: Option<&str>) -> ForeignService {
+        ForeignService {
+            identifier: identifier.into(),
+            name: name.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_single_same_name_device_rejecting_our_keys_means_pairing_lost() {
+        let seen = [
+            foreign("AAAA", Some("Salon")),
+            // The same service announced again (several interfaces) is still one device.
+            foreign("aaaa", Some("salon")),
+            foreign("BBBB", Some("Chambre")),
+        ];
+        assert_eq!(
+            judge_foreign(Some("Salon"), &seen),
+            Verdict::Lost("Salon".into())
+        );
+    }
+
+    #[test]
+    fn two_distinct_same_name_devices_are_only_a_hint() {
+        let seen = [
+            foreign("AAAA", Some("Apple TV")),
+            foreign("BBBB", Some("Apple TV")),
+        ];
+        assert_eq!(
+            judge_foreign(Some("Apple TV"), &seen),
+            Verdict::Ambiguous("Apple TV".into())
+        );
+    }
+
+    #[test]
+    fn no_same_name_device_or_unknown_name_is_not_a_verdict() {
+        let seen = [foreign("BBBB", Some("Chambre")), foreign("CCCC", None)];
+        assert_eq!(judge_foreign(Some("Salon"), &seen), Verdict::Nothing);
+        assert_eq!(judge_foreign(None, &seen), Verdict::Nothing);
+        assert_eq!(judge_foreign(Some("Salon"), &[]), Verdict::Nothing);
     }
 
     #[test]

@@ -13,6 +13,8 @@ pub struct PairingRecord {
     pub model: String,
     pub account_id: String,
     pub pairing_file_path: PathBuf,
+    /// `identifier` the device advertised over mDNS the last time it was located (absent until then).
+    pub service_identifier: Option<String>,
 }
 
 impl std::fmt::Display for PairingRecord {
@@ -145,6 +147,26 @@ impl PairingStore {
         Ok(None)
     }
 
+    /// Remembers the identifier a located device advertises, in the sidecar. Lets a later `locate`
+    /// recognise the same service even when the caller passes the pairing UDID and none of our keys
+    /// produce its tag any more (the device forgot this host). Best effort: a missing sidecar is created.
+    pub async fn remember_identifier(&self, udid: &str, identifier: &str) -> Result<(), Error> {
+        let mut info = self.read_info(udid).await?.unwrap_or_default();
+        if info.get("service_identifier").and_then(Value::as_string) == Some(identifier) {
+            return Ok(());
+        }
+        info.insert(
+            "service_identifier".into(),
+            Value::String(identifier.to_string()),
+        );
+        if !info.contains_key("udid") {
+            info.insert("udid".into(), Value::String(udid.to_string()));
+        }
+        let mut buf = Vec::new();
+        plist::to_writer_xml(&mut buf, &info)?;
+        write_atomic(&self.info_path(udid)?, &buf).await
+    }
+
     pub async fn remove(&self, udid: &str) -> Result<bool, Error> {
         let removed = remove_if_present(&self.pairing_file_path(udid)?).await?;
         remove_if_present(&self.info_path(udid)?).await?;
@@ -167,6 +189,7 @@ impl PairingStore {
             name: field("name").unwrap_or_else(|| udid.to_string()),
             model: field("model").unwrap_or_else(|| "Unknown".to_string()),
             account_id: field("account_id").unwrap_or_default(),
+            service_identifier: field("service_identifier"),
             udid: udid.to_string(),
             pairing_file_path,
         })
@@ -309,6 +332,33 @@ mod tests {
 
             assert!(store.remove(&device.udid).await.unwrap());
             assert!(store.find(IDENTIFIER, AUTH_TAG).await.unwrap().is_none());
+
+            tokio::fs::remove_dir_all(store.directory()).await.ok();
+        });
+    }
+
+    #[test]
+    fn remembered_identifier_is_stored_in_the_sidecar_and_survives_listing() {
+        let store = temp_store();
+        let device = sample_device();
+        let mut pairing_file = RpPairingFile::generate("plume");
+        pairing_file.alt_irk = Some(ALT_IRK.to_vec());
+
+        block_on(async {
+            store.save(&device, &pairing_file).await.unwrap();
+            assert_eq!(store.list().await.unwrap()[0].service_identifier, None);
+
+            store
+                .remember_identifier(&device.udid, IDENTIFIER)
+                .await
+                .unwrap();
+            store
+                .remember_identifier(&device.udid, IDENTIFIER)
+                .await
+                .unwrap();
+            let record = &store.list().await.unwrap()[0];
+            assert_eq!(record.service_identifier.as_deref(), Some(IDENTIFIER));
+            assert_eq!(record.name, "Living Room");
 
             tokio::fs::remove_dir_all(store.directory()).await.ok();
         });

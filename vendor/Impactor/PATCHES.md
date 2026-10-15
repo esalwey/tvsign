@@ -14,11 +14,15 @@ Each entry names the files, what changed and why. Tests added with a change are 
   `CertificateIdentity::new_with_session_policy`. `new_with_session` keeps its signature and its old
   behaviour (`any`) for the GUI.
 - On error 7460 (account full) only certificates the policy allows are revoked, one at a time, each
-  serial at most once, six attempts at most, in this order: dead ones (revoked, expired), then the
-  ones created by this install (same machine name), then other installs of the same family, then
+  serial at most once, six attempts at most (dead ones do not count), in this order: dead ones
+  (status Expired or expiry in the past; an unknown status is NOT dead; a certificate already
+  Revoked is skipped, it frees nothing), then the ones created by this install (same machine name), then other installs of the same family, then
   foreign ones (Xcode, SideStore, AltStore). Default for plumesign is `own`: a foreign certificate is
   never revoked unless the user asks for `any`. With nothing left to revoke the error starts with
   `CERT_LIMIT:` and lists every certificate (name, machine, serial, status, expiry).
+- Log lines: `Removed dead certificate ...`, `Revoked own certificate ...`, and
+  `Revoked certificate (FOREIGN) ...` for another install or another app. Only the last one makes
+  tvsign warn that other sideloaded apps will stop working.
 - A certificate is reused only when its status is `Issued` and it has more than 30 days left. A
   certificate close to its end is replaced without revoking anything (the old one keeps working when
   the account has no free slot). A revoked or expired one is replaced.
@@ -69,7 +73,8 @@ Each entry names the files, what changed and why. Tests added with a change are 
 `crates/plume_core/src/auth/anisette_data.rs`, `developer/session.rs`, `auth/account/login.rs`
 
 - `AnisetteData::refresh_in_place`: three tries with a pause, then the previous data is kept instead
-  of `unwrap()` (which aborted plumesign in the middle of a sign or a 2FA wait). `generate_headers`
+  of `unwrap()` (which aborted plumesign in the middle of a sign or a 2FA wait). After an abandoned
+  refresh no new attempt is made for 30 s, so an outage does not add the retries to every Apple call. `generate_headers`
   no longer panics on old data; clock going backwards no longer panics.
 - `crates/plume_core/src/lib.rs` `client()`: connect timeout 10 s, request timeout 60 s.
 - `auth/account/mod.rs` `check_error`: no `unwrap` on a missing `ec`.
@@ -90,7 +95,9 @@ Each entry names the files, what changed and why. Tests added with a change are 
 
 - Team resolution order: `--team` / `-t`, `$PLUMESIGN_TEAM_ID`, the team stored in `accounts.json`
   (`team_id` of the account), the only team. An explicit or stored team that Apple no longer lists is
-  an error `TEAM_NOT_FOUND:` (it used to fall through to `teams[0]` silently). With several teams and
+  an error `TEAM_NOT_FOUND:` (it used to fall through to `teams[0]` silently), except when the account
+  has exactly one team left: it is used and stored in place of the vanished one. `account teams` marks
+  no team when the choice would fail. With several teams and
   nothing chosen, without a terminal, the first team is used (as before) with a `MULTIPLE_TEAMS:`
   warning and is stored, so a later change of Apple's ordering cannot move the app to another team.
 - New `account teams [--json]` and `account set-team <TEAM_ID>`. `sign` takes `--team`.
@@ -98,10 +105,14 @@ Each entry names the files, what changed and why. Tests added with a change are 
 
 ## Wireless pairing (plume_utils, plumesign)
 
-- `wireless/tunnel.rs`: `locate()` no longer turns "not found" into "pairing lost" because a device
-  with the same name is visible (the name is user-editable). The identifier + authTag match, or an
-  explicit refusal by the device, remain the only signals. A same-name device is only mentioned in the
-  not-found message. `open_tunnel` maps only `PairVerifyFailed` / `PairingRejected` to
+- `wireless/tunnel.rs`: `locate()` reports a lost pairing (`PairingNotAccepted`) when the wanted
+  device never matched and either (a) a service with the identifier given on the command line, or with
+  the identifier remembered in the `.info.plist` sidecar (`service_identifier`, written after every
+  successful locate), shows a tag none of our keys produce, or (b) exactly ONE distinct identifier
+  carries the wanted device's name and matches none of our keys (tvsign passes the pairing UDID, which
+  differs from the advertised identifier, so a reset TV is only recognisable this way). Two or more
+  distinct same-name identifiers (names are user-editable, "Apple TV" by default) stay a not-found with
+  a hint. `open_tunnel` maps only `PairVerifyFailed` / `PairingRejected` to
   `PairingNotAccepted`; any other pair-verify error is `Unreachable` (retry later, exit 3). The tunnel
   address is built from the located address, so an IPv6 scope id is kept.
 - `wireless/discovery.rs`: a 169.254/16 IPv4 address is only chosen when nothing else is advertised.
