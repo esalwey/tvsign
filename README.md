@@ -131,6 +131,28 @@ branch, for testers). The database is copied before any schema change. Avoid upd
 renewal: `stop_grace_period: 5m` and `TVSIGN_SHUTDOWN_DRAIN_SECONDS` (240) let an install in
 progress finish before the container stops. Watchtower or Diun work but are optional.
 
+tvsign looks once a day for a newer release of itself (one request to the GitHub API, nothing else
+is sent) and shows a dismissible banner with the right instruction for your edition. It never
+updates itself. Turn it off in Settings (“Check for tvsign updates”) or with `TVSIGN_UPDATE_CHECK=off`.
+
+### Windows
+
+1. Download `tvsign-setup-<version>.exe` from the Releases page of this repository and run it. It
+   installs for your Windows account only, no administrator password. If Windows says *Windows
+   protected your PC*, click **More info → Run anyway**: the installer is not code-signed yet.
+2. Keep “Start tvsign with Windows” ticked. Closing the window does not quit tvsign: it keeps
+   running next to the clock (tray icon) and renews your apps.
+3. On the first pairing, Windows may ask about **plumesign** in the firewall: allow it on
+   **private networks**, otherwise the Apple TV cannot be found.
+4. The PC must stay **awake and online**: a sleeping or switched-off PC renews nothing (profiles are
+   renewed 60 h before they expire, which leaves about two and a half days of margin).
+5. **Updating:** run the new installer over the old one. It upgrades in place and keeps your apps,
+   Apple session and pairings; tvsign shows a banner when a new version exists.
+6. **Uninstalling:** Windows Settings → Apps → tvsign. Your data (`%LOCALAPPDATA%\tvsign`) is kept
+   unless you tick “Also delete my tvsign data”.
+
+The full guide (French) is [windows/README-windows.md](windows/README-windows.md).
+
 ### Security
 
 - **Never expose tvsign to the Internet.** No port forwarding, no public reverse proxy. For remote
@@ -164,8 +186,33 @@ the app, and tvsign gives up after `TVSIGN_APP_WAIT_MINUTES` (30) and retries la
 Followed sources: a GitHub release is reinstalled when its tag changes or when its `.ipa` is
 replaced under the same tag (new checksum). A direct link is checked at each renewal (ETag,
 `Last-Modified` and size sent by the server) and downloaded again when the file changed; a server
-that sends none of them cannot be followed: the first download is kept. Shutdown: a renewal in
-progress may finish for up to `TVSIGN_SHUTDOWN_DRAIN_SECONDS` (240) before it is interrupted.
+that sends none of them is followed by downloading the file again at renewal and comparing its
+checksum (the app card says so). Links must be `https://`, cannot contain `user:password@`, and
+cannot point to private or local addresses (including Tailscale/CGNAT `100.64.0.0/10`) unless
+`TVSIGN_ALLOW_PRIVATE_URLS=1`; GitHub itself is never subject to that check. `TVSIGN_GITHUB_TOKEN`
+lifts GitHub's limit of 60 requests per hour and also makes private repositories work (the token
+is only ever sent to `api.github.com`). Shutdown: a renewal in progress may finish for up to
+`TVSIGN_SHUTDOWN_DRAIN_SECONDS` (240) before it is interrupted.
+
+Update control, in each app's Settings and on its card:
+
+- **New versions**: installed automatically (default), or only when you ask. When off, the app is
+  still renewed before it expires; the card shows “Update available” with the release notes and an
+  **Install now** button.
+- **Pinned version** (GitHub): follow one release tag only.
+- **Previous version**: the last installed IPA is kept; the button reinstalls it and skips the
+  version you left until another release comes out.
+- If a new version cannot be signed or installed, tvsign tries the previous one and skips the
+  broken release. An update that fails never turns a valid app red: the installed version stays
+  valid and the update is retried later.
+- A release that needs a newer tvOS than your Apple TV runs (`MinimumOSVersion`) is held back, and
+  installed by itself once the TV is updated.
+- An uploaded app is updated with **Replace IPA** (card, Settings, or the “IPA missing” message after
+  a restore): its history, Apple TV and account are kept.
+
+After a failed renewal, tvsign retries with a delay that doubles at each failure (45 min, 90 min,
+… up to 6 h), more often as the expiry gets closer; errors that only you can fix (free-account
+limit, no developer team, tvOS too old) are retried once a day. **Renew** restarts the sequence.
 
 Notifications (ntfy): the topic name acts as a password on the public ntfy.sh, and messages name
 your Apple ID and your apps: pick a long random topic, or use a self-hosted ntfy. A protected
@@ -298,6 +345,31 @@ pendant un renouvellement : `stop_grace_period: 5m` et `TVSIGN_SHUTDOWN_DRAIN_SE
 finir une installation en cours avant l'arrêt du conteneur. Watchtower ou Diun fonctionnent mais
 restent facultatifs.
 
+tvsign cherche une fois par jour s'il existe une version plus récente de lui-même (une requête à
+l'API GitHub, rien d'autre n'est envoyé) et affiche une bannière qu'on peut écarter, avec la bonne
+consigne pour votre édition. Il ne se met jamais à jour tout seul. Désactivable dans les Réglages
+(« Chercher les mises à jour de tvsign ») ou avec `TVSIGN_UPDATE_CHECK=off`.
+
+### Windows
+
+1. Télécharger `tvsign-setup-<version>.exe` depuis la page Releases de ce dépôt et le lancer. Il
+   s'installe pour votre seul compte Windows, sans mot de passe administrateur. Si Windows affiche
+   *Windows a protégé votre ordinateur*, cliquer sur **Informations complémentaires → Exécuter
+   quand même** : l'installeur n'est pas encore signé numériquement.
+2. Laisser coché « Démarrer tvsign avec Windows ». Fermer la fenêtre ne quitte pas tvsign : il
+   continue près de l'horloge (icône de la zone de notification) et renouvelle vos apps.
+3. Au premier appairage, Windows peut poser une question sur **plumesign** dans le pare-feu : l'autoriser
+   sur les **réseaux privés**, sinon l'Apple TV reste introuvable.
+4. Le PC doit rester **allumé et connecté** : un PC en veille ou éteint ne renouvelle rien (les
+   profils sont renouvelés 60 h avant leur expiration, soit environ deux jours et demi de marge).
+5. **Mettre à jour :** lancer le nouvel installeur par-dessus l'ancien. Il met à jour sur place et
+   conserve vos apps, la session Apple et les appairages ; tvsign affiche une bannière quand une
+   nouvelle version existe.
+6. **Désinstaller :** Paramètres Windows → Applications → tvsign. Vos données
+   (`%LOCALAPPDATA%\tvsign`) sont conservées, sauf si vous cochez « Supprimer aussi mes données tvsign ».
+
+Le guide complet est [windows/README-windows.md](windows/README-windows.md).
+
 ### Sécurité
 
 - **Ne jamais exposer tvsign sur Internet.** Pas de redirection de port, pas de reverse proxy
@@ -333,9 +405,35 @@ fermeture : la carte de l'app demande alors de la fermer, et tvsign abandonne au
 Sources suivies : une release GitHub est réinstallée quand son tag change ou quand son `.ipa` est
 remplacé sous le même tag (nouvelle empreinte). Un lien direct est vérifié à chaque renouvellement
 (ETag, `Last-Modified` et taille envoyés par le serveur) et retéléchargé si le fichier a changé ; un
-serveur qui n'envoie rien de tout cela ne peut pas être suivi : le premier téléchargement est
-conservé. À l'arrêt, un renouvellement en cours peut finir pendant `TVSIGN_SHUTDOWN_DRAIN_SECONDS`
-(240) avant d'être interrompu.
+serveur qui n'envoie rien de tout cela est suivi en retéléchargeant le fichier au renouvellement
+pour comparer son empreinte (la carte de l'app le signale). Les liens doivent être en `https://`,
+ne peuvent pas contenir `utilisateur:motdepasse@`, ni viser une adresse privée ou locale (y compris
+Tailscale/CGNAT `100.64.0.0/10`) sauf avec `TVSIGN_ALLOW_PRIVATE_URLS=1` ; GitHub, lui, n'est jamais
+soumis à ce contrôle. `TVSIGN_GITHUB_TOKEN` relève la limite de GitHub (60 requêtes par heure) et
+fait aussi fonctionner les dépôts privés (le jeton n'est envoyé qu'à `api.github.com`). À l'arrêt,
+un renouvellement en cours peut finir pendant `TVSIGN_SHUTDOWN_DRAIN_SECONDS` (240) avant d'être
+interrompu.
+
+Contrôle des mises à jour, dans les Réglages de chaque app et sur sa carte :
+
+- **Nouvelles versions** : installées automatiquement (par défaut), ou seulement sur demande. Coupé,
+  l'app est quand même renouvelée avant son expiration ; la carte affiche « Mise à jour disponible »
+  avec les notes de version et un bouton **Installer maintenant**.
+- **Version épinglée** (GitHub) : ne suivre qu'un seul tag de release.
+- **Version précédente** : la dernière IPA installée est gardée ; le bouton la réinstalle et ignore la
+  version quittée jusqu'à la prochaine release.
+- Si une nouvelle version ne peut pas être signée ou installée, tvsign essaie la précédente et ignore
+  la release défectueuse. Une mise à jour qui échoue ne met jamais en rouge une app encore valable :
+  la version installée reste valide et la mise à jour est retentée plus tard.
+- Une release qui demande un tvOS plus récent que celui de l'Apple TV (`MinimumOSVersion`) est mise
+  de côté, et installée d'elle-même une fois la TV mise à jour.
+- Une app importée se met à jour avec **Remplacer l'IPA** (carte, Réglages, ou message « IPA absente »
+  après une restauration) : son historique, son Apple TV et son compte sont conservés.
+
+Après un renouvellement raté, tvsign réessaie avec un délai qui double à chaque échec (45 min, 90 min,
+… jusqu'à 6 h), plus souvent à l'approche de l'expiration ; les erreurs que seul l'utilisateur peut
+régler (limite du compte gratuit, pas d'équipe développeur, tvOS trop ancien) sont retentées une fois
+par jour. **Renouveler** repart de zéro.
 
 Notifications (ntfy) : sur ntfy.sh public, le nom du sujet fait office de mot de passe, et les messages
 citent votre Apple ID et vos apps : choisir un sujet long et aléatoire, ou un ntfy auto-hébergé. Un

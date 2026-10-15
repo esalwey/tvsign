@@ -87,6 +87,18 @@ Clic droit sur l'icône tvsign :
 
 Les libellés suivent la langue choisie dans tvsign.
 
+## Mettre à jour tvsign
+
+tvsign cherche une fois par jour (une seule requête à GitHub, rien d'autre n'est envoyé) s'il existe une version plus récente de lui-même, et affiche alors une bannière en haut de la fenêtre avec un lien vers la page de la version. Cette recherche se désactive dans **Réglages > Chercher les mises à jour de tvsign** (le bouton **Vérifier maintenant** de la section À propos la lance à la demande). tvsign ne se met jamais à jour tout seul.
+
+Pour mettre à jour :
+
+1. Téléchargez le nouvel **`tvsign-setup-<version>.exe`** depuis la page de la version.
+2. Lancez-le **par-dessus l'ancienne installation**, sans rien désinstaller. L'installeur demande à tvsign de se fermer et remplace les fichiers ; laissez cochée la case de lancement à la fin.
+3. Vos apps, votre session Apple, vos appairages et vos réglages sont **conservés** : ils sont dans `%LOCALAPPDATA%	vsign`, que l'installeur ne touche pas. Avant de modifier la base, tvsign en fait une copie de sécurité à côté.
+
+Faites-le de préférence quand aucune installation n'est en cours sur l'Apple TV.
+
 ## 7. Questions fréquentes
 
 **Pourquoi Windows dit-il « Windows a protégé votre ordinateur » ?**
