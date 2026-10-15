@@ -445,7 +445,7 @@ class TeamChoice(BaseModel):
 @app.get("/api/accounts/{email}/teams")
 async def account_teams(email: str):
     try:
-        return {"teams": await plume.teams(email)}
+        return {"teams": await plume.teams(email), "env_team": plume.env_team()}
     except plume.UnknownAccount:
         raise HTTPException(404, "unknown_account") from None
     except RuntimeError as e:

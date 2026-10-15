@@ -242,6 +242,27 @@ class Teams(unittest.TestCase):
         finally:
             restore()
 
+    def test_listing_says_when_the_environment_forces_the_team(self):
+        async def fake_teams(email):
+            return plume.parse_teams(self.LINES)
+
+        restore = patched(teams=fake_teams)
+        saved = os.environ.pop("PLUMESIGN_TEAM_ID", None)
+        try:
+            with TestClient(main.app) as client:
+                self.assertIsNone(client.get("/api/accounts/a@b.c/teams", headers=HEADERS).json()["env_team"])
+                os.environ["PLUMESIGN_TEAM_ID"] = "  ZZZZZ99999 "
+                self.assertEqual(plume.env_team(), "ZZZZZ99999")
+                self.assertEqual(client.get("/api/accounts/a@b.c/teams", headers=HEADERS).json()["env_team"],
+                                 "ZZZZZ99999")
+                os.environ["PLUMESIGN_TEAM_ID"] = "   "
+                self.assertIsNone(plume.env_team())
+        finally:
+            os.environ.pop("PLUMESIGN_TEAM_ID", None)
+            if saved is not None:
+                os.environ["PLUMESIGN_TEAM_ID"] = saved
+            restore()
+
     def test_api_reports_a_failure_as_bad_gateway(self):
         async def failing(email):
             raise RuntimeError("liste des équipes : TEAM_NOT_FOUND")

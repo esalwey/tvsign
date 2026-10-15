@@ -398,6 +398,11 @@ def parse_teams(output: str) -> list[dict]:
     return teams
 
 
+def env_team() -> str | None:
+    """Équipe imposée par PLUMESIGN_TEAM_ID (environnement du conteneur) : elle l'emporte sur le choix mémorisé."""
+    return os.environ.get("PLUMESIGN_TEAM_ID", "").strip() or None
+
+
 async def teams(email: str) -> list[dict]:
     """Équipes de développeur du compte (appel Apple)."""
     async with _locked(), _as(email):

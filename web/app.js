@@ -81,10 +81,12 @@ function relatif(ts, now) {
 // ---------- erreurs en clair ----------
 // Chaque cause connue (messages du serveur et de plumesign) : un titre lisible et ce que l'utilisateur peut faire.
 const CAUSES = [
-  [/ntfy/i, "c_ntfy"],
-  [/8220|no devices from which/i, "c_8220"],
+  // Ces deux messages listent des numéros de série et des noms d'équipe : à tester avant les motifs génériques.
   [/CERT_LIMIT/, "c_certlimit"],
   [/NO_TEAM|MULTIPLE_TEAMS|TEAM_NOT_FOUND/, "c_team"],
+  [/arrêté par le système|killed by the system/i, "c_oom"],
+  [/ntfy/i, "c_ntfy"],
+  [/8220|no devices from which/i, "c_8220"],
   [/ancienne version de tvsign/i, "c_legacy"],
   [/appairage perdu|PAIRING_LOST|pairing record|not paired|No stored pairing/i, "c_lost"],
   [/aucune Apple TV/i, "c_no_tv"],
@@ -261,6 +263,7 @@ function problemeApp(a, now) {
     ? `<button class="btn btn--petit" data-relogin="${esc(a.effective_account)}">${t("reconnect")}</button>`
     : e.cle === "c_no_account" ? `<button class="btn btn--petit" data-open="dlg-login" data-key="login-p-${a.id}">${t("connect")}</button>`
     : ["c_lost", "c_legacy"].includes(e.cle) ? `<button class="btn btn--petit" data-open="dlg-pair">${t("pair")}</button>`
+    : e.cle === "c_certlimit" ? `<a class="btn btn--petit" href="#/settings">${t("settings")}</a>`
     : ["c_no_tv", "c_source", "c_bundle", "c_digest"].includes(e.cle) ? `<button class="btn btn--petit" data-edit="${a.id}" data-key="edit-p-${a.id}">${t("settings")}</button>` : "";
   const details = e.brut && (e.brut.length > 110 || e.connu)
     ? `<details class="details" data-key="err-${a.id}"><summary>${t("tech_details")}</summary><pre class="log">${esc(nettoyer(e.brut) || e.brut)}</pre></details>` : "";
@@ -659,14 +662,17 @@ async function openTeam(email) {
     const r = await api(`/api/accounts/${encodeURIComponent(email)}/teams`);
     if (TEAM_EMAIL !== email) return;
     if (!r.teams.length) { box.innerHTML = `<div class="vide"><p>${t("team_none")}</p></div>`; return; }
-    box.innerHTML = `<div class="list">${r.teams.map((x) => `
+    // PLUMESIGN_TEAM_ID (environnement du conteneur) l'emporte sur le choix mémorisé : on le dit, on ne laisse pas choisir.
+    const verrou = !!r.env_team;
+    box.innerHTML = (verrou ? `<p class="group__footer">${esc(t("team_env_locked", { name: "PLUMESIGN_TEAM_ID" }))}</p>` : "") +
+      `<div class="list">${r.teams.map((x) => `
       <label class="row row--choix">
-        <input type="radio" name="team" value="${esc(x.team_id)}" ${x.selected ? "checked" : ""}>
+        <input type="radio" name="team" value="${esc(x.team_id)}" ${x.selected ? "checked" : ""} ${verrou ? "disabled" : ""}>
         <span class="row__icon row__icon--blue">${ICONS.user}</span>
         <span class="row__label"><span class="row__title">${esc(x.name)}</span>
           <span class="row__sub mono">${esc(x.team_id)}${x.type ? " · " + esc(x.type) : ""}</span></span>
       </label>`).join("")}</div>`;
-    ok.disabled = false;
+    ok.disabled = verrou;
   } catch (e) {
     box.innerHTML = "";
     const c = enClair(e.message);
@@ -684,7 +690,8 @@ $("#form-team").addEventListener("submit", async (ev) => {
     ev.target.closest("dialog").close();
     flash("ok", t("team_saved_t"), " " + t("team_saved"));
   } catch (e) {
-    err.textContent = e.message;
+    const c = enClair(e.message);
+    err.textContent = c.connu ? `${c.titre}. ${c.conseil}` : c.titre;
   } finally {
     btn.disabled = false;
     refresh();

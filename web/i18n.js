@@ -475,7 +475,7 @@ const I18N = {
   c_digest_t: ["Nouvelle version refusée : fichier altéré", "New version refused: file altered"],
   c_digest_a: ["Le fichier téléchargé ne correspond pas à l'empreinte publiée. La version précédente reste installée.", "The downloaded file doesn't match the published checksum. The previous version stays installed."],
   c_cert_t: ["Certificat Apple refusé", "Apple certificate refused"],
-  c_cert_a: ["Un compte gratuit a 2 certificats au plus. Si un autre outil (AltStore, Sideloadly) en a créé, révoque-en un sur developer.apple.com ou autorise la révocation dans Réglages › Certificats.", "A free account has 2 certificates at most. If another tool (AltStore, Sideloadly) created one, revoke one at developer.apple.com or allow revoking in Settings › Certificates."],
+  c_cert_a: ["Apple a refusé la demande de certificat. Réessaie plus tard ; le détail technique est juste en dessous.", "Apple refused the certificate request. Try again later; the technical details are just below."],
   c_app_open_t: ["App ouverte sur l'Apple TV", "App open on the Apple TV"],
   c_app_open_a: ["Fermez l'app sur l'Apple TV : la mise à jour sera retentée automatiquement.", "Close the app on the Apple TV: the update will be retried automatically."],
   c_plumesign_old_t: ["plumesign trop ancien", "plumesign too old"],
@@ -514,6 +514,9 @@ const I18N = {
   team_note: ["L'équipe fait partie de l'identifiant de l'app : en changer installe une seconde copie de l'app sur l'Apple TV.", "The team is part of the app's identifier: changing it installs a second copy of the app on the Apple TV."],
   team_saved_t: ["Équipe enregistrée", "Team saved"],
   team_saved: ["Les prochaines signatures l'utilisent.", "The next signatures use it."],
+  team_env_locked: ["L'équipe est imposée par la variable {name} du conteneur : elle l'emporte sur ce choix. Retire la variable pour choisir ici.", "The team is set by the container's {name} variable, which overrides this choice. Remove the variable to choose here."],
+  c_oom_t: ["plumesign arrêté par le système", "plumesign stopped by the system"],
+  c_oom_a: ["Le système a coupé plumesign, le plus souvent faute de mémoire. Libère de la mémoire sur la machine qui héberge tvsign.", "The system killed plumesign, most often for lack of memory. Free some memory on the machine hosting tvsign."],
 };
 
 let LANG = "en";
