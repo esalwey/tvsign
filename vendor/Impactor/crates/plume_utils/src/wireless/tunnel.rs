@@ -18,6 +18,7 @@ use mdns_sd::{ServiceDaemon, ServiceEvent};
 
 use super::discovery::{DiscoveredDevice, ServiceKind};
 use super::store::{PairingRecord, PairingStore};
+use super::unicast::{DIRECT_TIMEOUT, Hint, query};
 use crate::Error;
 
 /// How long a single network step may take before the device counts as unreachable.
@@ -39,6 +40,68 @@ pub struct RsdConnection {
     pub handshake: RsdHandshake,
 }
 
+/// What we are looking for, and what a located candidate is judged against.
+struct Wanted {
+    identifier: String,
+    udid: Option<String>,
+    name: Option<String>,
+}
+
+enum Verdict {
+    /// One of our paired devices, and the one asked for.
+    Found(LocatedDevice),
+    /// The device asked for, but none of our keys produce its tag: it was reset or forgot this host.
+    Refused,
+    /// Not the device we want.
+    Skip,
+}
+
+/// Judges a `_remotepairing._tcp` announcement against our pairings. `seen_forgotten` is set for
+/// a device with our device's name whose tag none of our keys produce: probably our device, which
+/// forgot this host. It is only reported if the real one never shows up before the deadline.
+async fn judge(
+    store: &PairingStore,
+    wanted: &Wanted,
+    device: &DiscoveredDevice,
+    seen_forgotten: &mut bool,
+) -> Result<Verdict, Error> {
+    let (Some(service_identifier), Some(auth_tag)) = (&device.identifier, &device.auth_tag) else {
+        return Ok(Verdict::Skip);
+    };
+
+    let mentioned = service_identifier.eq_ignore_ascii_case(&wanted.identifier);
+
+    Ok(match store.find(service_identifier, auth_tag).await? {
+        Some(record)
+            if mentioned
+                || wanted
+                    .udid
+                    .as_deref()
+                    .is_some_and(|udid| udid.eq_ignore_ascii_case(&record.udid)) =>
+        {
+            log::debug!(
+                "{} is {} at {}",
+                service_identifier,
+                record.udid,
+                device.address
+            );
+            Verdict::Found(LocatedDevice {
+                record,
+                service_identifier: service_identifier.clone(),
+                address: device.address,
+            })
+        }
+        None if mentioned => Verdict::Refused,
+        None => {
+            if let (Some(wanted_name), Some(name)) = (&wanted.name, &device.name) {
+                *seen_forgotten |= wanted_name.eq_ignore_ascii_case(name);
+            }
+            Verdict::Skip
+        }
+        _ => Verdict::Skip,
+    })
+}
+
 /// Finds a paired device by stored UDID or by its mDNS `identifier`.
 ///
 /// Only `_remotepairing._tcp` is browsed; the manual pairing service, which
@@ -50,22 +113,48 @@ pub async fn locate(
     identifier: &str,
     timeout: Duration,
 ) -> Result<LocatedDevice, Error> {
+    locate_via(store, identifier, None, timeout).await
+}
+
+/// [`locate`], first asking `hint` directly (a unicast mDNS query) when given. That finds a device
+/// whose multicast announcements do not reach us (VLAN, Docker bridge network, filtering access
+/// point, firewall); when the direct query finds nothing usable the multicast browse still runs.
+pub async fn locate_via(
+    store: &PairingStore,
+    identifier: &str,
+    hint: Option<Hint>,
+    timeout: Duration,
+) -> Result<LocatedDevice, Error> {
     let records = store.list().await?;
     if records.is_empty() {
         return Err(Error::PairingNotFound(identifier.to_string()));
     }
 
-    let wanted_udid = records
+    let known = records
         .iter()
-        .find(|record| record.udid.eq_ignore_ascii_case(identifier))
-        .map(|record| record.udid.clone());
-    let wanted_name = records
-        .iter()
-        .find(|record| record.udid.eq_ignore_ascii_case(identifier))
-        .map(|record| record.name.clone());
-    // A device with our device's name whose tag none of our keys produce: probably our device,
-    // which forgot this host. Only reported if the real one never shows up before the deadline.
+        .find(|record| record.udid.eq_ignore_ascii_case(identifier));
+    let wanted = Wanted {
+        identifier: identifier.to_string(),
+        udid: known.map(|record| record.udid.clone()),
+        name: known.map(|record| record.name.clone()),
+    };
     let mut seen_forgotten = false;
+
+    if let Some(hint) = hint {
+        match query(hint, ServiceKind::RemotePairing, DIRECT_TIMEOUT).await {
+            Ok(devices) => {
+                for device in &devices {
+                    match judge(store, &wanted, device, &mut seen_forgotten).await? {
+                        Verdict::Found(located) => return Ok(located),
+                        Verdict::Refused => return Err(Error::PairingNotAccepted),
+                        Verdict::Skip => {}
+                    }
+                }
+                log::debug!("{} did not announce the device directly", hint.addr);
+            }
+            Err(e) => log::debug!("direct query to {} failed: {e}", hint.addr),
+        }
+    }
 
     let daemon = ServiceDaemon::new()?;
     let browse = daemon.browse(ServiceKind::RemotePairing.service_type())?;
@@ -86,45 +175,17 @@ pub async fn locate(
         else {
             continue;
         };
-        let (Some(service_identifier), Some(auth_tag)) = (&device.identifier, &device.auth_tag)
-        else {
-            continue;
-        };
 
-        let mentioned = service_identifier.eq_ignore_ascii_case(identifier);
-
-        match store.find(service_identifier, auth_tag).await? {
-            Some(record)
-                if mentioned
-                    || wanted_udid
-                        .as_deref()
-                        .is_some_and(|udid| udid.eq_ignore_ascii_case(&record.udid)) =>
-            {
-                log::debug!(
-                    "{} is {} at {}",
-                    service_identifier,
-                    record.udid,
-                    device.address
-                );
-                result = Ok(LocatedDevice {
-                    record,
-                    service_identifier: service_identifier.clone(),
-                    address: device.address,
-                });
+        match judge(store, &wanted, &device, &mut seen_forgotten).await? {
+            Verdict::Found(located) => {
+                result = Ok(located);
                 break;
             }
-            // The device we were asked for, but none of our keys produce its
-            // tag: it was reset or forgot this host.
-            None if mentioned => {
+            Verdict::Refused => {
                 result = Err(Error::PairingNotAccepted);
                 break;
             }
-            None => {
-                if let (Some(wanted), Some(name)) = (&wanted_name, &device.name) {
-                    seen_forgotten |= wanted.eq_ignore_ascii_case(name);
-                }
-            }
-            _ => {}
+            Verdict::Skip => {}
         }
     }
 
@@ -165,7 +226,18 @@ pub async fn locate_and_connect(
     host: &str,
     timeout: Duration,
 ) -> Result<RsdConnection, Error> {
-    let device = locate(store, identifier, timeout).await?;
+    locate_and_connect_via(store, identifier, host, None, timeout).await
+}
+
+/// [`locate_via`] then [`connect_rsd`].
+pub async fn locate_and_connect_via(
+    store: &PairingStore,
+    identifier: &str,
+    host: &str,
+    hint: Option<Hint>,
+    timeout: Duration,
+) -> Result<RsdConnection, Error> {
+    let device = locate_via(store, identifier, hint, timeout).await?;
     connect_rsd(store, device, host).await
 }
 
@@ -237,4 +309,105 @@ async fn step<F: std::future::Future>(future: F) -> Result<F::Output, Error> {
                 "device stopped responding",
             ))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::IpAddr;
+
+    use idevice::remote_pairing::RpPairingFile;
+    use tokio::net::UdpSocket;
+
+    use super::super::pairing::PairedDevice;
+    use super::super::unicast::tests::response_with;
+    use super::*;
+
+    // Shared with idevice's own validate_auth_tag test (see store.rs).
+    const ALT_IRK: [u8; 16] = [
+        0x32, 0x0a, 0x7a, 0x64, 0x63, 0xf3, 0x5c, 0xcd, 0xa4, 0xbb, 0xd6, 0xeb, 0xe3, 0xab, 0xec,
+        0x8b,
+    ];
+    const IDENTIFIER: &str = "2BE6E510-0325-4365-923E-B14C6F57DB3A";
+    const AUTH_TAG: &str = "kXjlTr2l";
+    const UDID: &str = "00008110-001A2B3C00000000";
+
+    async fn store_with_pairing() -> PairingStore {
+        let dir = std::env::temp_dir().join(format!("plume-locate-test-{}", uuid::Uuid::new_v4()));
+        let store = PairingStore::new(dir);
+        let mut file = RpPairingFile::generate("plume");
+        file.alt_irk = Some(ALT_IRK.to_vec());
+        let device = PairedDevice {
+            udid: UDID.to_string(),
+            name: "Salon".to_string(),
+            model: "AppleTV11,1".to_string(),
+            account_id: "plume".to_string(),
+        };
+        store.save(&device, &file).await.unwrap();
+        store
+    }
+
+    /// A device that only answers direct queries is located through the hint, without multicast.
+    #[tokio::test]
+    async fn locate_via_finds_a_device_that_answers_directly() {
+        let store = store_with_pairing().await;
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (_, peer) = server.recv_from(&mut buf).await.unwrap();
+            let reply = response_with(true, IDENTIFIER, AUTH_TAG);
+            server.send_to(&reply, peer).await.unwrap();
+        });
+
+        let located = locate_via(
+            &store,
+            UDID,
+            Some(Hint::with_port(addr.ip(), addr.port())),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(located.record.udid, UDID);
+        assert_eq!(located.service_identifier, IDENTIFIER);
+        assert_eq!(located.address.ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(located.address.port(), 49152);
+        tokio::fs::remove_dir_all(store.directory()).await.ok();
+    }
+
+    /// An answer whose tag none of our keys produce is never taken for our device; with our
+    /// device's name it is reported as "forgot this host" if the real one never shows up.
+    #[tokio::test]
+    async fn a_foreign_tag_is_never_taken_for_our_device() {
+        let store = store_with_pairing().await;
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (_, peer) = server.recv_from(&mut buf).await.unwrap();
+            let reply = response_with(true, IDENTIFIER, "AAAAAAAA");
+            server.send_to(&reply, peer).await.unwrap();
+        });
+        let verdict = {
+            let records = store.list().await.unwrap();
+            let wanted = Wanted {
+                identifier: UDID.to_string(),
+                udid: Some(records[0].udid.clone()),
+                name: Some(records[0].name.clone()),
+            };
+            let devices = query(
+                Hint::with_port(addr.ip(), addr.port()),
+                ServiceKind::RemotePairing,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            let mut seen_forgotten = false;
+            let verdict = judge(&store, &wanted, &devices[0], &mut seen_forgotten)
+                .await
+                .unwrap();
+            (matches!(verdict, Verdict::Skip), seen_forgotten)
+        };
+        assert_eq!(verdict, (true, true));
+        tokio::fs::remove_dir_all(store.directory()).await.ok();
+    }
 }
