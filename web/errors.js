@@ -18,6 +18,7 @@ function apiError(detail, status) {
     if (c.connu) return c.conseil ? `${c.titre}. ${c.conseil}` : c.titre;
     return brut;
   }
+  if (status === 502 || status === 503 || status === 504) return t("err_gateway");     // proxy ou redémarrage : corps HTML, pas de détail
   return status >= 500 ? t("err_server") : status === 404 ? t("err_not_found") : status === 422 ? t("err_invalid") : t("err_status", { n: status });
 }
 
@@ -84,9 +85,11 @@ function srpError(log) {
 function causeConnexion(log) {
   const brut = String(log || "");
   const srp = srpError(brut);
-  const texte = srp ? `${srp.code} ${srp.message}` : brut;     // la ligne d'erreur d'abord : le reste du journal est du bruit
-  for (const [re, k] of LOGIN_CAUSES) if (re.test(texte)) return { titre: t(k + "_t"), conseil: t(k + "_a"), cle: k, connu: true };
-  const e = enClair(brut);
+  // Les causes précises ne valent que pour la ligne d'erreur d'Apple : sans elle (réseau coupé, délai, plantage),
+  // un « locked » ou un « two-factor » égaré dans le journal ferait un faux diagnostic.
+  const texte = srp ? `${srp.code} ${srp.message}` : brut;
+  if (srp) for (const [re, k] of LOGIN_CAUSES) if (re.test(texte)) return { titre: t(k + "_t"), conseil: t(k + "_a"), cle: k, connu: true };
+  const e = enClair(texte);       // avec une erreur SRP : sa ligne seule, pas un mot du journal ('anisette', 'download'…)
   if (e.cle === "c_session") return { titre: t("c_login_bad_password_t"), conseil: t("c_login_bad_password_a"), cle: "c_login_bad_password", connu: true };
   if (e.connu) return e;
   if (srp) return { titre: t("c_login_refused_t"), conseil: t("c_login_refused_a", { why: srp.message || srp.code }), cle: "c_login_refused", connu: true };

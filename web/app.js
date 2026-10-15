@@ -718,10 +718,16 @@ async function fillAppForm() {
   $("#app-submit").disabled = !STATE.devices.length;
   syncTabs();
   const list = await presets();
+  if (PRESETS_ECHEC) {
+    // liste illisible : on le dit et on propose de réessayer, sans changer d'onglet à la place de l'utilisateur
+    $("#app-presets").innerHTML = `<p class="erreur">${t("presets_failed")} <button class="lien lien--inline" type="button" id="app-presets-retry">${t("try_again")}</button></p>`;
+    return;
+  }
   $("#app-presets").innerHTML = presetCartes(list, "preset");
   canalDuPreset("preset", "channel");
   if (!list.length && f.source_type.value === "preset") { f.source_type.value = "github"; syncTabs(); }
 }
+$("#app-presets").addEventListener("click", (e) => { if (e.target.closest("#app-presets-retry")) fillAppForm(); });
 // canal proposé par défaut : celui du préréglage choisi (ex. bêtas tant qu'il n'y a pas de version stable)
 function canalDuPreset(nomPreset, nomCanal) {
   const choix = $(`input[name="${nomPreset}"]:checked`);

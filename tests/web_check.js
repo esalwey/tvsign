@@ -91,7 +91,9 @@ test("texte libre : cause connue traduite, sinon tel quel", () => {
 test("statuts sans détail", () => {
   langue("en");
   eq(ev(`apiError("", 404)`), "Not found");
-  ok(/did not answer in time/.test(ev(`apiError("", 504)`)) || /server error/.test(ev(`apiError("", 504)`)));
+  for (const s of [502, 503, 504]) ok(/did not answer in time/.test(ev(`apiError("", ${s})`)), String(s));      // proxy ou redémarrage
+  ok(/server error/i.test(ev(`apiError("", 500)`)));
+  eq(ev(`apiError("quelque chose", 502)`), "quelque chose");                  // un 502 du serveur garde son détail
   eq(ev(`apiError("", 418)`), "Error 418");
 });
 
@@ -141,6 +143,19 @@ test("erreur SRP inconnue : message d'Apple repris", () => {
 });
 test("le bruit du journal ne change pas le diagnostic", () => {
   eq(connexion(LOG("-22406", "Your Apple ID or password is incorrect.").replace("Signing in", "anisette disabled, device locked")).cle, "c_login_bad_password");
+});
+test("sans ligne d'erreur SRP, un mot égaré du journal ne fait pas un diagnostic", () => {
+  langue("en");
+  const sansSrp = (bruit) => connexion(`[INFO plumesign] ${bruit}`);
+  eq(sansSrp("mutex locked, waiting").cle, null);                       // pas « compte verrouillé »
+  eq(sansSrp("Two-factor prompt displayed").cle, null);                 // pas « pas de 2FA »
+  eq(sansSrp("accept the terms of the agreement").cle, null);
+  eq(sansSrp("operation timed out").cle, "c_timeout");                  // les causes générales restent
+});
+test("erreur SRP inconnue : le bruit du journal ne remplace pas le message d'Apple", () => {
+  langue("en");
+  const c = connexion(LOG("-99999", "Something odd").replace("Signing in", "anisette download IPA timeout"));
+  eq(c.cle, "c_login_refused");
 });
 test("journal de session sans horodatage", () => {
   eq(ev(`journalSession(["[2026-10-15T10:00:00Z INFO plumesign] bonjour", "sans préfixe"])`), "bonjour\nsans préfixe");

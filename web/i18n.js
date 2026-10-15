@@ -116,6 +116,8 @@ const I18N = {
   err_language_value: ["Choisis auto, en ou fr.", "Choose auto, en or fr."],
   err_number_expected: ["Un nombre est attendu.", "A number is expected."],
   err_unknown_setting: ["Réglage inconnu.", "Unknown setting."],
+  err_tv_listing_empty: ["L'Apple TV n'a renvoyé aucune app : vérification impossible pour le moment. Réveille la TV et réessaie.", "The Apple TV returned no apps: the check cannot be done right now. Wake the TV and try again."],
+  err_nothing_to_accept: ["Aucune version refusée à accepter pour cette app.", "There is no refused version to accept for this app."],
   err_locked_by_env: ["Défini par {env} : modifiable seulement là.", "Set by {env}: it can only be changed there."],
   err_bundle_changed: ["Cette IPA a un autre identifiant d'app : supprime l'app puis ajoute la nouvelle.", "This IPA has a different app identifier: delete the app, then add the new one."],
   err_not_uploaded_app: ["Seule une app importée par fichier peut être remplacée ainsi.", "Only an app added from a file can be replaced this way."],
