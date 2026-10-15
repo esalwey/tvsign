@@ -1,14 +1,13 @@
 """Renouvellement : mise à jour de la source, signature, installation, et boucle de planification."""
 import asyncio
-import base64
 import json
+import shutil
 import time
-import urllib.parse
-import urllib.request
 
-from . import db, devices, ipa, plume, proc, settings
+from . import backup, db, devices, ipa, notifier, plume, proc, settings
 from .config import (ACCOUNT_CHECK_HOURS, APP_WAIT_MINUTES, CHECK_INTERVAL, IPA_DIR,
-                     RELEASE_CHECK_MINUTES, RENEW_TIMEOUT_MINUTES, RETRY_MINUTES)
+                     RELEASE_CHECK_MINUTES, RENEW_TIMEOUT_MINUTES, RETRY_MINUTES, UPDATE_WAIT_MINUTES)
+from .util import replace_retry
 
 # Arrêt du service en cours : plus aucun renouvellement ne démarre, ceux en cours peuvent finir.
 STOPPING = False
@@ -21,6 +20,12 @@ _RERUN: set[int] = set()                # destination changée pendant un renouv
 _ACC_ALERTED: set[str] = set()          # comptes déjà signalés déconnectés (une alerte par épisode)
 _EXPIRED_LOGGED: set[int] = set()       # apps dont l'expiration est déjà au journal (une fois par épisode)
 _NO_MATCH_LOGGED: set[int] = set()      # apps dont l'absence de release correspondante est déjà au journal
+_UPDATE_FAILS: dict[int, int] = {}      # échecs de signature/installation d'une mise à jour pas encore installée
+_OUTCOME: dict[int, tuple[str, str | None]] = {}   # résultat du dernier essai par app (historique des renouvellements)
+_STALL_ALERTED = False                  # blocage de la boucle déjà signalé (une alerte par épisode)
+
+# Après N échecs de contenu (pas de réseau) d'une version téléchargée, on revient à la précédente.
+ROLLBACK_AFTER = 2
 
 # État de la boucle, exposé dans /api/state pour l'interface.
 HEALTH: dict = {
@@ -41,48 +46,17 @@ def app_dir(app_id: int):
 
 
 def _fmt(ts: float) -> str:
-    return time.strftime("%d/%m %H:%M", time.localtime(ts))
+    return notifier.fmt_time(ts)
 
 
 # ---------- notifications ----------
 
-def _send(message: str, priority: str, url: str | None = None) -> None:
-    url = url or settings.ntfy_url()
-    headers = {"Title": "tvsign", "Priority": priority}
-    parts = urllib.parse.urlsplit(url)
-    if parts.username is not None:
-        # https://user:pass@hôte/sujet : urllib n'en fait pas d'authentification, on l'envoie en Basic
-        cred = f"{urllib.parse.unquote(parts.username)}:{urllib.parse.unquote(parts.password or '')}"
-        headers["Authorization"] = "Basic " + base64.b64encode(cred.encode("utf-8")).decode()
-        host = parts.hostname + (f":{parts.port}" if parts.port else "")
-        url = urllib.parse.urlunsplit(parts._replace(netloc=host))
-    req = urllib.request.Request(url, data=message.encode("utf-8"), headers=headers)
-    urllib.request.urlopen(req, timeout=10).close()
-
-
-async def notify_test(url: str | None = None) -> None:
-    """Notification d'essai depuis les Réglages ; lève l'erreur pour l'afficher."""
-    target = url or settings.ntfy_url()
-    if not target:
-        raise RuntimeError("aucune adresse de notification")
-    await asyncio.to_thread(_send, "tvsign : notification de test", "default", target)
-    HEALTH["notify_error"] = None
-
-
-async def notify(message: str, priority: str = "default") -> bool:
-    """Envoi ntfy hors de la boucle d'événements ; un échec est journalisé une fois.
+async def notify(message: str, priority: str = "default", event: str = "fail", **extra) -> bool:
+    """Envoi aux destinations abonnées à `event` (voir notifier.py), hors de la boucle d'événements.
     True si la notification est partie : l'appelant ne doit la considérer envoyée qu'alors."""
-    if not settings.ntfy_url():
-        return False
-    try:
-        await asyncio.to_thread(_send, message, priority)
-        HEALTH["notify_error"] = None
-        return True
-    except Exception as e:  # noqa: BLE001 - la notification est accessoire
-        if HEALTH["notify_error"] is None:
-            db.log(f"notification ntfy échouée : {e}", "warn")
-        HEALTH["notify_error"] = str(e)
-        return False
+    sent = await notifier.dispatch(event, message, priority, **extra)
+    HEALTH["notify_error"] = notifier.last_error()
+    return sent
 
 
 # Niveaux d'alerte croissants : on ne renotifie que si la situation s'aggrave.
@@ -112,12 +86,14 @@ async def alert(app: dict, reason: str, now: float, quiet_fail: bool = False) ->
         return  # déjà notifié à ce niveau
     if lvl == "fail" and quiet_fail:
         return
+    name = app["name"]
     if lvl == "fail":
-        sent = await notify(f"{app['name']} : renouvellement échoué, {reason}")
+        sent = await notify(notifier.text("renew_failed", name=name, reason=reason), "default", "fail", app=name)
     elif lvl == "expired":
-        sent = await notify(f"{app['name']} : profil EXPIRÉ, l'app ne se lance plus. {reason}", "urgent")
+        sent = await notify(notifier.text("expired", name=name, reason=reason), "urgent", "expiry", app=name)
     else:
-        sent = await notify(f"{app['name']} expire dans moins de {lvl[:-1]} h et le renouvellement échoue : {reason}", "high")
+        sent = await notify(notifier.text("expiring", name=name, h=lvl[:-1], reason=reason), "high", "expiry",
+                            app=name)
     if sent:
         # niveau mémorisé seulement si la notification est partie : sinon on réessaiera au prochain échec
         db.update("apps", app["id"], notified_level=lvl)
@@ -137,13 +113,42 @@ def _rejected(app: dict, tag: str, key: str | None) -> bool:
     return tag == app.get("bad_tag") and (key is None or app.get("bad_key") in (None, key))
 
 
-async def refresh_source(app: dict) -> bool:
+class NoRelease(RuntimeError):
+    """Aucune release GitHub ne correspond (canal, préfixes de tag) et aucune IPA n'est encore téléchargée."""
+
+    def __init__(self, message: str, beta_tag: str | None = None):
+        super().__init__(message)
+        self.beta_tag = beta_tag
+
+
+def _keep_previous(dest, app: dict):
+    """Garde une copie de l'IPA actuelle avant qu'une nouvelle la remplace (une copie, pas un lien
+    physique : aucun écrivain ne peut alors altérer les deux). Renvoie le chemin provisoire, ou None
+    si rien à garder."""
+    if not dest.exists():
+        return None
+    keep = dest.with_name("previous.new")
+    keep.unlink(missing_ok=True)
+    shutil.copy2(dest, keep)
+    return keep
+
+
+def _device_os(app: dict) -> str | None:
+    if not app.get("device_id"):
+        return None
+    d = db.row("SELECT os_version FROM devices WHERE id = ?", app["device_id"])
+    return (d or {}).get("os_version") or None
+
+
+async def refresh_source(app: dict, force: bool = False) -> bool:
     """Télécharge une nouvelle version si la source en publie une ; True si l'IPA a changé.
-    Si une IPA utilisable existe déjà, un problème de source ne bloque pas le renouvellement."""
+    Si une IPA utilisable existe déjà, un problème de source ne bloque pas le renouvellement.
+    Une app dont les mises à jour automatiques sont coupées ne change de version que sur demande
+    (force) ; la version précédente reste alors proposée comme « disponible »."""
     if app["source_type"] == "upload":
         return False
     dest = app_dir(app["id"]) / "original.ipa"
-    tag, key, sha256 = None, None, None
+    tag, key, sha256, notes, keep = None, None, None, None, None
     try:
         if app["source_type"] == "github":
             found = await asyncio.to_thread(_latest, app)
@@ -152,9 +157,9 @@ async def refresh_source(app: dict) -> bool:
                     channel = "stable" if app.get("channel") != "beta" else "beta"
                     prefixes, _ = ipa.release_rule(app)
                     which = f", tags {' / '.join(x + '*' for x in prefixes)}" if prefixes else ""
-                    hint = await _beta_hint(app) if channel == "stable" else ""
-                    raise RuntimeError(f"aucune IPA trouvée dans les releases ({channel}{which}) de "
-                                       f"{app['source']}{hint}")
+                    hint, beta_tag = await _beta_hint(app) if channel == "stable" else ("", None)
+                    raise NoRelease(f"aucune IPA trouvée dans les releases ({channel}{which}) de "
+                                    f"{app['source']}{hint}", beta_tag)
                 if app["id"] not in _NO_MATCH_LOGGED:
                     _NO_MATCH_LOGGED.add(app["id"])
                     db.log(f"{app['name']} : aucune release ne correspond plus dans {app['source']} "
@@ -163,6 +168,7 @@ async def refresh_source(app: dict) -> bool:
                 return False
             _NO_MATCH_LOGGED.discard(app["id"])
             tag, url, sha256, key = found["tag"], found["url"], found["sha256"], found.get("key")
+            notes = found.get("notes")
         else:
             tag = url = app["source"]
             key = await asyncio.to_thread(ipa.url_key, url)
@@ -173,41 +179,61 @@ async def refresh_source(app: dict) -> bool:
                 if key and app.get("source_key") is None:
                     db.update("apps", app["id"], source_key=key)   # première lecture de la clé (ancienne base)
                 return False
+            if not force and not app.get("auto_update", 1):
+                if app["source_type"] == "github" and app.get("avail_tag") != tag:
+                    db.update("apps", app["id"], avail_tag=tag, avail_notes=notes)
+                return False
         db.log(f"{app['name']} : téléchargement de {tag}"
                + (" (fichier mis à jour sous le même nom)" if tag == app["source_tag"] and dest.exists() else "")
                + (" (empreinte SHA-256 vérifiée)" if sha256 else ""), app_id=app["id"])
-        # dest remplacé seulement si valide ; un bundle ID différent de l'app suivie est refusé
+        # dest remplacé seulement si valide ; un bundle ID différent de l'app suivie est refusé,
+        # ainsi qu'une version qui exige une tvOS plus récente que celle de l'Apple TV
         expect = app.get("bundle_id") if dest.exists() else None
-        info = await asyncio.to_thread(ipa.download, url, dest, sha256, expect)
+        extra = {"device_os": _device_os(app)} if _device_os(app) else {}
+        keep = await asyncio.to_thread(_keep_previous, dest, app)
+        info = await asyncio.to_thread(ipa.download, url, dest, sha256, expect, **extra)
     except Exception as e:  # noqa: BLE001
+        if keep:
+            keep.unlink(missing_ok=True)
         if not dest.exists():
             raise
-        # SourceRejected (IPA invalide, empreinte fausse, bundle ID changé) est un ValueError
+        # SourceRejected (IPA invalide, empreinte fausse, bundle ID changé, tvOS trop ancienne)
+        # est un ValueError
         if tag and isinstance(e, ValueError) and not isinstance(e, json.JSONDecodeError):
             # IPA invalide (pas une IPA, pas tvOS) : ne pas la retélécharger à chaque essai.
             # Le reste (coupure, réponse tronquée, JSON GitHub illisible) est passager : on réessaiera.
             db.update("apps", app["id"], bad_tag=tag, bad_key=key)
             db.log(f"{app['name']} : version {tag} inutilisable ({e}), version précédente conservée",
                    "warn", app_id=app["id"])
-            await notify(f"{app['name']} : nouvelle version {tag} inutilisable ({e}), version précédente conservée")
+            await notify(notifier.text("update_refused", name=app["name"], tag=tag, why=e), "default", "update",
+                         app=app["name"])
         else:
             db.log(f"{app['name']} : source indisponible ({e}), version précédente conservée",
                    "warn", app_id=app["id"])
         return False
-    db.update("apps", app["id"], source_tag=tag, source_key=key, version=info["version"],
-              bundle_id=info["bundle_id"], bad_tag=None, bad_key=None, source_sha256=info.get("sha256"))
+    fields = dict(source_tag=tag, source_key=key, version=info["version"], bundle_id=info["bundle_id"],
+                  bad_tag=None, bad_key=None, source_sha256=info.get("sha256"), release_notes=notes,
+                  avail_tag=None, avail_notes=None)
+    if keep:
+        if app.get("update_pending") and (dest.parent / "previous.ipa").exists():
+            keep.unlink(missing_ok=True)      # la version précédente reste la dernière installée avec succès
+        else:
+            replace_retry(keep, dest.parent / "previous.ipa")
+            fields.update(prev_tag=app["source_tag"], prev_key=app.get("source_key"), prev_version=app["version"])
+        fields["update_pending"] = 1
+    db.update("apps", app["id"], **fields)
     return True
 
 
-async def _beta_hint(app: dict) -> str:
-    """Canal stable sans release : indique si le canal beta, lui, en a une."""
+async def _beta_hint(app: dict) -> tuple[str, str | None]:
+    """Canal stable sans release : indique si le canal beta, lui, en a une (texte, tag)."""
     try:
         prefixes, prereleases = ipa.release_rule({**app, "channel": "beta"})
         found = await asyncio.to_thread(ipa.latest_github, app["source"], prefixes, prereleases,
                                         app.get("asset_name"))
     except Exception:  # noqa: BLE001 - simple indication
-        return ""
-    return f" ; une version beta existe ({found['tag']}) : choisis le canal Beta" if found else ""
+        return "", None
+    return (f" ; une version beta existe ({found['tag']}) : choisis le canal Beta", found["tag"]) if found else ("", None)
 
 
 def _latest(app: dict) -> dict | None:
@@ -215,16 +241,9 @@ def _latest(app: dict) -> dict | None:
     return ipa.latest_github(app["source"], prefixes, prereleases, app.get("asset_name"))
 
 
-async def new_release(app: dict) -> bool:
-    """Vrai si la source GitHub publie une version différente de celle installée (autre tag, ou
-    même tag dont l'IPA a été remplacée) et pas déjà refusée. Les liens ne sont relus qu'au
-    renouvellement (refresh_source)."""
-    if app["source_type"] != "github":
-        return False
-    try:
-        found = await asyncio.to_thread(_latest, app)
-    except Exception:  # noqa: BLE001 - GitHub indisponible : on réessaiera
-        return False
+def _newer(app: dict, found: dict | None) -> bool:
+    """La release trouvée diffère-t-elle de celle installée (autre tag, ou même tag dont l'IPA a été
+    remplacée) et n'a-t-elle pas déjà été refusée ?"""
     if not found:
         return False
     tag, key = found["tag"], found.get("key")
@@ -235,21 +254,68 @@ async def new_release(app: dict) -> bool:
     return bool(key) and app.get("source_key") not in (None, key)
 
 
+async def new_release(app: dict) -> bool:
+    """Vrai si la source GitHub publie une version différente de celle installée et pas déjà refusée.
+    Les liens ne sont relus qu'au renouvellement (refresh_source)."""
+    if app["source_type"] != "github":
+        return False
+    try:
+        found = await asyncio.to_thread(_latest, app)
+    except Exception:  # noqa: BLE001 - GitHub indisponible : on réessaiera
+        return False
+    return _newer(app, found)
+
+
+async def check_available(app: dict) -> None:
+    """Apps sans mise à jour automatique : mémorise la version disponible (pastille et notes dans
+    l'interface) et prévient une fois par nouvelle version."""
+    if app["source_type"] != "github":
+        return
+    try:
+        found = await asyncio.to_thread(_latest, app)
+    except Exception:  # noqa: BLE001
+        return
+    if _newer(app, found):
+        if app.get("avail_tag") != found["tag"]:
+            db.update("apps", app["id"], avail_tag=found["tag"], avail_notes=found.get("notes"))
+            db.log(f"{app['name']} : version {found['tag']} disponible (mises à jour automatiques désactivées)",
+                   app_id=app["id"])
+            await notify(notifier.text("update_available", name=app["name"], tag=found["tag"]), "default",
+                         "update", app=app["name"])
+    elif app.get("avail_tag"):
+        db.update("apps", app["id"], avail_tag=None, avail_notes=None)
+
+
 # ---------- renouvellement ----------
 
+def _record(app_id: int, trigger: str, started: float) -> None:
+    """Historique des renouvellements (inclus dans le dossier de support) ; ne doit jamais gêner un essai."""
+    outcome, error = _OUTCOME.pop(app_id, ("skipped", None))
+    try:
+        db.execute("INSERT INTO renewals (app_id, started, finished, cause, outcome, error) VALUES (?, ?, ?, ?, ?, ?)",
+                   app_id, started, time.time(), trigger, outcome, (error or "")[:500] or None)
+        db.execute("DELETE FROM renewals WHERE id NOT IN (SELECT id FROM renewals ORDER BY id DESC LIMIT 500)")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def renew(app_id: int, trigger: str = "manuel") -> None:
-    if app_id in _RUNNING or STOPPING:
+    if app_id in _RUNNING or STOPPING or backup.RESTORING:
         return
     _RUNNING.add(app_id)
     try:
         while True:
+            started = time.time()
             try:
                 await asyncio.wait_for(_renew(app_id, trigger), RENEW_TIMEOUT_MINUTES * 60)
             except TimeoutError:
+                _OUTCOME[app_id] = ("error", "renouvellement trop long, abandonné")
                 app = db.row("SELECT * FROM apps WHERE id = ?", app_id)
                 if app:
                     db.log(f"{app['name']} : renouvellement trop long, abandonné", "error", app_id=app_id)
                     await alert(app, "renouvellement trop long, abandonné", time.time())
+            finally:
+                _record(app_id, trigger, started)
             if app_id not in _RERUN:
                 break
             # Apple TV ou compte changés pendant l'opération : l'essai terminé visait l'ancienne destination
@@ -263,7 +329,7 @@ async def renew(app_id: int, trigger: str = "manuel") -> None:
 
 def spawn(app_id: int, trigger: str = "manuel") -> bool:
     """Lance un renouvellement en tâche de fond (référence conservée). False si déjà en cours."""
-    if app_id in _RUNNING or STOPPING:
+    if app_id in _RUNNING or STOPPING or backup.RESTORING:
         return False
     proc.spawn(renew(app_id, trigger))
     return True
@@ -337,8 +403,9 @@ async def _renew(app_id: int, trigger: str) -> None:
     if trigger == "auto" and not app["enabled"]:
         return  # mise en pause pendant que la boucle traitait une autre app
     started = time.time()
-    db.update("apps", app_id, status="running", last_error=None, last_attempt_at=started,
+    db.update("apps", app_id, status="running", last_error=None, error_kind=None, last_attempt_at=started,
               last_trigger=trigger)
+    stage = None            # étape de contenu atteinte : signing, installing (voir le retour arrière)
     try:
         device = db.row("SELECT * FROM devices WHERE id = ?", app["device_id"]) if app["device_id"] else None
         if not device:
@@ -359,16 +426,20 @@ async def _renew(app_id: int, trigger: str) -> None:
         # quittées, une app « avec processus » n'est donc pas forcément à l'écran. Seul installd
         # sait si l'app est réellement utilisée : il met alors l'installation en attente (étape 3).
         _phase(app_id, "checking")
-        if not device["udid"]:
+        if not device["udid"] or not device.get("os_version"):
+            # première connexion, ou tvOS de la TV pas encore connue (contrôle de compatibilité de l'IPA)
             await devices.refresh_info(device["id"])
             device = db.row("SELECT * FROM devices WHERE id = ?", device["id"])
         else:
             await devices.check_reachable(device)
 
-        updated = await refresh_source(app)
-        if trigger == "nouvelle version" and not updated and app["status"] == "ok":
+        updated = await refresh_source(app, force=trigger in ("mise à jour", "nouvelle source"))
+        fresh = db.row("SELECT * FROM apps WHERE id = ?", app_id) or app
+        pending = bool(fresh.get("update_pending"))     # version téléchargée, jamais installée avec succès
+        if trigger == "nouvelle version" and not updated and not pending and app["status"] == "ok":
             # téléchargement raté ou version refusée : inutile de re-signer l'ancienne version
             db.update("apps", app_id, status="ok", last_error=None)
+            _OUTCOME[app_id] = ("skipped", None)
             return
         original = app_dir(app_id) / "original.ipa"
         signed = app_dir(app_id) / "signed.ipa"
@@ -376,28 +447,35 @@ async def _renew(app_id: int, trigger: str) -> None:
             raise RuntimeError("IPA d'origine absente : réimporte l'app")
 
         # 2. Signature (réutilise une signature récente jamais installée, sauf demande manuelle).
-        force = trigger in ("manuel", "nouvelle destination")
+        force = trigger in ("manuel", "nouvelle destination", "retour arrière")
         expires = None if force else _reusable_signature(app, original, signed, time.time())
         if expires:
             db.log(f"{app['name']} : signature du {_fmt(signed.stat().st_mtime)} réutilisée", app_id=app_id)
         else:
+            stage = "signing"
             _phase(app_id, "signing")
             await plume.ensure_device(email, device["udid"], device["name"])
             db.log(f"{app['name']} : signature avec {email}", app_id=app_id)
             if await plume.sign(email, original, signed):
-                msg = (f"un ancien certificat de {email} a été révoqué pour signer {app['name']} : "
-                       "les autres apps sideloadées avec ce compte (iPhone…) vont cesser de fonctionner")
+                msg = notifier.text("cert_revoked", "fr", email=email, name=app["name"])
                 db.log(msg, "warn", app_id=app_id)
-                await notify(msg)
+                # bandeau durable dans l'interface (pas seulement une notification, qui peut ne pas être configurée)
+                settings.raw_set("revocation_notice", json.dumps({"email": email, "app": app["name"], "at": time.time()}))
+                await notify(notifier.text("cert_revoked", email=email, name=app["name"]), "default", "account",
+                             app=app["name"])
                 # les autres apps tvsign du compte, signées avec le certificat révoqué, sont à refaire
                 # tout de suite plutôt qu'au prochain contrôle périodique
                 await _guarded("contrôle des certificats", _check_certificates(email))
             expires = ipa.profile_expiry(signed) or time.time() + 7 * 86400
 
         # 3. Installation. Si l'app est ouverte sur la TV, installd attend qu'elle soit fermée :
-        # l'interface le signale, et on abandonne au bout de APP_WAIT_MINUTES.
+        # l'interface le signale, et on abandonne au bout de APP_WAIT_MINUTES. Une mise à jour facultative
+        # (l'app installée reste valable plus de 24 h) n'attend que UPDATE_WAIT_MINUTES.
+        stage = "installing"
         db.log(f"{app['name']} : installation sur « {device['name']} »", app_id=app_id)
-        wait_cap = APP_WAIT_MINUTES * 60
+        optional = (trigger in ("nouvelle version", "mise à jour") and app["status"] == "ok"
+                    and bool(app["expires_at"]) and app["expires_at"] - time.time() > 24 * 3600)
+        wait_cap = (UPDATE_WAIT_MINUTES if optional else APP_WAIT_MINUTES) * 60
         logged = set()
 
         def on_event(step: str, percent=None, since=None) -> None:
@@ -415,18 +493,29 @@ async def _renew(app_id: int, trigger: str) -> None:
         await devices.install(device, [signed], on_event=on_event, wait_cap=wait_cap, app_name=app["name"])
 
         fields = dict(status="ok", signed_at=time.time(), expires_at=expires, next_attempt_at=None,
-                      last_error=None, notified_level=None, cert_serial=_serials(signed))
+                      last_error=None, error_kind=None, notified_level=None, update_pending=0,
+                      cert_serial=_serials(signed))
         cur = db.row("SELECT account_email FROM apps WHERE id = ?", app_id)
         if cur and not cur["account_email"]:
             # fige le compte : un autre compte = autre équipe = autre bundle ID (2e copie).
             # Pas d'écrasement d'un compte choisi pendant l'opération.
             fields["account_email"] = email
         db.update("apps", app_id, **fields)
+        _OUTCOME[app_id] = ("ok", None)
+        _UPDATE_FAILS.pop(app_id, None)
         db.log(f"{app['name']} : renouvelée ({trigger}), valable jusqu'au {_fmt(expires)}, "
                f"prochain renouvellement auto le {_fmt(expires - settings.renew_before_hours() * 3600)}",
                app_id=app_id)
-        if app["status"] == "error" or app.get("notified_level"):
-            await notify(f"{app['name']} : renouvelée, valable jusqu'au {_fmt(expires)}")
+        if pending:
+            notes = (fresh.get("release_notes") or "").strip()
+            db.log(f"{app['name']} : version {fresh['version']} installée", app_id=app_id)
+            await notify(notifier.text("update_installed", name=app["name"], version=fresh["version"],
+                                       notes=("\n\n" + notes[:600]) if notes else ""),
+                         "default", "update", app=app["name"], version=fresh["version"])
+        if app.get("notified_level"):
+            # seulement si une alerte d'échec est partie : sinon « renouvelée » n'annonce rien de nouveau
+            await notify(notifier.text("renewed", name=app["name"], until=_fmt(expires)), "default", "recovered",
+                         app=app["name"])
     except asyncio.CancelledError:
         # délai dépassé ou arrêt du service : ne pas rester « en cours »
         if STOPPING:
@@ -438,18 +527,77 @@ async def _renew(app_id: int, trigger: str) -> None:
         raise
     except Exception as e:  # noqa: BLE001 - l'erreur est remontée dans l'interface
         now = time.time()
+        row = db.row("SELECT * FROM apps WHERE id = ?", app_id) or app
         unreachable = isinstance(e, devices.Unreachable)
         transient = isinstance(e, (plume.Transient, devices.AppInUse)) or unreachable
-        if unreachable and trigger == "nouvelle version" and app["status"] == "ok":
-            # TV en veille : l'app installée reste valable, la mise à jour attend simplement la TV
-            db.update("apps", app_id, status="ok", last_error=None, next_attempt_at=_retry_at(app, now, True))
+        session = isinstance(e, plume.SessionExpired)
+        far = bool(row["expires_at"]) and row["expires_at"] - now > 24 * 3600
+        if trigger in ("nouvelle version", "mise à jour") and app["status"] == "ok" and far and (transient or session):
+            # TV en veille, app ouverte, anisette ou session : l'app installée reste valable, la mise à jour
+            # attend. Ni carte rouge ni notification d'échec avant que l'expiration approche.
+            db.update("apps", app_id, status="ok", last_error=None, error_kind=None,
+                      next_attempt_at=_retry_at(app, now, True))
             db.log(f"{app['name']} : mise à jour en attente, {e}", "warn", app_id=app_id)
+            _OUTCOME[app_id] = ("skipped", str(e))
             return
-        db.update("apps", app_id, status="error", last_error=str(e),
+        _OUTCOME[app_id] = ("error", str(e))
+        if (row.get("update_pending") and stage and not transient and not session
+                and not isinstance(e, (devices.PairingLost, devices.OldPlumesign))):
+            # une version téléchargée qui ne se signe ou ne s'installe pas : après quelques essais, on
+            # revient à la précédente plutôt que de rejouer le même échec jusqu'à l'expiration
+            _UPDATE_FAILS[app_id] = _UPDATE_FAILS.get(app_id, 0) + 1
+            if _UPDATE_FAILS[app_id] >= ROLLBACK_AFTER and await _auto_rollback(app_id, str(e)):
+                return
+        kind = "transient" if transient else "session" if session else "other"
+        db.update("apps", app_id, status="error", last_error=str(e), error_kind=kind,
                   next_attempt_at=_retry_at(app, now, transient))
         db.log(f"{app['name']} : échec, {e}", "error", app_id=app_id)
-        # une TV en veille loin de l'expiration est banale : pas de notification avant le niveau 24h
-        await alert(db.row("SELECT * FROM apps WHERE id = ?", app_id) or app, str(e), now, quiet_fail=unreachable)
+        # une panne banale (TV en veille, app ouverte, anisette) loin de l'expiration ne prévient pas :
+        # les niveaux 24h / 6h / expiré, eux, notifient toujours
+        await alert(db.row("SELECT * FROM apps WHERE id = ?", app_id) or app, str(e), now, quiet_fail=transient)
+
+
+def restore_previous(app_id: int, pin: bool = False) -> dict | None:
+    """Revient à la version précédente conservée (previous.ipa) ; renvoie l'ancienne fiche, ou None
+    s'il n'y a rien à restaurer. pin : mises à jour automatiques coupées, la version écartée reste
+    proposée comme « disponible » ; sinon elle est marquée refusée."""
+    app = db.row("SELECT * FROM apps WHERE id = ?", app_id)
+    folder = app_dir(app_id)
+    if not app or not app.get("prev_tag") or not (folder / "previous.ipa").exists():
+        return None
+    replace_retry(folder / "previous.ipa", folder / "original.ipa")
+    (folder / "signed.ipa").unlink(missing_ok=True)       # signée à partir de la version écartée
+    fields = dict(source_tag=app["prev_tag"], source_key=app["prev_key"], version=app["prev_version"],
+                  update_pending=0, prev_tag=None, prev_key=None, prev_version=None, release_notes=None,
+                  next_attempt_at=None, bad_tag=None if pin else app["source_tag"],
+                  bad_key=None if pin else app["source_key"])
+    if pin:
+        fields.update(auto_update=0, avail_tag=app["source_tag"], avail_notes=app.get("release_notes"))
+    db.update("apps", app_id, **fields)
+    _UPDATE_FAILS.pop(app_id, None)
+    return app
+
+
+async def _auto_rollback(app_id: int, why: str) -> bool:
+    old = restore_previous(app_id)
+    if not old:
+        return False
+    msg = f"version {old['source_tag']} annulée ({why}), retour à la version {old['prev_version'] or old['prev_tag']}"
+    db.update("apps", app_id, status="error", last_error=msg, error_kind="other")
+    db.log(f"{old['name']} : {msg}", "warn", app_id=app_id)
+    await notify(notifier.text("update_rolled_back", name=old["name"], tag=old["source_tag"], why=why,
+                               prev=old["prev_version"] or old["prev_tag"]), "default", "update", app=old["name"])
+    return True
+
+
+def rollback(app_id: int) -> bool:
+    """Retour arrière demandé par l'utilisateur : restaure la version précédente, coupe les mises à
+    jour automatiques de l'app et relance une signature. False si rien à restaurer."""
+    if not restore_previous(app_id, pin=True):
+        return False
+    db.log("Retour à la version précédente (mises à jour automatiques désactivées)", app_id=app_id)
+    spawn(app_id, "retour arrière")
+    return True
 
 
 def due(app: dict, now: float) -> bool:
@@ -494,8 +642,7 @@ async def _check_certificates(email: str) -> None:
             db.update("apps", app["id"], expires_at=time.time() - 1, next_attempt_at=None,
                       notified_level=None)
             db.log(f"{app['name']} : certificat révoqué, nouvelle signature", "error", app_id=app["id"])
-            await notify(f"{app['name']} : certificat Apple révoqué (autre outil sur le même compte), "
-                         "re-signature en cours", "high")
+            await notify(notifier.text("cert_revoked_other", name=app["name"]), "high", "account", app=app["name"])
 
 
 async def _check_accounts() -> None:
@@ -506,7 +653,7 @@ async def _check_accounts() -> None:
             if email not in _ACC_ALERTED:
                 _ACC_ALERTED.add(email)
                 db.log(f"Compte Apple {email} déconnecté : reconnexion nécessaire", "error")
-                await notify(f"Compte Apple {email} déconnecté : reconnecte-le dans tvsign", "high")
+                await notify(notifier.text("account_lost", email=email), "high", "account")
         elif ok:
             if email in _ACC_ALERTED:
                 _ACC_ALERTED.discard(email)
@@ -552,7 +699,8 @@ def health(now: float | None = None) -> dict:
     now = now or time.time()
     last = HEALTH["last_loop_at"]
     stalled = bool(last) and now - last > 3 * CHECK_INTERVAL + RENEW_TIMEOUT_MINUTES * 60
-    return {**HEALTH, "notifications": bool(settings.ntfy_url()), "loop_stalled": stalled,
+    return {**HEALTH, "notify_error": notifier.last_error(), "notifications": notifier.configured(),
+            "loop_stalled": stalled,
             "check_interval": CHECK_INTERVAL, "retry_minutes": RETRY_MINUTES,
             "release_check_minutes": RELEASE_CHECK_MINUTES, "account_check_hours": ACCOUNT_CHECK_HOURS}
 
@@ -562,12 +710,15 @@ async def _guarded(what: str, coro) -> None:
         await coro
     except Exception as e:  # noqa: BLE001 - un échec isolé ne doit pas bloquer le reste
         HEALTH["loop_error"] = f"{what} : {e}"
-        db.log(f"{what} : {e}", "error")
+        _log_quietly(f"{what} : {e}")
 
 
 async def loop() -> None:
     last_account_check = last_release_check = 0.0
     while True:
+        if backup.RESTORING:        # restauration en cours : la base et les dossiers sont en train d'être remplacés
+            await asyncio.sleep(5)
+            continue
         now = time.time()
         HEALTH["last_loop_at"] = now
         HEALTH["next_check_at"] = now + CHECK_INTERVAL
@@ -590,11 +741,56 @@ async def loop() -> None:
                 now = HEALTH["last_loop_at"] = time.time()   # la boucle vit tant qu'elle avance d'app en app
                 if due(app, now):
                     await _guarded(f"renouvellement de {app['name']}", renew(app["id"], "auto"))
-                elif check_releases and idle(app, now) and await new_release(app):
-                    await _guarded(f"renouvellement de {app['name']}", renew(app["id"], "nouvelle version"))
+                elif check_releases and idle(app, now):
+                    if not app.get("auto_update", 1):
+                        await _guarded(f"version disponible de {app['name']}", check_available(app))
+                    elif app.get("update_pending") or await new_release(app):
+                        # (update_pending : version déjà téléchargée, installation différée par une panne banale)
+                        await _guarded(f"renouvellement de {app['name']}", renew(app["id"], "nouvelle version"))
             await _check_expired(time.time())
         except Exception as e:  # noqa: BLE001 - la boucle ne doit jamais s'arrêter
             HEALTH["loop_error"] = str(e)
-            db.log(f"boucle de renouvellement : {e}", "error")
+            _log_quietly(f"boucle de renouvellement : {e}", "error")
         HEALTH["next_check_at"] = time.time() + CHECK_INTERVAL
         await asyncio.sleep(CHECK_INTERVAL)
+
+
+def _log_quietly(message: str, level: str = "error") -> None:
+    """Journal sans jamais lever : appelé depuis un gestionnaire d'erreur, souvent parce que la base
+    est verrouillée ou pleine, et une exception de plus tuerait la boucle de renouvellement."""
+    try:
+        db.log(message, level)
+    except Exception as e:  # noqa: BLE001
+        print(f"[{level}] {message} (journal indisponible : {e})", flush=True)
+
+
+async def supervise() -> None:
+    """Fait tourner loop() sans jamais la laisser mourir en silence : une exception qui lui
+    échapperait est journalisée et la boucle redémarre après une courte pause."""
+    while True:
+        try:
+            await loop()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            HEALTH["loop_error"] = str(e)
+            _log_quietly(f"boucle de renouvellement arrêtée, redémarrage : {e}")
+            await asyncio.sleep(30)
+
+
+async def watchdog(period: float = 300) -> None:
+    """Prévient (une fois par épisode) quand la boucle ne donne plus signe de vie : /api/livez reste
+    vert tant que le serveur répond, et personne n'ouvre forcément l'interface."""
+    global _STALL_ALERTED
+    while True:
+        await asyncio.sleep(period)
+        try:
+            if health()["loop_stalled"]:
+                if not _STALL_ALERTED:
+                    _STALL_ALERTED = True
+                    _log_quietly("la boucle de renouvellement ne répond plus")
+                    await notify(notifier.text("loop_stalled"), "urgent", "fail")
+            else:
+                _STALL_ALERTED = False
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] surveillance de la boucle : {e}", flush=True)

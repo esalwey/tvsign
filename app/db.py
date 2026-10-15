@@ -59,6 +59,15 @@ CREATE TABLE IF NOT EXISTS events (
     app_id  INTEGER,
     message TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS renewals (
+    id       INTEGER PRIMARY KEY,
+    app_id   INTEGER NOT NULL,
+    started  REAL NOT NULL,
+    finished REAL NOT NULL,
+    cause    TEXT,                          -- déclencheur : auto, manuel, nouvelle version…
+    outcome  TEXT NOT NULL,                 -- ok | error | skipped
+    error    TEXT
+);
 """
 
 
@@ -101,6 +110,16 @@ MIGRATIONS = [
     ("apps", "deferred_since", "REAL"),      # idem
     ("apps", "source_key", "TEXT"),          # identité du contenu téléchargé (empreinte, ETag…) : tag fixe, IPA remplacée
     ("apps", "bad_key", "TEXT"),             # identité de la release refusée (avec bad_tag)
+    # contrôle des versions : mises à jour automatiques, retour arrière, notes de version
+    ("apps", "auto_update", "INTEGER NOT NULL DEFAULT 1"),   # 0 : une nouvelle version est proposée, pas installée seule
+    ("apps", "update_pending", "INTEGER NOT NULL DEFAULT 0"),  # 1 : release téléchargée, pas encore installée avec succès
+    ("apps", "prev_tag", "TEXT"),            # version précédente gardée (previous.ipa) pour le retour arrière
+    ("apps", "prev_key", "TEXT"),
+    ("apps", "prev_version", "TEXT"),
+    ("apps", "avail_tag", "TEXT"),           # nouvelle version disponible (auto_update = 0)
+    ("apps", "avail_notes", "TEXT"),
+    ("apps", "release_notes", "TEXT"),       # notes de la release téléchargée
+    ("apps", "error_kind", "TEXT"),          # transient | session | other : nature du dernier échec
 ]
 
 
@@ -126,15 +145,20 @@ def snapshot(dest) -> None:
         src.close()
 
 
+def migrate(conn: sqlite3.Connection) -> None:
+    """Crée les tables manquantes et ajoute les colonnes de MIGRATIONS (sans rien supprimer)."""
+    conn.executescript(SCHEMA)
+    for table, col, kind in _pending(conn):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {kind}")
+
+
 def init() -> None:
     existed = DB_PATH.exists() and DB_PATH.stat().st_size > 0
     with tx() as conn:
         if existed and _pending(conn):
             # copie de sécurité avant de modifier le schéma (retour arrière possible)
             snapshot(DB_PATH.with_name(f"tvsign.db.pre-migrate-{int(time.time())}"))
-        conn.executescript(SCHEMA)
-        for table, col, kind in _pending(conn):
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {kind}")
+        migrate(conn)
 
 
 def rows(sql: str, *args) -> list[dict]:

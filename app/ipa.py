@@ -18,7 +18,13 @@ from .util import replace_retry
 
 class SourceRejected(ValueError):
     """Release refusée pour de bon (IPA invalide, empreinte fausse, bundle ID changé) :
-    ne pas la retélécharger à chaque essai."""
+    ne pas la retélécharger à chaque essai.
+    code : identifiant stable (« code » ou « code:paramètre ») que l'API renvoie tel quel et que
+    l'interface traduit ; le message reste en français pour le journal."""
+
+    def __init__(self, message: str, code: str | None = None):
+        super().__init__(message)
+        self.code = code
 
 
 def app_info(ipa: Path) -> dict:
@@ -34,6 +40,27 @@ def app_info(ipa: Path) -> dict:
         "platform": info.get("DTPlatformName"),
         "min_os": info.get("MinimumOSVersion"),
     }
+
+
+def _version_tuple(version) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", str(version or ""))[:4])
+
+
+def min_os_ok(min_os, device_os) -> bool:
+    """La tvOS de l'Apple TV suffit-elle au MinimumOSVersion de l'IPA ? Une version inconnue
+    (IPA sans MinimumOSVersion, TV pas encore interrogée) ne bloque jamais."""
+    need, have = _version_tuple(min_os), _version_tuple(device_os)
+    if not need or not have:
+        return True
+    n = max(len(need), len(have))
+    return have + (0,) * (n - len(have)) >= need + (0,) * (n - len(need))
+
+
+def check_min_os(info: dict, device_os) -> None:
+    """Refuse une IPA qui exige une tvOS plus récente que celle de l'Apple TV."""
+    if not min_os_ok(info.get("min_os"), device_os):
+        raise SourceRejected(f"cette version exige tvOS {info['min_os']}, ton Apple TV est en {device_os}",
+                             code=f"needs_tvos:{info['min_os']}:{device_os}")
 
 
 def check_tvos(info: dict) -> None:
@@ -108,7 +135,7 @@ def _check_url(url: str) -> None:
     """Sources « lien » : https uniquement, et pas d'adresse privée/locale (SSRF)."""
     parts = urllib.parse.urlsplit(url)
     if parts.scheme != "https" or not parts.hostname:
-        raise SourceRejected("seules les adresses https:// sont acceptées")
+        raise SourceRejected("seules les adresses https:// sont acceptées", code="https_only")
     if ALLOW_PRIVATE_URLS:
         return
     try:
@@ -118,7 +145,8 @@ def _check_url(url: str) -> None:
     for info in infos:
         addr = ipaddress.ip_address(info[4][0].split("%")[0])
         if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved or addr.is_multicast:
-            raise SourceRejected(f"adresse locale refusée ({addr}) : TVSIGN_ALLOW_PRIVATE_URLS=1 pour l'autoriser")
+            raise SourceRejected(f"adresse locale refusée ({addr}) : TVSIGN_ALLOW_PRIVATE_URLS=1 pour l'autoriser",
+                                 code=f"private_address:{addr}")
 
 
 def _get(url: str, timeout: int = 30, headers: dict | None = None):
@@ -192,7 +220,7 @@ def latest_github(repo: str, tag_prefixes: list[str] | str | None, prereleases: 
             key = sha256 or f"{ipas[0].get('id')}:{ipas[0].get('updated_at')}:{ipas[0].get('size')}"
             return {"tag": rel["tag_name"], "url": ipas[0]["browser_download_url"],
                     "sha256": sha256, "key": key, "prerelease": bool(rel.get("prerelease")),
-                    "asset": ipas[0]["name"], "notes": (rel.get("body") or "")[:4000]}
+                    "asset": ipas[0]["name"], "notes": (rel.get("body") or "")[:4000], "name": rel.get("name") or rel["tag_name"]}
     return None
 
 
@@ -205,9 +233,10 @@ def url_key(url: str) -> str | None:
     return "|".join(p or "" for p in parts) if any(parts) else None
 
 
-def download(url: str, dest: Path, sha256: str | None = None, expect_bundle: str | None = None) -> dict:
-    """Télécharge, vérifie (taille, empreinte, IPA tvOS, bundle ID) puis remplace dest ; l'ancienne
-    IPA est conservée en cas d'échec. Renvoie les infos de l'app."""
+def download(url: str, dest: Path, sha256: str | None = None, expect_bundle: str | None = None,
+             device_os: str | None = None) -> dict:
+    """Télécharge, vérifie (taille, empreinte, IPA tvOS, tvOS minimale de l'Apple TV, bundle ID) puis
+    remplace dest ; l'ancienne IPA est conservée en cas d'échec. Renvoie les infos de l'app."""
     part = dest.with_suffix(".part")
     try:
         h = hashlib.sha256()
@@ -215,11 +244,11 @@ def download(url: str, dest: Path, sha256: str | None = None, expect_bundle: str
             expected = int(r.headers.get("Content-Length") or 0)
             limit = MAX_UPLOAD_MB * 1024 * 1024    # même plafond que les envois : un lien ne remplit pas le disque
             if expected > limit:
-                raise SourceRejected(f"fichier trop gros (> {MAX_UPLOAD_MB} Mo)")
+                raise SourceRejected(f"fichier trop gros (> {MAX_UPLOAD_MB} Mo)", code=f"too_large:{MAX_UPLOAD_MB}")
             got = 0
             while chunk := r.read(1 << 20):
                 if got + len(chunk) > limit:
-                    raise SourceRejected(f"fichier trop gros (> {MAX_UPLOAD_MB} Mo)")
+                    raise SourceRejected(f"fichier trop gros (> {MAX_UPLOAD_MB} Mo)", code=f"too_large:{MAX_UPLOAD_MB}")
                 f.write(chunk)
                 h.update(chunk)
                 got += len(chunk)
@@ -240,6 +269,7 @@ def download(url: str, dest: Path, sha256: str | None = None, expect_bundle: str
             check_tvos(info)
         except ValueError as e:
             raise SourceRejected(str(e)) from e
+        check_min_os(info, device_os)
         if expect_bundle and info["bundle_id"] != expect_bundle:
             raise SourceRejected(f"identifiant d'app changé ({expect_bundle} → {info['bundle_id']}) : "
                                  "version refusée par sécurité ; supprime et rajoute l'app pour l'accepter")

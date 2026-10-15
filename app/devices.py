@@ -273,6 +273,9 @@ async def refresh_info(device_id: int) -> dict:
         last_port=info.get("port"),
     ).items() if v}
     db.update("devices", device_id, **fields)
+    if fields.get("os_version") and device.get("os_version") and fields["os_version"] != device["os_version"]:
+        # nouvelle tvOS : une version écartée parce qu'elle exigeait une tvOS plus récente peut convenir maintenant
+        db.execute("UPDATE apps SET bad_tag = NULL, bad_key = NULL WHERE device_id = ?", device_id)
     if info.get("udid_matches_pairing") is False:
         db.log(f"« {device['name']} » : UDID matériel {info.get('UniqueDeviceID')} différent de "
                f"l'UDID d'appairage {device['pairing_udid']}", "warn")
