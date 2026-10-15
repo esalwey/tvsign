@@ -243,6 +243,9 @@ def restore(archive: Path) -> dict:
                         missing.append(a["name"])
                         db.update("apps", a["id"], status="error", next_attempt_at=None,
                                   last_error="IPA d'origine absente : réimporte l'app")
+                # previous.ipa n'est jamais sauvegardée : plus de retour arrière possible, et une version
+                # « à installer » ne doit pas annoncer « version installée » après le premier renouvellement
+                db.execute("UPDATE apps SET update_pending = 0, prev_tag = NULL, prev_key = NULL, prev_version = NULL")
             except Exception as e:  # noqa: BLE001 - on annule ce qui a été remplacé, quelle que soit l'erreur
                 for step in reversed(undo):
                     try:

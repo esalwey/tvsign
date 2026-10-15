@@ -7,7 +7,7 @@ import time
 from . import backup, db, devices, ipa, notifier, plume, proc, settings
 from .config import (ACCOUNT_CHECK_HOURS, APP_WAIT_MINUTES, CHECK_INTERVAL, IPA_DIR,
                      RELEASE_CHECK_MINUTES, RENEW_TIMEOUT_MINUTES, RETRY_MINUTES, UPDATE_WAIT_MINUTES)
-from .util import replace_retry
+from .util import ContentError, replace_retry
 
 # Arrêt du service en cours : plus aucun renouvellement ne démarre, ceux en cours peuvent finir.
 STOPPING = False
@@ -173,8 +173,8 @@ async def refresh_source(app: dict, force: bool = False) -> bool:
             tag = url = app["source"]
             key = await asyncio.to_thread(ipa.url_key, url)
         if dest.exists():
-            if _rejected(app, tag, key):
-                return False
+            if _rejected(app, tag, key) and not force:
+                return False         # « Installer maintenant » (force) retente une version écartée
             if _unchanged(app, tag, key):
                 if key and app.get("source_key") is None:
                     db.update("apps", app["id"], source_key=key)   # première lecture de la clé (ancienne base)
@@ -532,19 +532,20 @@ async def _renew(app_id: int, trigger: str) -> None:
         transient = isinstance(e, (plume.Transient, devices.AppInUse)) or unreachable
         session = isinstance(e, plume.SessionExpired)
         far = bool(row["expires_at"]) and row["expires_at"] - now > 24 * 3600
-        if trigger in ("nouvelle version", "mise à jour") and app["status"] == "ok" and far and (transient or session):
+        if trigger == "nouvelle version" and app["status"] == "ok" and far and (transient or session):
             # TV en veille, app ouverte, anisette ou session : l'app installée reste valable, la mise à jour
-            # attend. Ni carte rouge ni notification d'échec avant que l'expiration approche.
+            # attend. Ni carte rouge ni notification d'échec avant que l'expiration approche. Une mise à jour
+            # demandée à la main (« mise à jour ») ne passe pas ici : l'échec doit se voir.
             db.update("apps", app_id, status="ok", last_error=None, error_kind=None,
                       next_attempt_at=_retry_at(app, now, True))
             db.log(f"{app['name']} : mise à jour en attente, {e}", "warn", app_id=app_id)
             _OUTCOME[app_id] = ("skipped", str(e))
             return
         _OUTCOME[app_id] = ("error", str(e))
-        if (row.get("update_pending") and stage and not transient and not session
-                and not isinstance(e, (devices.PairingLost, devices.OldPlumesign))):
-            # une version téléchargée qui ne se signe ou ne s'installe pas : après quelques essais, on
-            # revient à la précédente plutôt que de rejouer le même échec jusqu'à l'expiration
+        if (row.get("update_pending") and stage and isinstance(e, ContentError) and not transient and not session):
+            # une version téléchargée dont l'IPA ne se signe ou ne s'installe pas : après quelques essais, on
+            # revient à la précédente plutôt que de rejouer le même échec jusqu'à l'expiration. Les pannes
+            # sans rapport avec l'IPA (limite d'App ID, TV pleine ou absente…) ne comptent jamais.
             _UPDATE_FAILS[app_id] = _UPDATE_FAILS.get(app_id, 0) + 1
             if _UPDATE_FAILS[app_id] >= ROLLBACK_AFTER and await _auto_rollback(app_id, str(e)):
                 return
@@ -570,9 +571,11 @@ def restore_previous(app_id: int, pin: bool = False) -> dict | None:
     fields = dict(source_tag=app["prev_tag"], source_key=app["prev_key"], version=app["prev_version"],
                   update_pending=0, prev_tag=None, prev_key=None, prev_version=None, release_notes=None,
                   next_attempt_at=None, bad_tag=None if pin else app["source_tag"],
-                  bad_key=None if pin else app["source_key"])
+                  bad_key=None if pin else app["source_key"],
+                  # la version écartée reste proposée (« Installer maintenant » la retente même refusée)
+                  avail_tag=app["source_tag"], avail_notes=app.get("release_notes"))
     if pin:
-        fields.update(auto_update=0, avail_tag=app["source_tag"], avail_notes=app.get("release_notes"))
+        fields.update(auto_update=0)
     db.update("apps", app_id, **fields)
     _UPDATE_FAILS.pop(app_id, None)
     return app

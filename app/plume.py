@@ -11,7 +11,7 @@ from pathlib import Path
 from . import db, settings
 from .config import IMPORT_PLUME, LOGIN_TIMEOUT, PLUME_HOME, PLUME_LOCK_TIMEOUT, PLUMESIGN
 from .proc import Result, Session, register, run, spawn
-from .util import replace_retry
+from .util import ContentError, is_content_error, replace_retry
 
 # accounts.json est partagé : une seule opération plumesign à la fois.
 LOCK = asyncio.Lock()
@@ -204,15 +204,18 @@ class Transient(RuntimeError):
     """Anisette, réseau ou Apple momentanément indisponibles : nouvel essai rapproché."""
 
 
-def _failure(email: str, what: str, res: Result) -> RuntimeError:
+def _failure(email: str, what: str, res: Result, content: bool = False) -> RuntimeError:
     """Erreur d'une commande plumesign du compte, classée : session expirée (bouton Reconnecter),
-    passagère (anisette, réseau), ou autre."""
+    passagère (anisette, réseau), ou autre. content : l'IPA signée est en cause (ContentError) quand la
+    sortie le dit ; une limite du compte Apple reste une erreur ordinaire."""
     if session_expired(res.output):
         _set_status(email, False, "session expirée, reconnexion nécessaire")
         return SessionExpired(f"session Apple de {email} expirée : reconnecte-le (bouton Reconnecter) "
                               f"[{what} : {res.tail(2)}]")
     if re.search(r"anisette|panicked", res.output, re.I) or _TRANSIENT.search(res.output) or res.code == -1:
         return Transient(f"{what} : {_why(res)} (passager, nouvel essai automatique)")
+    if content and is_content_error(res.output):
+        return ContentError(f"{what} : {res.tail()}")
     return RuntimeError(f"{what} : {res.tail()}")
 
 
@@ -350,7 +353,7 @@ async def sign(email: str, ipa: Path, out: Path) -> bool:
             e["RUST_LOG"] = "warn"
             res = await run(PLUMESIGN, "sign", "-p", ipa, "--apple-id", "-o", tmp, env=e, timeout=600)
         if not res.ok or not tmp.exists():
-            raise _failure(email, "signature", res)
+            raise _failure(email, "signature", res, content=True)
         replace_retry(tmp, out)
     finally:
         tmp.unlink(missing_ok=True)
