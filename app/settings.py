@@ -160,6 +160,16 @@ def update(values: dict) -> dict:
             todo[key] = _convert(spec, raw)
         except ValueError as e:
             errors[key] = str(e)
+    if not errors and ("renew_window_start" in values or "renew_window_end" in values):
+        # une seule borne de la plage horaire serait ignorée sans le dire (renouvellements à toute heure)
+        pair = {}
+        for key in ("renew_window_start", "renew_window_end"):
+            if key in todo:
+                pair[key] = todo[key] or ""
+            else:
+                pair[key] = str(get(key) or "")
+        if bool(pair["renew_window_start"]) != bool(pair["renew_window_end"]):
+            errors["renew_window_end" if "renew_window_end" in values else "renew_window_start"] = "window_incomplete"
     if errors:
         raise ValueError(errors)
     for key, value in todo.items():
@@ -204,3 +214,18 @@ def in_renew_window(now: float, window: tuple[int, int] | None = None, tz_hour: 
     if start == end:
         return True
     return start <= hour < end if start < end else hour >= start or hour < end
+
+
+def next_window_start(ts: float, window: tuple[int, int] | None = None) -> float:
+    """Premier instant >= ts où un renouvellement non urgent est permis : ts lui-même dans la plage, sinon
+    le prochain début de plage (heure locale pleine)."""
+    window = window if window is not None else renew_window()
+    if in_renew_window(ts, window):
+        return ts
+    lt = time.localtime(ts)
+    t = ts - lt.tm_min * 60 - lt.tm_sec        # début de l'heure locale en cours
+    for _ in range(50):                        # au plus un jour et demi (changements d'heure compris)
+        t += 3600
+        if in_renew_window(t, window):
+            return t
+    return ts

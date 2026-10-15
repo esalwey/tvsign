@@ -1380,5 +1380,203 @@ class Interface(unittest.TestCase):
                 self.assertIn(f'name="{key}"', self.HTML, key)
 
 
+
+# ---------- corrections de la revue ----------
+
+class ReviewFixes(Base):
+    @classmethod
+    def setUpClass(cls):
+        cls.ctx = TestClient(main.app)
+        cls.client = cls.ctx.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.ctx.__exit__(None, None, None)
+
+    # -- alerte « expiré » pendant le démarrage d'une re-signature
+    def test_no_expiry_alert_for_an_app_whose_renewal_is_starting(self):
+        self.add_app("Revoked", expires_at=NOW - 1, notified_level=None)
+        sent = []
+
+        async def notify(msg, priority="default"):
+            sent.append(msg)
+            return True
+
+        async def fake(i, trigger):
+            await asyncio.sleep(0.2)
+            db.update("apps", i, expires_at=NOW + 7 * 86400, status="ok")
+
+        async def go():
+            with mock.patch.object(renew, "_renew", fake), mock.patch.object(renew, "notify", notify):
+                await renew.tick(NOW, NOW, NOW)
+                await asyncio.sleep(0.4)
+        asyncio.run(go())
+        self.assertEqual(sent, [])
+        self.assertEqual([e for e in db.rows("SELECT * FROM events WHERE level = 'error'")
+                          if "expiré" in e["message"]], [])
+
+    # -- compte déconnecté entre-temps
+    def test_account_removed_between_lookup_and_listing_needs_action(self):
+        self.set_accounts("a@x.com")
+        with mock.patch.object(plume, "find_account", lambda e: "a@x.com"), \
+                mock.patch.object(plume, "accounts", lambda: []):
+            with self.assertRaises(renew.NeedsAction) as cm:
+                asyncio.run(renew._usable_account({"account_email": "a@x.com"}))
+        self.assertEqual(cm.exception.kind, "session")
+
+    # -- journal de reprise d'un compte
+    def test_recovery_found_by_the_periodic_check_is_journaled(self):
+        self.set_accounts("a@x.com")
+        renew._ACC_ALERTED.add("a@x.com")
+
+        async def check(email):
+            renew._account_valid(email)         # ce que fait plume._valid() en cas de succès
+            return True
+
+        async def certs(email):
+            return None
+        with mock.patch.object(plume, "check_account", check), mock.patch.object(renew, "_check_certificates", certs):
+            asyncio.run(renew._check_accounts())
+        self.assertTrue(any("de nouveau valide" in e["message"] for e in db.rows("SELECT * FROM events")))
+        self.assertNotIn("a@x.com", renew._ACC_ALERTED)
+
+    # -- plage horaire visible de l'interface
+    def test_next_window_start(self):
+        w = (2, 6)
+        self.assertEqual(settings.next_window_start(local_ts(3), w), local_ts(3))
+        got = settings.next_window_start(local_ts(14), w)
+        self.assertEqual(time.localtime(got).tm_hour, 2)
+        self.assertEqual((time.localtime(got).tm_min, time.localtime(got).tm_sec), (0, 0))
+        self.assertGreater(got, local_ts(14))
+        self.assertLess(got - local_ts(14), 13 * 3600)
+        self.assertEqual(settings.next_window_start(local_ts(14), None), local_ts(14))
+        got = settings.next_window_start(local_ts(12), (23, 5))        # plage passant minuit
+        self.assertEqual(time.localtime(got).tm_hour, 23)
+
+    def test_window_view_reports_the_real_renewal_time(self):
+        settings.raw_set("renew_window_start", "2")
+        settings.raw_set("renew_window_end", "6")
+        now = local_ts(14)
+        app_id = self.add_app("W", expires_at=now + 50 * 3600)         # renouvellement dû depuis 10 h
+        v = renew.window_view(self.app(app_id), now, 60.0)
+        self.assertTrue(v["window_wait"])
+        self.assertGreater(v["renew_at"], now)
+        self.assertEqual(v["renew_at"], v["window_at"])
+        self.assertEqual(time.localtime(v["window_at"]).tm_hour, 2)
+        # dans la plage : rien n'attend
+        inside = local_ts(3)
+        v = renew.window_view({**self.app(app_id), "expires_at": inside + 50 * 3600}, inside, 60.0)
+        self.assertFalse(v["window_wait"])
+        self.assertLess(v["renew_at"], inside)
+        # urgent (moins de 24 h) : la plage ne compte plus
+        v = renew.window_view({**self.app(app_id), "expires_at": now + 10 * 3600}, now, 60.0)
+        self.assertFalse(v["window_wait"])
+        # pas encore dû : le repère de renouvellement tombe à l'ouverture de la plage suivante
+        v = renew.window_view({**self.app(app_id), "expires_at": now + 80 * 3600}, now, 60.0)
+        self.assertFalse(v["window_wait"])
+        self.assertGreaterEqual(v["renew_at"], now + 20 * 3600)
+        self.assertTrue(settings.in_renew_window(v["renew_at"]))
+        # sans plage : comportement d'origine
+        settings.raw_set("renew_window_start", None)
+        settings.raw_set("renew_window_end", None)
+        v = renew.window_view({**self.app(app_id), "expires_at": now + 50 * 3600}, now, 60.0)
+        self.assertEqual((v["window_wait"], v["renew_at"]), (False, now + 50 * 3600 - 60 * 3600))
+
+    def test_failed_app_outside_the_window_waits_for_it(self):
+        settings.raw_set("renew_window_start", "2")
+        settings.raw_set("renew_window_end", "6")
+        now = local_ts(14)
+        app_id = self.add_app("F", expires_at=now + 100 * 3600, status="error", next_attempt_at=now + 600)
+        v = renew.window_view(self.app(app_id), now, 60.0)
+        self.assertTrue(v["window_wait"])
+        self.assertEqual(time.localtime(v["window_at"]).tm_hour, 2)
+
+    def test_state_exposes_window_wait(self):
+        lt = time.localtime()
+        settings.raw_set("renew_window_start", str((lt.tm_hour + 2) % 24))
+        settings.raw_set("renew_window_end", str((lt.tm_hour + 3) % 24))
+        now = time.time()
+        self.add_app("S", expires_at=now + 50 * 3600)
+        a = main.state()["apps"][0]
+        self.assertTrue(a["window_wait"])
+        self.assertGreater(a["renew_at"], now)
+        self.assertEqual(a["renew_at"], a["window_at"])
+
+    # -- une seule borne de la plage
+    def test_half_a_window_is_refused(self):
+        with self.assertRaises(ValueError) as cm:
+            settings.update({"renew_window_start": "2", "renew_window_end": ""})
+        self.assertEqual(set(cm.exception.args[0].values()), {"window_incomplete"})
+        self.assertIsNone(settings.raw_get("renew_window_start"))
+        with self.assertRaises(ValueError):
+            settings.update({"renew_window_end": "6"})
+        settings.update({"renew_window_start": "2", "renew_window_end": "6"})
+        self.assertEqual(settings.renew_window(), (2, 6))
+        with self.assertRaises(ValueError):
+            settings.update({"renew_window_end": ""})          # retirer une borne seulement
+        settings.update({"renew_window_start": "", "renew_window_end": ""})
+        self.assertIsNone(settings.renew_window())
+        # sans toucher à la plage, un autre réglage passe toujours
+        settings.raw_set("renew_window_start", "2")
+        settings.update({"renew_before_hours": 48})
+        settings.update({"renew_before_hours": None})
+
+    def test_window_incomplete_over_the_api(self):
+        r = self.client.patch("/api/settings", headers=HEADERS, json={"renew_window_start": "3"})
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("window_incomplete", json.dumps(r.json()))
+
+    # -- restauration : sessions déconnectées conservées
+    def test_restore_keeps_revoked_sessions(self):
+        cookie = auth.make_cookie()
+        sid = auth.read_cookie(cookie)["sid"]
+        auth.revoke(sid)
+        self.assertIsNone(auth.read_cookie(cookie))
+        archive = self.client.get("/api/backup/export")
+        self.assertEqual(archive.status_code, 200)
+        r = self.client.post("/api/backup/import", headers=HEADERS,
+                             files={"file": ("b.tvsign-backup", archive.content, "application/zip")})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIsNone(auth.read_cookie(cookie), "la session déconnectée reste révoquée après restauration")
+        self.assertTrue(db.row("SELECT 1 FROM revoked_sessions WHERE sid = ?", sid))
+
+    # -- cookie d'avant les sessions individuelles
+    def test_sign_out_revokes_a_cookie_without_session_id(self):
+        import base64
+
+        def legacy(salt):
+            payload = base64.urlsafe_b64encode(json.dumps(
+                {"v": auth._version(), "iat": int(time.time()) - salt}).encode()).decode().rstrip("=")
+            return f"{payload}.{auth._sign(payload.encode())}"
+        mine, other = legacy(1), legacy(2)
+        self.assertIsNotNone(auth.read_cookie(mine))
+        self.client.cookies.set(auth.COOKIE, mine)
+        try:
+            r = self.client.post("/api/auth/logout", headers=HEADERS)
+        finally:
+            self.client.cookies.clear()
+        self.assertEqual(r.status_code, 200)
+        self.assertIsNone(auth.read_cookie(mine), "un cookie copié ne vaut plus rien")
+        self.assertIsNotNone(auth.read_cookie(other), "les autres sessions restent ouvertes")
+
+    # -- interface et déploiement
+    def test_new_interface_strings_and_hooks(self):
+        i18n = (ROOT / "web" / "i18n.js").read_text(encoding="utf-8")
+        js = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+        for key in ("err_window_incomplete", "st_window", "retry_window", "set_lbl_renew_window_start",
+                    "set_lbl_renew_window_end"):
+            self.assertRegex(i18n, rf'(?m)^\s+{key}: \["[^"]+",\s*"[^"]+"\]', key)
+        self.assertIn("window_wait", js)
+        self.assertIn("libelleReglage", js)
+        self.assertIn('$("#backup-export").addEventListener("click"', js)
+
+    def test_anisette_service_uses_a_named_volume_and_a_pinned_image(self):
+        compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        self.assertNotIn("./anisette-data", compose)
+        self.assertRegex(compose, r"(?m)^volumes:\s*\n\s+anisette_data:")
+        self.assertNotIn("anisette-v3-server:latest", compose)
+        self.assertRegex(compose, r"anisette-v3-server:[\w.-]+@sha256:[0-9a-f]{64}")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -42,6 +42,11 @@ function apiError(detail, status) {
   return status >= 500 ? t("err_server") : status === 404 ? t("err_not_found") : status === 422 ? t("err_invalid") : t("err_status", { n: status });
 }
 
+// Réglage (clé de l'API) -> libellé du champ affiché, pour qu'une erreur de validation parle comme le formulaire.
+const LIBELLE_REGLAGE = { language: "language", renew_before_hours: "renew_before", anisette_url: "anisette_server",
+  renew_window_start: "set_lbl_renew_window_start", renew_window_end: "set_lbl_renew_window_end" };
+const libelleReglage = (k) => (k === "ntfy_url" ? "ntfy" : LIBELLE_REGLAGE[k] ? t(LIBELLE_REGLAGE[k]) : k);
+
 async function api(path, opts = {}) {
   const { json, quiet, ...init } = opts;
   init.headers = { "X-Tvsign": "1", ...(init.headers || {}) };
@@ -55,7 +60,7 @@ async function api(path, opts = {}) {
   if (!r.ok) {
     const detail = typeof data.detail === "string" ? data.detail
       : Array.isArray(data.detail) ? data.detail.map((d) => d?.msg || "").filter(Boolean).join(", ")
-      : data.detail && typeof data.detail === "object" ? Object.entries(data.detail).map(([k, v]) => `${k} : ${apiError(v)}`).join(", ")
+      : data.detail && typeof data.detail === "object" ? Object.entries(data.detail).map(([k, v]) => `${libelleReglage(k)} : ${apiError(v)}`).join(", ")
       : "";
     const e = new Error(apiError(detail, r.status));
     e.status = r.status; e.code = detail;
@@ -208,7 +213,11 @@ function etatApp(a, now, s) {
   if (a.status === "error" && a.needs_action) return ["err", t("st_action")];
   if (a.status === "error") return ["err", exp && exp - now < 24 * 3600 ? t("st_failed_soon") : t("st_failed")];
   if (!exp) return ["warn", t("st_to_install")];
-  if (exp - now < fenetre) return ["warn", t("st_to_renew")];
+  if (exp - now < fenetre) {
+    // le moment est passé mais la plage horaire choisie n'est pas ouverte : rien n'est en retard
+    if (a.window_wait && s.renew_window) return ["neutre", t("st_window", { h: s.renew_window[0] })];
+    return ["warn", t("st_to_renew")];
+  }
   return ["ok", t("st_valid")];
 }
 const COULEUR = { ok: "green", warn: "orange", err: "red", cours: "blue", neutre: "gray" };
@@ -264,6 +273,7 @@ function problemeApp(a, now) {
   const retry = !a.enabled ? t("retry_paused")
     : a.running ? ""
     : a.needs_action ? (a.next_attempt_at && a.next_attempt_at > now ? t("retry_blocked", { when: relatif(a.next_attempt_at, now) }) : "")
+    : a.window_wait && a.window_at ? t("retry_window", { when: relatif(a.window_at, now) })
     : a.next_attempt_at && a.next_attempt_at > now
       ? ((a.fail_count || 0) > 1 ? t("retry_at_n", { when: relatif(a.next_attempt_at, now), n: a.fail_count }) : t("retry_at", { when: relatif(a.next_attempt_at, now) }))
     : a.device_id ? t("retry_next_pass") : "";
@@ -1298,6 +1308,29 @@ $("#vue-settings").addEventListener("click", async (e) => {
   } catch (ex) { if (err) err.textContent = ex.message; else flash("err", t("action_failed"), " " + ex.message); }
 });
 $("#backup-uploads").onchange = (e) => ($("#backup-export").href = "/api/backup/export" + (e.target.checked ? "?uploads=true" : ""));
+// L'export passe par fetch : un « occupé » (connexion Apple ou appairage en cours) s'affiche au lieu d'un
+// téléchargement raté ou d'un fichier contenant {"detail":"busy"}.
+$("#backup-export").addEventListener("click", async (e) => {
+  e.preventDefault();
+  const lien = e.currentTarget, err = $("#reglages-error");
+  if (lien.getAttribute("aria-busy")) return;
+  lien.setAttribute("aria-busy", "true");
+  err.textContent = "";
+  try {
+    const r = await fetch(lien.getAttribute("href"), { credentials: "same-origin", headers: { "X-Tvsign": "1" } });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      throw new Error(apiError(typeof d.detail === "string" ? d.detail : "", r.status));
+    }
+    const nom = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(r.headers.get("content-disposition") || "")?.[1];
+    const url = URL.createObjectURL(await r.blob());
+    const a = document.createElement("a");
+    a.href = url; a.download = nom ? decodeURIComponent(nom) : "tvsign.tvsign-backup";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  } catch (ex) { err.textContent = ex.message; }
+  finally { lien.removeAttribute("aria-busy"); }
+});
 $("#backup-file").onchange = async (e) => {
   const f = e.target.files[0];
   e.target.value = "";

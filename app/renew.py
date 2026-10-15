@@ -420,7 +420,10 @@ async def _usable_account(app: dict) -> str:
         raise NeedsAction(f"compte Apple {email} déconnecté : reconnecte-le "
                           "(en choisir un autre installerait une 2e copie de l'app)", "session")
     email = known
-    acc = next(a for a in plume.accounts() if a["email"] == email)
+    acc = next((a for a in plume.accounts() if a["email"] == email), None)
+    if acc is None:      # déconnecté entre-temps (DELETE /api/accounts)
+        raise NeedsAction(f"compte Apple {email} déconnecté : reconnecte-le "
+                          "(en choisir un autre installerait une 2e copie de l'app)", "session")
     if acc["ok"] == 0:
         # Session jugée expirée. Récemment, inutile de solliciter Apple ; sinon on revérifie une fois : un
         # faux « expirée » (réponse passagère mal classée) ne doit pas bloquer les renouvellements
@@ -588,6 +591,28 @@ def due(app: dict, now: float) -> bool:
     return app["expires_at"] - now < settings.renew_before_hours() * 3600
 
 
+def window_view(app: dict, now: float, before_hours: float) -> dict:
+    """Ce que la plage horaire change pour l'interface : `renew_at` réel (jamais avant le prochain début de
+    plage pour un renouvellement non urgent), `window_wait` (le renouvellement ou le nouvel essai attend la
+    plage) et `window_at` (quand elle s'ouvre). Sans plage, ou pour une app urgente, rien ne change."""
+    exp = app["expires_at"]
+    base = exp - before_hours * 3600 if exp else None
+    out = {"renew_at": base, "window_wait": False, "window_at": None}
+    if not exp or not app["enabled"] or urgent(app, now) or settings.renew_window() is None:
+        return out
+    limit = exp - 24 * 3600                 # au-delà, la plage ne s'applique plus
+    start = settings.next_window_start(max(base, now))
+    if start > max(base, now) and base < limit:
+        out["renew_at"] = min(start, limit)
+    if app["id"] not in _RUNNING and not settings.in_renew_window(now) and (
+            base <= now or app["status"] in ("error", "pending")):
+        t0 = max(now, base, app["next_attempt_at"] or 0)
+        out["window_wait"] = True
+        out["window_at"] = min(settings.next_window_start(t0), max(limit, t0))
+        out["renew_at"] = max(out["renew_at"], out["window_at"]) if base <= now else out["renew_at"]
+    return out
+
+
 def idle(app: dict, now: float) -> bool:
     """Ni en cours, ni en attente d'un nouvel essai après échec."""
     return bool(app["enabled"]) and app["id"] not in _RUNNING and not (
@@ -718,6 +743,7 @@ async def _check_certificates(email: str) -> None:
 async def _check_accounts() -> None:
     for acc in plume.accounts():
         email = acc["email"]
+        was_alerted = email in _ACC_ALERTED          # _account_valid() le réarme pendant check_account()
         ok = await plume.check_account(email)       # ne lève pas : None si indéterminé
         if ok is False:
             if email not in _ACC_ALERTED:
@@ -725,15 +751,17 @@ async def _check_accounts() -> None:
                 db.log(f"Compte Apple {email} déconnecté : reconnexion nécessaire", "error")
                 await notify(f"Compte Apple {email} déconnecté : reconnecte-le dans tvsign", "high")
         elif ok:
-            if email in _ACC_ALERTED:
+            if was_alerted:
                 _ACC_ALERTED.discard(email)
                 db.log(f"Compte Apple {email} de nouveau valide")
             await _check_certificates(email)
 
 
-async def _check_expired(now: float) -> None:
-    """Signale une expiration même si aucun essai n'est en cours."""
+async def _check_expired(now: float, skip: set | frozenset = frozenset()) -> None:
+    """Signale une expiration même si aucun essai n'est en cours. `skip` : apps dont le renouvellement
+    démarre à l'instant (leur échec alertera lui-même, une réussite ne doit rien signaler)."""
     expired = db.rows("SELECT * FROM apps WHERE enabled = 1 AND expires_at > 0 AND expires_at < ?", now)
+    expired = [a for a in expired if a["id"] not in skip]
     _EXPIRED_LOGGED.intersection_update(a["id"] for a in expired)   # renouvelée depuis : épisode terminé
     for app in expired:
         if app["notified_level"] != "expired":
@@ -850,11 +878,15 @@ async def tick(now: float, last_account_check: float, last_release_check: float)
     if RELEASE_CHECK_MINUTES > 0 and now - last_release_check > RELEASE_CHECK_MINUTES * 60:
         if _background("releases", _release_pass):
             last_release_check = now
+    launched = set()
     for app in by_urgency([a for a in db.rows("SELECT * FROM apps") if due(a, now)], now):
         if STOPPING:
             break
-        spawn(app["id"], "auto")
-    await _guarded("alertes d'expiration", _check_expired(time.time()))
+        if spawn(app["id"], "auto"):
+            launched.add(app["id"])
+    # Les tâches lancées ci-dessus n'ont pas encore démarré (_RUNNING est vide pour elles) : sans cette
+    # exclusion, une app expirée dont la re-signature démarre recevrait une alerte « EXPIRÉ » à tort.
+    await _guarded("alertes d'expiration", _check_expired(time.time(), launched | set(_RUNNING)))
     return last_account_check, last_release_check
 
 

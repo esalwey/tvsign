@@ -514,7 +514,7 @@ const I18N = {
   loop_restarted: ["relancée {n} fois", "restarted {n} times"],
   renew_window_from: ["Renouveler seulement de", "Renew only from"],
   renew_window_to: ["jusqu'à", "until"],
-  renew_window_note: ["Les renouvellements non urgents n'ont lieu que dans cette plage (heure locale ; vide : à toute heure). Ignorée quand il reste moins de 24 h, et pour un renouvellement lancé à la main.", "Non-urgent renewals only happen within this range (local time; empty: any time). Ignored when less than 24 h remain, and for a manual renewal."],
+  renew_window_note: ["Les renouvellements non urgents n'ont lieu que dans cette plage (heure locale ; vide : à toute heure). Ignorée quand il reste moins de 24 h, et pour un renouvellement lancé à la main. Début = fin : toute la journée.", "Non-urgent renewals only happen within this range (local time; empty: any time). Ignored when less than 24 h remain, and for a manual renewal. Start = end: all day."],
   diag_password_file: ["Mot de passe prédéfini", "Preset password"],
   diag_password_file_fix: ["TVSIGN_PASSWORD_FILE est défini mais inutilisable : le mot de passe prévu n'est PAS appliqué. Rends le fichier lisible par l'utilisateur de tvsign (PUID/PGID) ou corrige le chemin, puis redémarre.", "TVSIGN_PASSWORD_FILE is set but unusable: the intended password is NOT applied. Make the file readable by the tvsign user (PUID/PGID) or fix the path, then restart."],
   err_session_expired: ["Session expirée.", "Session expired."],
@@ -528,8 +528,13 @@ const I18N = {
   err_language_expected: ["Langue : auto, en ou fr.", "Language: auto, en or fr."],
   err_hour_expected: ["Heure attendue, de 0 à 23.", "An hour from 0 to 23 is expected."],
   err_unknown_setting: ["Réglage inconnu.", "Unknown setting."],
+  err_window_incomplete: ["Indique l'heure de début et de fin, ou laisse les deux vides.", "Enter both a start and an end hour, or leave both empty."],
   err_set_by_env: ["Défini par {n}.", "Set by {n}."],
   err_credentials_required: ["Indique l'identifiant Apple et le mot de passe.", "Enter the Apple ID and password."],
+  st_window: ["En attente de la plage horaire (dès {h} h)", "Waiting for the time window (from {h} h)"],
+  retry_window: ["Nouvel essai automatique dans la plage horaire choisie, {when}.", "Automatic retry within the chosen time window, {when}."],
+  set_lbl_renew_window_start: ["Plage horaire (début)", "Time window (start)"],
+  set_lbl_renew_window_end: ["Plage horaire (fin)", "Time window (end)"],
 };
 
 let LANG = "en";

@@ -187,7 +187,10 @@ server can be reached with `https://user:password@host/topic` (sent as Basic aut
   until the new one is installed.
 - **Renewal time window** (Settings): restrict non-urgent renewals and updates to certain hours,
   e.g. 02:00 to 06:00 (`TVSIGN_RENEW_WINDOW_START` / `TVSIGN_RENEW_WINDOW_END`, local time).
-  It never applies in the last 24 hours before expiry, nor to a manual renewal.
+  It never applies in the last 24 hours before expiry, nor to a manual renewal. Enter both a start and
+  an end hour (or neither); start = end means all day. While an app waits for the window, its card
+  says "Waiting for the time window (from N h)" and shows when the window opens instead of a
+  retry delay; it is not counted as late.
 - Loop and limits for tuning: `TVSIGN_CHECK_INTERVAL` (600 s, at least 30), `TVSIGN_RETRY_MINUTES`
   (45, at least 5), `TVSIGN_ACCOUNT_CHECK_HOURS` (6, at least 1). An unreadable or out-of-range value
   is replaced by the default (or clamped) with a warning in the log.
@@ -207,7 +210,9 @@ App IDs. Free a slot (**Pause** an app, or remove it from the Apple TV) then pre
 if the first server is down, the next one takes over and is tried first from then on. Diagnostics
 lists each server with its response time. To run your own, `docker compose --profile anisette up -d`
 starts a local anisette-v3 server (`dadoum/anisette-v3-server`) on `127.0.0.1:6969`; put
-`http://127.0.0.1:6969` in the setting (host network: tvsign reaches it on loopback).
+`http://127.0.0.1:6969` in the setting (host network: tvsign reaches it on loopback). Its data lives
+in the `anisette_data` Docker volume and the image is pinned to a tag and digest. If the server does
+not answer, check `docker compose logs anisette`.
 
 ### Forgot the admin password
 
@@ -223,7 +228,7 @@ Settings › Security changes the password without asking for the old one.) If t
 `TVSIGN_PASSWORD_FILE` that cannot be read (wrong path, a root-only secret while tvsign runs as
 `PUID`) is reported in the log and in Diagnostics: the preset password is **not** applied then.
 
-Sign out only ends the session of the browser you click it in (a copied cookie stops working);
+Sign out only ends the session of the browser you click it in (a copied cookie stops working, including one issued before this version);
 **Sign out everywhere** also ends all the others. Backups no longer contain the admin password hash.
 
 ### Pairing identity
@@ -422,7 +427,10 @@ serveur protégé s'utilise avec `https://utilisateur:motdepasse@hôte/sujet` (e
 - **Plage horaire des renouvellements** (Réglages) : limite les renouvellements et mises à jour non
   urgents à certaines heures, par exemple de 2 h à 6 h (`TVSIGN_RENEW_WINDOW_START` /
   `TVSIGN_RENEW_WINDOW_END`, heure locale). Elle ne s'applique jamais dans les 24 dernières heures
-  avant l'expiration, ni à un renouvellement manuel.
+  avant l'expiration, ni à un renouvellement manuel. Indiquer l'heure de début et l'heure de fin (ou
+  aucune des deux) ; début = fin signifie toute la journée. Tant qu'une app attend la plage, sa carte
+  affiche « En attente de la plage horaire (dès N h) » et l'ouverture de la plage au lieu d'un délai
+  de nouvel essai ; elle n'est pas comptée en retard.
 - Réglages de la boucle : `TVSIGN_CHECK_INTERVAL` (600 s, au moins 30), `TVSIGN_RETRY_MINUTES` (45,
   au moins 5), `TVSIGN_ACCOUNT_CHECK_HOURS` (6, au moins 1). Une valeur illisible ou hors limites est
   remplacée par le défaut (ou ramenée à la limite) avec un avertissement dans le journal.
@@ -444,7 +452,9 @@ des espaces : si le premier serveur tombe, le suivant prend le relais et passe e
 diagnostic liste chaque serveur avec son temps de réponse. Pour héberger le vôtre,
 `docker compose --profile anisette up -d` lance un serveur anisette-v3 local
 (`dadoum/anisette-v3-server`) sur `127.0.0.1:6969` ; indiquer `http://127.0.0.1:6969` dans le réglage
-(réseau hôte : tvsign l'atteint en boucle locale).
+(réseau hôte : tvsign l'atteint en boucle locale). Ses données vivent dans le volume Docker
+`anisette_data` et l'image est figée sur un tag et un digest. Si le serveur ne répond pas, consulter
+`docker compose logs anisette`.
 
 ### Mot de passe administrateur oublié
 
@@ -462,7 +472,7 @@ en `PUID`) est signalé dans le journal et dans le diagnostic : le mot de passe 
 **pas** appliqué.
 
 « Se déconnecter » ne ferme que la session du navigateur utilisé (un cookie copié cesse de
-fonctionner) ; **Se déconnecter partout** ferme aussi toutes les autres. Les sauvegardes ne
+fonctionner, y compris s'il date d'avant cette version) ; **Se déconnecter partout** ferme aussi toutes les autres. Les sauvegardes ne
 contiennent plus l'empreinte du mot de passe administrateur.
 
 ### Identité d'appairage

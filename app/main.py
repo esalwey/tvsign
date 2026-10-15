@@ -330,8 +330,9 @@ def state():
         a["phase"] = renew.PHASE.get(a["id"]) if a["running"] else None
         exp = a["expires_at"]
         a["expired"] = bool(exp) and exp <= now
-        # moment où la boucle lancera le renouvellement automatique (None : dès que possible)
-        a["renew_at"] = exp - before * 3600 if exp else None
+        # moment où la boucle lancera le renouvellement automatique, plage horaire comprise ;
+        # window_wait : il attend l'ouverture de la plage (window_at)
+        a.update(renew.window_view(a, now, before))
         a["effective_account"] = a["account_email"] or default
     health = renew.health(now)
     devices_ = db.rows("SELECT * FROM devices ORDER BY name")
