@@ -5,7 +5,7 @@ mod certificate;
 mod macho;
 mod provision;
 
-pub use certificate::CertificateIdentity;
+pub use certificate::{CertificateIdentity, CertificatePolicy, RevokeMode};
 #[cfg(feature = "tweaks")]
 pub use macho::{MachO, MachOExt};
 pub use provision::MobileProvision;

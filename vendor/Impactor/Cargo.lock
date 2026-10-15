@@ -5675,6 +5675,7 @@ dependencies = [
  "rustls",
  "serde_json",
  "tokio",
+ "uuid",
  "zip",
 ]
 
