@@ -414,8 +414,15 @@ class Desktop:
                         self.icon.update_menu()
                 state = self.api("GET", "/api/state")
                 snapshot = {}
+                now = state.get("now") or time.time()
                 for a in state.get("apps", []):
-                    snapshot[f"app:{a['id']}"] = ("expired" if a.get("expired") else a.get("status"), a["name"])
+                    status = "expired" if a.get("expired") else a.get("status")
+                    exp = a.get("expires_at")
+                    if status == "error" and a.get("error_kind") == "transient" and exp and exp - now > 24 * 3600:
+                        # panne banale (Apple TV en veille, app ouverte, anisette) loin de l'expiration :
+                        # même règle que les notifications du serveur, pas de toast avant le niveau 24 h
+                        status = "error-quiet"
+                    snapshot[f"app:{a['id']}"] = (status, a["name"])
                 for acc in state.get("accounts", []):
                     snapshot[f"acc:{acc['email']}"] = ("lost" if acc.get("ok") == 0 else "ok", acc["email"])
                 if known is not None:

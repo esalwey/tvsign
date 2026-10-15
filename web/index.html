@@ -103,6 +103,7 @@
           <label><input type="radio" name="journal-filtre" value="tout" checked><span data-i18n="all">All</span></label>
           <label><input type="radio" name="journal-filtre" value="erreurs"><span data-i18n="problems">Problems</span></label>
         </div>
+        <a class="lien" href="/api/log/export" download data-i18n="log_export">Download the log</a>
       </div>
       <div id="events"></div>
     </details>
@@ -131,14 +132,6 @@
       </section>
 
       <section class="group">
-        <h2 class="group__header" data-i18n="notifications">Notifications</h2>
-        <div class="list">
-          <label class="field"><span>ntfy</span><input name="ntfy_url" type="url" placeholder="https://ntfy.sh/…" autocomplete="off" spellcheck="false"></label>
-        </div>
-        <p class="group__footer"><span data-i18n="ntfy_note">Alerts when a renewal fails or an app is about to expire. Use a hard-to-guess topic.</span> <button class="lien lien--inline" type="button" id="ntfy-test" data-i18n="send_test">Send a test</button></p>
-      </section>
-
-      <section class="group">
         <h2 class="group__header" data-i18n="signing_service">Signing service</h2>
         <div class="list">
           <label class="field"><span data-i18n="anisette_server">Anisette server</span><input name="anisette_url" type="url" placeholder="https://ani.sidestore.app" autocomplete="off" spellcheck="false"></label>
@@ -148,6 +141,15 @@
       <p class="erreur" id="reglages-error" role="alert"></p>
       <div class="actions-form"><button class="btn btn--primary" id="reglages-submit" data-i18n="save">Save</button></div>
     </form>
+
+    <section class="group" aria-labelledby="t-notif">
+      <div class="group__titre">
+        <h2 class="group__header" id="t-notif" data-i18n="notifications">Notifications</h2>
+        <button class="lien" type="button" id="notif-add" data-i18n="notif_add">Add a destination</button>
+      </div>
+      <div id="notif-liste"></div>
+      <p class="group__footer" data-i18n="notif_note">Alerts when a renewal fails or an app is about to expire. Each destination picks the events it receives. Secrets stay on this server and are never shown again.</p>
+    </section>
 
     <section class="group" aria-labelledby="t-securite">
       <h2 class="group__header" id="t-securite" data-i18n="security">Security</h2>
@@ -200,6 +202,27 @@
       <button class="btn" id="diag-relancer" data-i18n="run_again">Run again</button>
     </div>
     <div id="diag"></div>
+    <section class="group espace-haut" aria-labelledby="t-support">
+      <h2 class="group__header" id="t-support" data-i18n="support">Support</h2>
+      <div class="list">
+        <div class="row">
+          <div class="row__label">
+            <p class="row__title" data-i18n="support_copy">Copy support info</p>
+            <p class="row__sub" data-i18n="support_copy_sub">Version, checks and the last events as text, to paste into a bug report. E-mail addresses, IP addresses and device identifiers are masked.</p>
+          </div>
+          <div class="row__buttons"><button class="row__action row__action--go" type="button" id="support-copy" data-i18n="copy">Copy</button></div>
+        </div>
+        <div class="row">
+          <div class="row__label">
+            <p class="row__title" data-i18n="support_bundle">Support bundle</p>
+            <p class="row__sub" data-i18n="support_bundle_sub">A zip with the diagnostics, apps, journal, renewal history and plumesign output, secrets masked. It contains no database, Apple session or key.</p>
+          </div>
+          <div class="row__buttons"><a class="row__action" href="/api/support-bundle" download data-i18n="download">Download</a></div>
+        </div>
+      </div>
+      <div id="support-text" aria-live="polite"></div>
+      <p class="group__footer"><span data-i18n="support_report">Found a bug? Open an issue and attach the bundle:</span> <a class="lien lien--inline" href="https://github.com/esalwey/tvsign/issues" target="_blank" rel="noopener noreferrer">github.com/esalwey/tvsign/issues</a></p>
+    </section>
   </main>
 
   <!-- Feuille : ajout d'app -->
@@ -282,7 +305,36 @@
             <label class="field"><span data-i18n="address">Address</span><input name="source_url" type="url" autocomplete="off" spellcheck="false"></label>
           </div>
         </div>
+        <div id="edit-updates">
+          <p class="group__header espace" data-i18n="upd_title">Updates</p>
+          <label class="case"><input type="checkbox" name="auto_update"> <span data-i18n="upd_auto">Install new versions automatically</span></label>
+          <p class="group__footer" data-i18n="upd_auto_note">Turned off, tvsign keeps renewing the installed version and only tells you when a new one is out; you install it yourself.</p>
+          <div id="edit-updates-info"></div>
+        </div>
         <p class="erreur" id="edit-error" role="alert"></p>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Feuille : destination de notification -->
+  <dialog class="sheet" id="dlg-notif" aria-labelledby="t-notif-dlg">
+    <form id="form-notif" method="dialog">
+      <header class="sheet__bar">
+        <button class="sheet__link" type="button" data-close data-i18n="cancel">Cancel</button>
+        <h2 id="t-notif-dlg" data-i18n="notif_destination">Destination</h2>
+        <button class="sheet__link sheet__link--done" id="notif-submit" value="ok" data-i18n="save">Save</button>
+      </header>
+      <div class="sheet__body">
+        <div class="list">
+          <label class="field"><span data-i18n="notif_type">Service</span><select name="type"></select></label>
+          <label class="field"><span data-i18n="notif_name">Name</span><input name="name" maxlength="40" autocomplete="off" data-i18n-placeholder="optional" placeholder="optional"></label>
+        </div>
+        <div class="list espace-haut" id="notif-champs"></div>
+        <p class="group__footer" id="notif-aide"></p>
+        <p class="group__header espace" data-i18n="notif_events">Events</p>
+        <div class="list" id="notif-events"></div>
+        <p class="erreur" id="notif-error" role="alert"></p>
+        <div class="actions-form"><button class="btn" type="button" id="notif-test" data-i18n="send_test">Send a test</button></div>
       </div>
     </form>
   </dialog>
@@ -317,6 +369,10 @@
           <label class="field"><span data-i18n="password">Password</span><input name="password" type="password" required autocomplete="current-password"></label>
         </div>
         <p class="group__footer" data-i18n="login_note">Preferably use a dedicated Apple ID. The password is not stored: only the session token is.</p>
+        <div id="login-ack-row">
+          <p class="group__footer" data-i18n="login_revoke">tvsign uses, and may revoke, the development certificate of this Apple ID. Apps signed with it by AltStore, SideStore, Sideloadly or Xcode (on an iPhone, for instance) will stop launching. Use an Apple ID that only tvsign uses.</p>
+          <label class="case"><input type="checkbox" name="ack"> <span data-i18n="login_ack">I understand, this Apple ID is not used by another sideloading tool</span></label>
+        </div>
         <div id="login-session" aria-live="polite"></div>
         <p class="erreur" id="login-error" role="alert"></p>
       </div>
@@ -327,5 +383,6 @@
 
   <script src="/static/i18n.js"></script>
   <script src="/static/app.js"></script>
+  <script src="/static/extras.js"></script>
 </body>
 </html>

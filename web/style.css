@@ -275,7 +275,7 @@ h3 { margin: 0; }
 .journal-bloc summary::-webkit-details-marker { display: none; }
 .journal-bloc summary::before { content: '›'; font-size: 16px; line-height: 1; transition: transform 150ms ease; }
 .journal-bloc[open] summary::before { transform: rotate(90deg); }
-.journal-outils { margin: 0 0 var(--sp-3); }
+.journal-outils { margin: 0 0 var(--sp-3); display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); flex-wrap: wrap; }
 .journal__jour { font-size: var(--t-foot); font-weight: 600; color: var(--label-2); margin: var(--sp-4) var(--sp-4) var(--sp-2); }
 .journal__jour::first-letter { text-transform: uppercase; }
 .journal { list-style: none; }

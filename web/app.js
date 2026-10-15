@@ -28,9 +28,10 @@ const ICONS = {
 // ---------- erreurs de l'API ----------
 // Codes stables renvoyés par le serveur (« code » ou « code:paramètre »).
 function apiError(detail, status) {
-  const [code, arg] = String(detail || "").split(":");
+  const [code, ...rest] = String(detail || "").split(":");
   const k = "err_" + code;
-  if (I18N[k]) return t(k, { n: arg });
+  // n : tout ce qui suit le code ; a, b : les deux premiers paramètres (needs_tvos:26.0:18.4)
+  if (I18N[k]) return t(k, { n: rest.join(":"), a: rest[0], b: rest[1] });
   if (detail) return String(detail);
   return status >= 500 ? t("err_server") : status === 404 ? t("err_not_found") : status === 422 ? t("err_invalid") : t("err_status", { n: status });
 }
@@ -48,7 +49,7 @@ async function api(path, opts = {}) {
   if (!r.ok) {
     const detail = typeof data.detail === "string" ? data.detail
       : Array.isArray(data.detail) ? data.detail.map((d) => d?.msg || "").filter(Boolean).join(", ")
-      : data.detail && typeof data.detail === "object" ? Object.entries(data.detail).map(([k, v]) => `${k} : ${v}`).join(", ")
+      : data.detail && typeof data.detail === "object" ? Object.entries(data.detail).map(([k, v]) => `${k} : ${apiError(v, r.status)}`).join(", ")
       : "";
     const e = new Error(apiError(detail, r.status));
     e.status = r.status; e.code = detail;
@@ -81,7 +82,9 @@ function relatif(ts, now) {
 // ---------- erreurs en clair ----------
 // Chaque cause connue (messages du serveur et de plumesign) : un titre lisible et ce que l'utilisateur peut faire.
 const CAUSES = [
-  [/ntfy/i, "c_ntfy"],
+  [/ntfy|notification .*échouée|notify_failed/i, "c_ntfy"],
+  [/aucune IPA trouvée/, "c_no_release"],
+  [/exige tvOS|needs_tvos/, "c_needs_tvos"],
   [/8220|no devices from which/i, "c_8220"],
   [/NO_TEAM|MULTIPLE_TEAMS/, "c_team"],
   [/ancienne version de tvsign/i, "c_legacy"],
@@ -115,6 +118,14 @@ function nettoyer(msg) {
     .replace(/https?:\/\/\S+/g, "")
     .replace(/^(\w[\w ]{0,20} : )?(Error: )?(Core error: )?/, "$1")
     .replace(/\s+/g, " ").trim();
+}
+// Message d'une erreur d'API : traduit si le serveur a envoyé un code connu, sinon texte brut passé par enClair
+// (messages français des sources : « aucune IPA trouvée… », « adresse locale refusée… »).
+function messageErreur(e) {
+  const code = String(e.code || "").split(":")[0];
+  if (I18N["err_" + code]) return e.message;
+  const c = enClair(e.code || e.message);
+  return c.connu ? `${c.titre}.${c.conseil ? " " + c.conseil : ""}` : e.message;
 }
 function enClair(msg) {
   const brut = String(msg || "");
@@ -260,7 +271,7 @@ function problemeApp(a, now) {
     ? `<button class="btn btn--petit" data-relogin="${esc(a.effective_account)}">${t("reconnect")}</button>`
     : e.cle === "c_no_account" ? `<button class="btn btn--petit" data-open="dlg-login" data-key="login-p-${a.id}">${t("connect")}</button>`
     : ["c_lost", "c_legacy"].includes(e.cle) ? `<button class="btn btn--petit" data-open="dlg-pair">${t("pair")}</button>`
-    : ["c_no_tv", "c_source", "c_bundle", "c_digest"].includes(e.cle) ? `<button class="btn btn--petit" data-edit="${a.id}" data-key="edit-p-${a.id}">${t("settings")}</button>` : "";
+    : ["c_no_tv", "c_source", "c_bundle", "c_digest", "c_no_release", "c_needs_tvos"].includes(e.cle) ? `<button class="btn btn--petit" data-edit="${a.id}" data-key="edit-p-${a.id}">${t("settings")}</button>` : "";
   const details = e.brut && (e.brut.length > 110 || e.connu)
     ? `<details class="details" data-key="err-${a.id}"><summary>${t("tech_details")}</summary><pre class="log">${esc(nettoyer(e.brut) || e.brut)}</pre></details>` : "";
   return `<div class="probleme" role="group" aria-label="${esc(t("last_problem"))}">
@@ -296,6 +307,8 @@ function carteApp(a, now, s) {
       <div><dt>${t("account")}</dt><dd>${compte ? esc(compte) : t("default_account")}</dd></div>
       ${essai ? `<div><dt>${t("last_attempt")}</dt><dd>${essai}</dd></div>` : a.signed_at ? `<div><dt>${t("signed")}</dt><dd>${esc(relatif(a.signed_at, now))}</dd></div>` : ""}
       ${a.bad_tag ? `<div><dt>${t("skipped_version")}</dt><dd class="mono">${esc(a.bad_tag)}</dd></div>` : ""}
+      ${a.avail_tag && !a.auto_update ? `<div><dt>${t("upd_available")}</dt><dd class="mono">${esc(a.avail_tag)}</dd></div>` : ""}
+      ${a.update_pending ? `<div><dt>${t("upd_pending")}</dt><dd class="mono">${esc(a.version || "")}</dd></div>` : ""}
     </dl>
     <div class="app__actions">
       <button class="row__action row__action--go" data-renew="${a.id}" ${a.running ? "disabled" : ""}>${a.running ? t("in_progress") : t("renew")}</button>
@@ -307,7 +320,8 @@ function carteApp(a, now, s) {
 }
 // déclencheurs enregistrés par le serveur (en français) -> libellé traduit
 const trigger = (x) => ({ auto: t("tr_auto"), manuel: t("tr_manual"), ajout: t("tr_added"), "nouvelle version": t("tr_new_version"),
-  "nouvelle source": t("tr_new_source"), "nouvelle destination": t("tr_new_dest") }[x] || x);
+  "nouvelle source": t("tr_new_source"), "nouvelle destination": t("tr_new_dest"), "mise à jour": t("tr_update"),
+  "retour arrière": t("tr_rollback") }[x] || x);
 
 // ---------- synthèse globale ----------
 const boucleArretee = (h, now) => !!h && (h.loop_stalled || (!!h.last_loop_at && now - h.last_loop_at > 3 * (h.check_interval || 600) + 2700));
@@ -365,6 +379,10 @@ function renderAlertes() {
   if (s) {
     if (s.auth_disabled) {
       html.push(`<div class="banner banner--info"><p><strong>${t("auth_off_t")}</strong>${t("auth_off")}</p></div>`);
+    }
+    for (const n of (s.notices || []).filter((x) => x.id === "revocation")) {
+      html.push(`<div class="banner"><p><strong>${esc(t("revoked_t", { email: n.email }))}</strong>${esc(t("revoked", { app: n.app }))}</p>
+        <button class="btn" type="button" data-dismiss-notice="revocation">${t("dismiss")}</button></div>`);
     }
     for (const a of s.accounts.filter((x) => x.ok === 0)) {
       html.push(`<div class="banner"><p><strong>${esc(t("acc_disconnected_t", { email: a.email }))}</strong>${t("acc_disconnected")}</p>
@@ -488,11 +506,14 @@ function renderSysteme(s, now) {
   </div>`);
 }
 
+let OLDER_EVENTS = [];      // événements plus anciens chargés par « Afficher plus » (extras.js)
+let OLDER_MORE = null;      // null : inconnu (on suppose qu'il y en a si le serveur en a renvoyé 80)
 function renderEvents(s) {
   const filtre = store.get("tvsign.journal") || "tout";
   const radio = $(`input[name="journal-filtre"][value="${filtre}"]`);
   if (radio && !radio.checked) radio.checked = true;
-  const evs = s.events.filter((e) => filtre === "tout" || e.level !== "info");
+  const tous = s.events.concat(OLDER_EVENTS.filter((o) => o.id < (s.events[s.events.length - 1]?.id ?? Infinity)));
+  const evs = tous.filter((e) => filtre === "tout" || e.level !== "info");
   if (!evs.length) return setHTML($("#events"), `<div class="vide"><p>${filtre === "tout" ? t("log_empty") : t("log_no_problem")}</p></div>`);
   const jour = (ts) => {
     const d = new Date(ts * 1000), auj = new Date(), hier = new Date(Date.now() - 86400000);
@@ -516,7 +537,8 @@ function renderEvents(s) {
         ${long ? `<details class="details" data-key="ev-${e.id}"><summary>${t("details")}</summary><pre class="log">${esc(e.message)}</pre></details>` : ""}</div>
     </li>`;
   }
-  setHTML($("#events"), html + "</ol>");
+  const plus = OLDER_MORE === null ? s.events.length >= 80 : OLDER_MORE;
+  setHTML($("#events"), html + "</ol>" + (plus ? `<div class="actions-form"><button class="btn" type="button" data-more-events>${t("log_more")}</button></div>` : ""));
 }
 
 function render() {
@@ -639,6 +661,9 @@ function openDialog(id) {
   if (id === "dlg-login") {
     $("#login-session").innerHTML = ""; $("#login-error").textContent = "";
     $("#login-submit").disabled = false;
+    // l'avertissement sur les certificats se confirme une fois, au premier compte
+    $("#login-ack-row").hidden = !!(STATE?.accounts || []).length;
+    $("#form-login").ack.checked = false;
   }
   document.getElementById(id).showModal();
 }
@@ -724,7 +749,7 @@ $("#form-app").addEventListener("submit", async (ev) => {
     f.reset();
     flash("ok", t("app_added_t", { name: app.name }), " " + t("app_added"));
   } catch (e) {
-    err.textContent = e.message;
+    err.textContent = messageErreur(e);
   } finally {
     btn.disabled = false; btn.textContent = t("add");
     refresh();
@@ -748,6 +773,8 @@ function openEdit(id) {
   f.source_filter.value = a.source_filter || "";
   f.channel.value = a.channel === "beta" ? "beta" : "stable";
   f.source_url.value = a.source_type === "url" ? a.source || "" : "";
+  f.auto_update.checked = a.auto_update !== 0;
+  if (typeof renderMisesAJour === "function") renderMisesAJour(a);
   $$("#form-edit [data-for]").forEach((el) => (el.hidden = el.dataset.for !== a.source_type));
   $("#edit-error").textContent = "";
   $("#dlg-edit").showModal();
@@ -771,6 +798,7 @@ $("#form-edit").addEventListener("submit", async (ev) => {
     if (!/^https:\/\//.test(src)) return (err.textContent = t("https_only"));
     if (src !== a.source) body.source = src;
   }
+  if (a.source_type !== "upload" && f.auto_update.checked !== (a.auto_update !== 0)) body.auto_update = f.auto_update.checked;
   if (!Object.keys(body).length) return f.closest("dialog").close();
   if (body.account_email && !confirm(t("confirm_account_change", { name: a.name, email: body.account_email }))) return;
   const btn = $("#edit-submit");
@@ -783,7 +811,7 @@ $("#form-edit").addEventListener("submit", async (ev) => {
     if (relance && a.enabled) lance = await api(`/api/apps/${a.id}/renew`, { method: "POST" });   // nouvelle destination : installer tout de suite
     flash("ok", t("saved_t"), !lance ? "" : lance.started === false ? " " + t("dest_after") : " " + t("dest_now"));
   } catch (e) {
-    err.textContent = e.message;
+    err.textContent = messageErreur(e);
   } finally {
     btn.disabled = false;
     refresh();
@@ -922,6 +950,7 @@ $("#form-login").addEventListener("submit", async (ev) => {
   const f = ev.target, btn = $("#login-submit");
   if (btn.disabled) return;
   $("#login-error").textContent = "";
+  if (!f.ack.checked && !(STATE?.accounts || []).length) return ($("#login-error").textContent = t("login_ack_needed"));
   btn.disabled = true;
   try {
     const sess = await api("/api/accounts/login", { json: { email: f.email.value.trim(), password: f.password.value } });
@@ -1091,6 +1120,15 @@ const WIZ_RENDU = {
   },
 };
 
+// Détails calculés par le serveur en anglais (dossier de support) : l'interface les écrit dans sa langue.
+function detailDiag(c, d) {
+  if (c.id === "disk" && c.value != null) return t("diag_disk_d", { gb: c.value, dir: d.data_dir || "" });
+  if (c.id === "clock" && typeof c.value === "number") return t("diag_clock_d", { s: (c.value > 0 ? "+" : "") + c.value });
+  if (c.id === "clock" && c.value == null && c.status === "warn") return t("diag_clock_none");
+  if (c.id === "mdns" && c.value && typeof c.value === "object") return t("diag_mdns_d", c.value);
+  return c.detail;
+}
+
 function listeDiag(d) {
   return `<div class="list">${d.checks.map((c) => {
     const ton = c.status === "ok" ? "ok" : c.status === "warn" ? "warn" : "err";
@@ -1100,7 +1138,7 @@ function listeDiag(d) {
       <div class="row__label">
         <p class="row__title">${t("diag_" + c.id)}</p>
         <p class="row__sub"><span class="etat etat--${ton}">${t("diag_" + c.status)}</span>${c.id === "plumesign" && c.value ? ` · <span class="mono">${esc(c.value)}</span>` : ""}</p>
-        <p class="row__sub">${esc(c.detail)}</p>
+        <p class="row__sub">${esc(detailDiag(c, d))}</p>
         ${conseil && conseil !== `diag_${c.id}_fix` ? `<p class="row__sub">${esc(conseil)}</p>` : ""}
       </div>
     </div>`;
@@ -1138,7 +1176,7 @@ $("#vue-onboarding").addEventListener("click", async (e) => {
     fd.append("device_id", tv.id);
     await busy(b, "id", t("downloading"), async () => {
       try { await api("/api/apps", { method: "POST", body: fd }); WIZ.appAjoutee = true; await refresh(); }
-      catch (err) { const el = $("#wiz-erreur"); if (el) el.textContent = err.message; }
+      catch (err) { const el = $("#wiz-erreur"); if (el) el.textContent = messageErreur(err); }
     });
   }
 });
@@ -1182,6 +1220,7 @@ async function chargerReglages() {
   cb.checked = (STATE?.apps || []).some((a) => a.source_type === "upload");
   $("#backup-export").href = "/api/backup/export" + (cb.checked ? "?uploads=true" : "");
   renderSecurite();
+  if (typeof chargerNotifs === "function") chargerNotifs();
 }
 function renderSecurite() {
   const a = REGLAGES.auth;
@@ -1238,14 +1277,6 @@ function afficherFlashReglages() {
   const b = $("#reglages-submit"), txt = b.textContent;
   b.textContent = t("saved_t"); setTimeout(() => (b.textContent = txt), 1800);
 }
-$("#ntfy-test").onclick = async (ev) => {
-  const b = ev.currentTarget, err = $("#reglages-error");
-  err.textContent = "";
-  await busy(b, "id", t("sending"), async () => {
-    try { await api("/api/settings/test-notification", { json: { url: $("#form-reglages").ntfy_url.value.trim() || null } }); b.textContent = t("sent"); }
-    catch (e) { err.textContent = e.message; }
-  });
-};
 $("#vue-settings").addEventListener("click", async (e) => {
   const b = e.target.closest("button");
   if (!b) return;
@@ -1319,6 +1350,7 @@ async function changerLangue(lang, serveur = false) {
 }
 function appliquerI18n() {
   document.documentElement.lang = LANG;
+  if (typeof annoncerLangue === "function") annoncerLangue();
   $$("[data-i18n]").forEach((el) => (el.textContent = t(el.dataset.i18n)));
   $$("[data-i18n-placeholder]").forEach((el) => (el.placeholder = t(el.dataset.i18nPlaceholder)));
   $$("[data-i18n-aria]").forEach((el) => el.setAttribute("aria-label", t(el.dataset.i18nAria)));
