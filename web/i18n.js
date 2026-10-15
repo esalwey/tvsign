@@ -554,7 +554,7 @@ const I18N = {
   release_check_t: ["Recherche de nouvelles versions impossible", "Can't look for new versions"],
   self_update_t: ["tvsign {v} est disponible", "tvsign {v} is available"],
   self_update_windows: ["Télécharge le nouvel installeur et lance-le : il met tvsign à jour sur place et conserve tes données et tes réglages.", "Download the new installer and run it: it updates tvsign in place and keeps your data and settings."],
-  self_update_docker: ["Dans le dossier de tvsign : docker compose pull && docker compose up -d", "In tvsign's folder: docker compose pull && docker compose up -d"],
+  self_update_docker: ["Dans le dossier de tvsign : docker compose pull && docker compose up -d. Si l'image est épinglée sur une autre version majeure (ghcr.io/esalwey/tvsign:1), change d'abord son tag pour ghcr.io/esalwey/tvsign:{major} dans docker-compose.yml.", "In tvsign's folder: docker compose pull && docker compose up -d. If the image is pinned to another major version (ghcr.io/esalwey/tvsign:1), first change its tag to ghcr.io/esalwey/tvsign:{major} in docker-compose.yml."],
   release_page: ["Voir la version", "View release"],
   dismiss: ["Ignorer", "Dismiss"],
   update_check: ["Chercher les mises à jour de tvsign", "Check for tvsign updates"],
@@ -567,6 +567,11 @@ const I18N = {
   update_status_current: ["À jour (vérifié {when}).", "Up to date (checked {when})."],
   update_status_new: ["Version {v} disponible.", "Version {v} available."],
   update_status_error: ["Vérification impossible : {why}", "Check failed: {why}"],
+  untracked_link_manual: ["Ce serveur n'indique pas si le fichier change (ni ETag, ni date, ni taille) et la mise à jour automatique est coupée : tvsign ne compare le fichier que lorsque tu cliques sur « Vérifier maintenant ».", "This server doesn't say whether the file changed (no ETag, date or size) and automatic updates are off: tvsign only compares the file when you click \"Check now\"."],
+  err_files_locked: ["Un fichier de l'app est verrouillé (antivirus, disque en lecture seule ?) : rien n'a été modifié, réessaie dans un instant.", "A file of the app is locked (antivirus, read-only disk?): nothing was changed, try again in a moment."],
+  err_gh_bad_token: ["Jeton GitHub refusé : vérifie ou renouvelle TVSIGN_GITHUB_TOKEN (jeton expiré, révoqué ou sans accès à ce dépôt).", "GitHub token rejected: check or renew TVSIGN_GITHUB_TOKEN (expired, revoked or without access to this repository)."],
+  c_gh_token_t: ["Jeton GitHub refusé", "GitHub token rejected"],
+  c_gh_token_a: ["TVSIGN_GITHUB_TOKEN est expiré, révoqué ou sans accès à ce dépôt. Renouvelle-le (voir le README), puis redémarre tvsign.", "TVSIGN_GITHUB_TOKEN is expired, revoked or has no access to this repository. Renew it (see the README), then restart tvsign."],
 };
 
 let LANG = "en";

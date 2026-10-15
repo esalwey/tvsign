@@ -83,6 +83,7 @@ function relatif(ts, now) {
 const CAUSES = [
   [/ntfy/i, "c_ntfy"],
   [/limite de requêtes GitHub/i, "c_gh_rate"],
+  [/jeton GitHub refusé/i, "c_gh_token"],
   [/dépôt GitHub introuvable/i, "c_gh_missing"],
   [/demande tvOS/i, "c_tvos"],
   [/8220|no devices from which/i, "c_8220"],
@@ -144,7 +145,7 @@ function flash(ton, titre, texte = "") {
 
 // ---------- rendu sans perte de focus ----------
 const CLES = ["data-renew", "data-toggle", "data-edit", "data-del-app", "data-refresh-dev", "data-del-dev", "data-check",
-  "data-select", "data-relogin", "data-logout", "data-open", "data-key", "data-update", "data-rollback", "data-dismiss-update"];
+  "data-select", "data-relogin", "data-logout", "data-open", "data-key", "data-update", "data-rollback", "data-dismiss-update", "data-replace"];
 function cleDe(el) {
   if (!el?.getAttribute) return null;
   for (const a of CLES) if (el.hasAttribute(a)) return [a, el.getAttribute(a)];
@@ -252,7 +253,7 @@ function noteMaj(a, now) {
     html += `<details class="details" data-key="notes-${a.id}"><summary>${esc(t("release_notes_v", { v: a.version || a.source_tag || "" }))}</summary><pre class="log">${esc(a.notes)}</pre></details>`;
   }
   if (a.untracked_link) {
-    html += `<p class="row__sub">${esc(t("untracked_link"))} <button class="lien lien--inline" data-update="${a.id}" ${a.running ? "disabled" : ""}>${t("check_now")}</button></p>`;
+    html += `<p class="row__sub">${esc(t(a.auto_update === 0 ? "untracked_link_manual" : "untracked_link"))} <button class="lien lien--inline" data-update="${a.id}" ${a.running ? "disabled" : ""}>${t("check_now")}</button></p>`;
   }
   return html;
 }
@@ -304,7 +305,7 @@ function problemeApp(a, now) {
     ? `<button class="btn btn--petit" data-relogin="${esc(a.effective_account)}">${t("reconnect")}</button>`
     : e.cle === "c_no_account" ? `<button class="btn btn--petit" data-open="dlg-login" data-key="login-p-${a.id}">${t("connect")}</button>`
     : ["c_lost", "c_legacy"].includes(e.cle) ? `<button class="btn btn--petit" data-open="dlg-pair">${t("pair")}</button>`
-    : e.cle === "c_ipa_missing" && a.source_type === "upload" ? `<label class="btn btn--petit fichier"><input type="file" data-replace="${a.id}" accept=".ipa,application/octet-stream"><span>${t("replace_ipa")}</span></label>`
+    : e.cle === "c_ipa_missing" && a.source_type === "upload" ? `<button class="btn btn--petit" data-replace="${a.id}">${t("replace_ipa")}</button>`
     : ["c_no_tv", "c_source", "c_bundle", "c_digest", "c_gh_missing"].includes(e.cle) ? `<button class="btn btn--petit" data-edit="${a.id}" data-key="edit-p-${a.id}">${t("settings")}</button>` : "";
   const details = e.brut && (e.brut.length > 110 || e.connu)
     ? `<details class="details" data-key="err-${a.id}"><summary>${t("tech_details")}</summary><pre class="log">${esc(nettoyer(e.brut) || e.brut)}</pre></details>` : "";
@@ -347,7 +348,7 @@ function carteApp(a, now, s) {
       <button class="row__action row__action--go" data-renew="${a.id}" ${a.running ? "disabled" : ""}>${a.running ? t("in_progress") : t("renew")}</button>
       <button class="row__action" data-toggle="${a.id}" data-enabled="${a.enabled}">${a.enabled ? t("pause") : t("resume")}</button>
       ${a.can_rollback ? `<button class="row__action" data-rollback="${a.id}" data-nom="${esc(a.name)}" ${a.running ? "disabled" : ""}>${t("previous_version")}</button>` : ""}
-      ${a.source_type === "upload" ? `<label class="row__action fichier"><input type="file" data-replace="${a.id}" accept=".ipa,application/octet-stream"><span>${t("replace_ipa")}</span></label>` : ""}
+      ${a.source_type === "upload" ? `<button class="row__action" data-replace="${a.id}" ${a.running ? "disabled" : ""}>${t("replace_ipa")}</button>` : ""}
       <button class="row__action" data-edit="${a.id}">${t("settings")}</button>
       <button class="row__action row__action--danger" data-del-app="${a.id}" data-nom="${esc(a.name)}">${t("delete")}</button>
     </div>
@@ -434,7 +435,7 @@ function renderAlertes() {
     }
     if (s.update) {
       const u = s.update;
-      html.push(`<div class="banner banner--info"><p><strong>${esc(t("self_update_t", { v: u.version }))}</strong>${esc(u.edition === "windows" ? t("self_update_windows") : t("self_update_docker"))}</p>
+      html.push(`<div class="banner banner--info"><p><strong>${esc(t("self_update_t", { v: u.version }))}</strong>${esc(u.edition === "windows" ? t("self_update_windows") : t("self_update_docker", { major: String(u.version).split(".")[0] }))}</p>
         ${u.url ? `<a class="btn" href="${esc(u.url)}" target="_blank" rel="noopener noreferrer">${t("release_page")}</a>` : ""}
         <button class="btn" data-dismiss-update="1">${t("dismiss")}</button></div>`);
     }
@@ -637,6 +638,13 @@ document.addEventListener("click", async (ev) => {
     return;
   }
   if (d.edit) return openEdit(+d.edit);
+  if (d.replace) {
+    // le sélecteur de fichier est un <input> permanent (hors des sections redessinées) : un rendu de
+    // la carte pendant le choix du fichier ne perd donc pas l'envoi
+    REMPLACE_ID = +d.replace;
+    $("#replace-input").click();
+    return;
+  }
   if (!(d.renew || d.toggle || d.delApp || d.refreshDev || d.delDev || d.check || d.select || d.logout
       || d.update || d.rollback || d.dismissUpdate)) return;
   try {
@@ -720,9 +728,11 @@ async function remplacerIPA(id, input) {
     refresh();
   }
 }
-document.addEventListener("change", (e) => {
-  const input = e.target.closest?.("input[data-replace]");
-  if (input) remplacerIPA(+input.dataset.replace, input);
+let REMPLACE_ID = null;
+$("#replace-input").addEventListener("change", (e) => {
+  const input = e.target, id = REMPLACE_ID;
+  REMPLACE_ID = null;
+  if (id != null) remplacerIPA(id, input); else input.value = "";
 });
 
 $("#journal-bloc").addEventListener("change", (e) => {

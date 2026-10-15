@@ -127,7 +127,8 @@ docker compose pull && docker compose up -d
 ```
 
 Tags: `:1` (recommended, stays on major version 1), `:1.2`, `:1.2.3`, `:latest`, `:edge` (main
-branch, for testers). The database is copied before any schema change. Avoid updating during a
+branch, for testers). `:1` never moves to a new major version: to go to 2.x, change the tag in
+`docker-compose.yml` (`ghcr.io/esalwey/tvsign:2`) before pulling. The database is copied before any schema change. Avoid updating during a
 renewal: `stop_grace_period: 5m` and `TVSIGN_SHUTDOWN_DRAIN_SECONDS` (240) let an install in
 progress finish before the container stops. Watchtower or Diun work but are optional.
 
@@ -340,7 +341,8 @@ docker compose pull && docker compose up -d
 ```
 
 Tags : `:1` (conseillé, reste en version majeure 1), `:1.2`, `:1.2.3`, `:latest`, `:edge` (branche
-main, pour les testeurs). La base est copiée avant tout changement de schéma. Éviter de mettre à jour
+main, pour les testeurs). `:1` ne passe jamais à une autre version majeure : pour aller en 2.x, change le tag
+dans `docker-compose.yml` (`ghcr.io/esalwey/tvsign:2`) avant le pull. La base est copiée avant tout changement de schéma. Éviter de mettre à jour
 pendant un renouvellement : `stop_grace_period: 5m` et `TVSIGN_SHUTDOWN_DRAIN_SECONDS` (240) laissent
 finir une installation en cours avant l'arrêt du conteneur. Watchtower ou Diun fonctionnent mais
 restent facultatifs.
