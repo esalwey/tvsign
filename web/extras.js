@@ -53,13 +53,18 @@ async function chargerNotifs() {
     : `<div class="vide"><p>${t("notif_empty")}</p><button class="btn" type="button" data-notif-new>${t("notif_add")}</button></div>`);
 }
 
+// Destination ntfy venue de l'adresse des réglages : ni nom ni jeton (le serveur les refuserait), l'accès
+// protégé passe par https://utilisateur:mot-de-passe@hôte/sujet.
+const integree = (cible) => !!(cible && cible.builtin);
 function champsNotif(type, cible) {
-  const ph = (n) => (NOTIF_CHAMPS[type].find((c) => c[0] === n) || [])[3] || "";
-  $("#notif-champs").innerHTML = NOTIF_CHAMPS[type].map(([nom, kind, secret, exemple]) => `
+  const champs = NOTIF_CHAMPS[type].filter(([nom]) => !(integree(cible) && nom === "token"));
+  $("#notif-champs").innerHTML = champs.map(([nom, kind, secret, exemple]) => `
     <label class="field"><span>${t("nf_" + type + "_" + nom)}</span>
       <input name="${nom}" type="${kind}" placeholder="${esc(exemple)}" autocomplete="off" spellcheck="false"
-        ${cible && cible[nom] != null ? `value="${esc(cible[nom])}"` : ""}></label>`).join("");
-  $("#notif-aide").textContent = t("nh_" + type);
+        ${cible && cible[nom] != null ? `value="${esc(cible[nom])}"` : ""}
+        ${cible && cible.locked && nom === "url" ? "readonly" : ""}></label>`).join("");
+  $("#notif-aide").textContent = t("nh_" + type) + " " + t("nh_privacy")
+    + (integree(cible) ? " " + t("nh_ntfy_builtin") : "");
 }
 function evenementsNotif(actifs) {
   $("#notif-events").innerHTML = NOTIF_EVENTS.map((e) => `
@@ -75,6 +80,7 @@ function ouvrirNotif(cible) {
   f.type.value = cible ? cible.type : "ntfy";
   f.type.disabled = !!cible;
   f.name.value = cible ? cible.name : "";
+  f.name.closest("label").hidden = integree(cible);
   champsNotif(f.type.value, cible);
   evenementsNotif(cible ? cible.events : NOTIF?.events || NOTIF_EVENTS);
   $("#notif-error").textContent = "";
@@ -83,8 +89,8 @@ function ouvrirNotif(cible) {
 }
 function brouillonNotif() {
   const f = $("#form-notif");
-  const body = { type: f.type.value, name: f.name.value.trim(), events: $$('input[name="ev"]:checked', f).map((c) => c.value) };
-  for (const [nom] of NOTIF_CHAMPS[body.type]) body[nom] = f.elements[nom].value.trim();
+  const body = { type: f.type.value, name: integree(NOTIF_EDIT) ? "" : f.name.value.trim(), events: $$('input[name="ev"]:checked', f).map((c) => c.value) };
+  for (const [nom] of NOTIF_CHAMPS[body.type]) if (f.elements[nom]) body[nom] = f.elements[nom].value.trim();
   if (NOTIF_EDIT) body.id = NOTIF_EDIT.id;
   return body;
 }
@@ -186,7 +192,7 @@ async function renderMisesAJour(a) {
   bloc.hidden = a.source_type === "upload";
   info.innerHTML = "";
   if (bloc.hidden) return;
-  const dispo = a.avail_tag && !a.auto_update, retour = !!a.prev_tag;
+  const dispo = !!a.avail_tag, retour = !!a.prev_tag;
   if (!dispo && !retour && !a.update_pending) return;
   let notes = null;
   if (a.has_notes) { try { notes = await api(`/api/apps/${a.id}/notes`); } catch { /* notes facultatives */ } }
@@ -206,9 +212,10 @@ $("#edit-updates").addEventListener("click", async (e) => {
   const err = $("#edit-error");
   try {
     if (b.dataset.updNow !== undefined) {
-      await api(`/api/apps/${EDIT.id}/update`, { method: "POST" });
+      const r = await api(`/api/apps/${EDIT.id}/update`, { method: "POST" });
       $("#dlg-edit").close();
-      flash("info", t("upd_started_t"), " " + t("upd_started"));
+      if (r && r.started === false) flash("info", t("upd_busy_t"), " " + t("upd_busy"));
+      else flash("info", t("upd_started_t"), " " + t("upd_started"));
     }
     if (b.dataset.updBack !== undefined) {
       if (!confirm(t("upd_rollback_confirm", { name: EDIT.name }))) return;

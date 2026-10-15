@@ -307,7 +307,7 @@ function carteApp(a, now, s) {
       <div><dt>${t("account")}</dt><dd>${compte ? esc(compte) : t("default_account")}</dd></div>
       ${essai ? `<div><dt>${t("last_attempt")}</dt><dd>${essai}</dd></div>` : a.signed_at ? `<div><dt>${t("signed")}</dt><dd>${esc(relatif(a.signed_at, now))}</dd></div>` : ""}
       ${a.bad_tag ? `<div><dt>${t("skipped_version")}</dt><dd class="mono">${esc(a.bad_tag)}</dd></div>` : ""}
-      ${a.avail_tag && !a.auto_update ? `<div><dt>${t("upd_available")}</dt><dd class="mono">${esc(a.avail_tag)}</dd></div>` : ""}
+      ${a.avail_tag ? `<div><dt>${t("upd_available")}</dt><dd class="mono">${esc(a.avail_tag)}</dd></div>` : ""}
       ${a.update_pending ? `<div><dt>${t("upd_pending")}</dt><dd class="mono">${esc(a.version || "")}</dd></div>` : ""}
     </dl>
     <div class="app__actions">

@@ -72,7 +72,7 @@ Concrètement :
 - Si le PC reste éteint plus de deux jours et demi d'affilée au mauvais moment, l'app peut expirer sur la TV. Elle ne s'ouvre alors plus. Rallumez le PC : tvsign la renouvelle et la réinstalle à la première occasion.
 - La marge peut être modifiée dans **Réglages > Renouveler avant expiration**.
 
-Pour être prévenu en cas d'échec, tvsign affiche une notification Windows (pas pour une panne banale loin de l'expiration, comme une Apple TV en veille : l'alerte vient quand il reste moins de 24 h). Vous pouvez aussi ajouter des destinations dans **Réglages > Notifications** pour recevoir l'alerte sur votre téléphone : ntfy, Discord, Telegram, Gotify ou un webhook, chacune avec ses événements et un bouton « Envoyer un test ».
+Pour être prévenu en cas d'échec, tvsign affiche une notification Windows (pas pour une panne banale loin de l'expiration, comme une Apple TV en veille : l'alerte vient quand il reste moins de 24 h). Vous pouvez aussi ajouter des destinations dans **Réglages > Notifications** pour recevoir l'alerte sur votre téléphone : ntfy, Discord, Telegram, Gotify ou un webhook, chacune avec ses événements et un bouton « Envoyer un test ». Les messages citent votre Apple ID et vos apps et sont envoyés à ce service : utilisez un salon ou une conversation privés.
 
 En cas de problème à signaler, **Réglages > Diagnostic > Assistance** télécharge un dossier de support dont les adresses e-mail, adresses IP et secrets sont masqués ; le journal du programme est dans `%LOCALAPPDATA%\tvsign\logs\tvsign.log`.
 

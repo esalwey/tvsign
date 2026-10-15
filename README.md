@@ -218,8 +218,14 @@ offset. `TVSIGN_NTFY_URL` still presets an ntfy destination, `TVSIGN_NTFY_EVENTS
 (comma separated, `none` for none). On the public ntfy.sh the topic name acts as a password and
 messages name your Apple ID and your apps: pick a long random topic, or use a self-hosted ntfy. A
 protected server works with `https://user:password@host/topic` (Basic authentication) or an access
-token; a bare name such as `my-topic` means `https://ntfy.sh/my-topic`. The Windows desktop app also
-raises a Windows notification.
+token; a bare name such as `my-topic` means `https://ntfy.sh/my-topic`. The destination that comes from
+the ntfy address of the settings (or `TVSIGN_NTFY_URL`) has no name or token of its own: put the login
+in the address, or add a separate ntfy destination for an access token. Whatever the service (ntfy,
+Discord, Telegram, Gotify, a webhook), messages name your Apple ID and your apps and are sent to it:
+use a private channel or chat. For Telegram, the chat ID is the number after `"chat":{"id":` in
+`https://api.telegram.org/bot<token>/getUpdates` once you have sent a message to your bot (or ask
+@userinfobot). A failed test says what to check (wrong token, wrong address, unreachable server…). The
+Windows desktop app also raises a Windows notification.
 
 Logs: the access log is off (the page polls every 5 s); `TVSIGN_ACCESS_LOG=1` turns it on.
 
@@ -471,7 +477,14 @@ bouton **Envoyer un test**. Les messages suivent la langue choisie dans les Rég
 de passe et les messages citent votre Apple ID et vos apps : choisir un sujet long et aléatoire, ou un
 ntfy auto-hébergé. Un serveur protégé s'utilise avec `https://utilisateur:motdepasse@hôte/sujet`
 (authentification Basic) ou un jeton d'accès ; un simple nom comme `mon-sujet` vaut
-`https://ntfy.sh/mon-sujet`. L'application Windows affiche aussi une notification Windows.
+`https://ntfy.sh/mon-sujet`. La destination issue de l'adresse ntfy des réglages (ou de
+`TVSIGN_NTFY_URL`) n'a ni nom ni jeton propres : mettre l'identifiant dans l'adresse, ou ajouter une
+destination ntfy distincte pour un jeton d'accès. Quel que soit le service (ntfy, Discord, Telegram,
+Gotify, webhook), les messages citent votre Apple ID et vos apps et lui sont envoyés : utiliser un
+salon ou une conversation privés. Pour Telegram, l'identifiant de conversation est le nombre qui suit
+`"chat":{"id":` dans `https://api.telegram.org/bot<jeton>/getUpdates` après avoir écrit à son bot (ou
+demander à @userinfobot). Un test échoué indique quoi vérifier (jeton faux, adresse fausse, serveur
+injoignable…). L'application Windows affiche aussi une notification Windows.
 
 Journaux : le journal d'accès est coupé (la page interroge le serveur toutes les 5 s) ;
 `TVSIGN_ACCESS_LOG=1` le rétablit.
