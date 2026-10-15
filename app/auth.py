@@ -209,7 +209,11 @@ def read_cookie(value: str | None) -> dict | None:
         return None
     if data.get("v") != _version() or time.time() - data.get("iat", 0) > SESSION_DAYS * 86400:
         return None
-    if data.get("sid") in _REVOKED:
+    if not data.get("sid"):
+        # cookie émis avant les sessions individuelles : un identifiant dérivé de sa signature permet de
+        # le révoquer à la déconnexion (il reste valable tel quel jusqu'à son renouvellement)
+        data["sid"] = "legacy-" + sig[:16]
+    if data["sid"] in _REVOKED:
         return None
     return data
 

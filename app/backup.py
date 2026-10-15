@@ -162,6 +162,12 @@ def restore(archive: Path) -> dict:
                     shutil.copyfileobj(src, f)
 
             keep = {k: settings.raw_get(k) for k in KEEP_LOCAL}
+            # Sessions dont l'utilisateur s'est déconnecté : l'archive n'en contient pas (_strip_local), mais
+            # session_version est conservé, donc sans ceci leurs cookies redeviendraient valides.
+            try:
+                revoked = [(r["sid"], r["until"]) for r in db.rows("SELECT sid, until FROM revoked_sessions")]
+            except sqlite3.DatabaseError:
+                revoked = []
             if DB_PATH.exists():
                 db.snapshot(DATA_DIR / f"tvsign.db.pre-restore-{stamp}")
             replace_retry(new_db, DB_PATH)
@@ -188,6 +194,9 @@ def restore(archive: Path) -> dict:
         if v is not None or k in AUTH_LOCAL:
             settings.raw_set(k, v)
     settings.raw_set("onboarded", "1")
+    for sid, until in revoked:
+        db.execute("INSERT INTO revoked_sessions (sid, until) VALUES (?, ?) "
+                   "ON CONFLICT(sid) DO UPDATE SET until = excluded.until", sid, until)
     # Apps importées dont l'IPA n'est pas dans la sauvegarde : inutilisables, on le dit tout de suite
     # (sinon l'échec n'apparaît qu'à la fenêtre de renouvellement, des jours plus tard).
     missing = []
