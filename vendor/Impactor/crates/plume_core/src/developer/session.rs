@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::Error;
 
 use crate::auth::Account;
+use crate::auth::account::snippet;
 use crate::auth::anisette_data::AnisetteData;
 use crate::developer::qh::QHResponseMeta;
 use crate::developer::v1::V1ErrorResponse;
@@ -50,16 +51,43 @@ impl DeveloperSession {
         xcode_gs_token: String,
         config: AnisetteConfiguration,
     ) -> Result<Self, Error> {
-        let mut anisette = AnisetteData::new(config).await?;
-        if anisette.fresh_identity {
-            // A renewal never signs in, so nothing else would let Apple see the new identity
-            // synchronize before this session's first request. Best effort.
-            match anisette.synchronize_with_apple().await {
-                Ok(synced) => anisette = synced,
-                Err(e) => log::warn!("anisette synchronization with Apple skipped: {e}"),
+        let anisette = AnisetteData::new(config).await?;
+        Self::new_synchronizing(adsid, xcode_gs_token, anisette).await
+    }
+
+    /// A session with anisette data that may belong to an identity Apple has never seen
+    /// (`fresh_identity`). A renewal never signs in, so nothing has let Apple see a new identity
+    /// synchronize, and the portal may refuse the data of an identity it does not know. When the
+    /// first request fails for such an identity, ask GrandSlam once (a throwaway Apple ID, no
+    /// account is touched) and try again with synchronized data. Best effort: the first error is the
+    /// one reported when the synchronization does not happen.
+    pub(crate) async fn new_synchronizing(
+        adsid: String,
+        xcode_gs_token: String,
+        anisette: AnisetteData,
+    ) -> Result<Self, Error> {
+        let fresh_identity = anisette.fresh_identity;
+        let anisette = Arc::new(Mutex::new(anisette));
+        match Self::new_with_anisette(adsid.clone(), xcode_gs_token.clone(), anisette.clone()).await {
+            Err(first) if fresh_identity && could_be_an_unknown_identity(&first) => {
+                log::info!(
+                    "the developer portal refused a new anisette identity ({first}): synchronizing it with Apple"
+                );
+                let current = anisette.lock().await.clone();
+                match current.synchronize_with_apple().await {
+                    Ok(Some(synced)) => {
+                        *anisette.lock().await = synced;
+                        Self::new_with_anisette(adsid, xcode_gs_token, anisette).await
+                    }
+                    Ok(None) => Err(first),
+                    Err(e) => {
+                        log::warn!("anisette synchronization with Apple skipped: {e}");
+                        Err(first)
+                    }
+                }
             }
+            other => other,
         }
-        Self::new_with_anisette(adsid, xcode_gs_token, Arc::new(Mutex::new(anisette))).await
     }
 
     pub async fn new_with_anisette(
@@ -118,8 +146,19 @@ impl DeveloperSession {
         log::debug!("QH Request to {}: {:?}", url, body);
 
         let response = request_builder.body(buffer).send().await?;
+        let status = response.status().as_u16();
         let response_bytes = response.bytes().await?;
-        let response_dict: Dictionary = plist::from_bytes(&response_bytes)?;
+        let response_dict: Dictionary = match plist::from_bytes(&response_bytes) {
+            Ok(dict) => dict,
+            // the HTML page of an error (503: Apple refuses the anisette data, or is overloaded)
+            Err(_) if !is_plist(&response_bytes) => {
+                return Err(Error::DeveloperHttp {
+                    status,
+                    body: snippet(&String::from_utf8_lossy(&response_bytes)),
+                });
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         log::debug!("QH Response from {}: {:?}", url, response_dict);
 
@@ -173,11 +212,22 @@ impl DeveloperSession {
         }
 
         let response = request_builder.send().await?;
+        let status = response.status().as_u16();
         let response_text = response.text().await?;
 
         log::debug!("V1 Response from {}: {}", url, response_text);
 
-        let response_json: serde_json::Value = serde_json::from_str(&response_text)?;
+        let response_json: serde_json::Value = match serde_json::from_str(&response_text) {
+            Ok(json) => json,
+            // the HTML page of an error, or an HTTP error with no JSON in it
+            Err(_) if status >= 400 || response_text.trim_start().starts_with('<') => {
+                return Err(Error::DeveloperHttp {
+                    status,
+                    body: snippet(&response_text),
+                });
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         if let Ok(errors) = serde_json::from_value::<V1ErrorResponse>(response_json.clone()) {
             return Err(errors.errors[0].to_error(url.to_string()));
@@ -230,6 +280,18 @@ impl DeveloperSession {
         }
         Ok(locked.clone())
     }
+}
+
+/// A body that is a plist (XML or binary), not the HTML page of an error.
+fn is_plist(body: &[u8]) -> bool {
+    let body = body.trim_ascii_start();
+    body.starts_with(b"<?xml") || body.starts_with(b"<plist") || body.starts_with(b"bplist")
+}
+
+/// Whether the failure of the first request of a session could be the portal not accepting the
+/// data of an identity it has never seen (anything but a network failure).
+fn could_be_an_unknown_identity(error: &Error) -> bool {
+    !matches!(error, Error::Reqwest(_) | Error::Io(_) | Error::Anisette(_))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

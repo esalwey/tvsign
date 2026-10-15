@@ -12,8 +12,9 @@ source files stay under that license (https://www.mozilla.org/MPL/2.0/), and the
 available in `vendor/Impactor/crates/plume_core` of this repository, including our modifications.
 
 The Windows anisette handling of `plumesign` (version 1.0.1: client info and user agent taken from the
-anisette server, provisioning again on error -45061, synchronization on `hsc` 434, the `hsc` 409 case of
-the two-factor step) follows [isideload](https://github.com/nab138/isideload) (MIT), re-written for
+anisette server, a new anisette identity on error -45061, the headers and the Mac client info of the
+requests to Apple's provisioning service, synchronization on `hsc` 434, the `hsc` 409 case of the
+two-factor step) follows [isideload](https://github.com/nab138/isideload) (MIT), re-written for
 `omnisette` and `plume_core` (see `vendor/Impactor/PATCHES.md`). Its license:
 
 > MIT License

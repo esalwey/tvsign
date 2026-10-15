@@ -38,6 +38,10 @@ pub enum Error {
     /// anisette data or the client info it was sent, or is overloaded).
     #[error("Apple GrandSlam answered HTTP {status} without a usable reply: {body}")]
     GsaHttp { status: u16, body: String },
+    /// The developer portal answered with an HTTP error and no usable body (an HTML 503 page: Apple
+    /// refuses the anisette data it was sent, or is overloaded).
+    #[error("Apple developer services answered HTTP {status} without a usable reply: {body}")]
+    DeveloperHttp { status: u16, body: String },
     /// Apple refuses to send or check a code by SMS (HTTP 403 since October 2026).
     #[error(
         "SMS 2FA refused by Apple (HTTP {status}: {message}): use the code shown on a trusted Apple device instead"

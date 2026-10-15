@@ -6,8 +6,9 @@ use reqwest::header::{HeaderMap, HeaderValue};
 
 use crate::Error;
 
-/// `X-Xcode-Version` of the GrandSlam, 2FA and developer requests.
-pub const XCODE_VERSION: &str = "27.0 (27A5218g)";
+/// `X-Xcode-Version` of the GrandSlam, 2FA and developer requests (the provisioning requests of the
+/// anisette identity send the same one).
+pub const XCODE_VERSION: &str = omnisette::remote_anisette_v3::XCODE_VERSION;
 /// User agent used when the anisette provider does not report one with its client info.
 pub const DEFAULT_USER_AGENT: &str = "akd/1.0 CFNetwork/808.1.4";
 /// GrandSlam answers HTTP 503 to a client info that names Xcode (since September 2026).
@@ -60,7 +61,8 @@ impl AnisetteData {
                 .user_agent()
                 .unwrap_or_else(|| DEFAULT_USER_AGENT.to_string()),
             fresh_identity: b.provider.identity_is_new(),
-            config,
+            // the server that answered is the first one tried by the next refresh
+            config: config.set_preferred_url_v3(b.provider.server_used()),
         })
     }
 
@@ -82,7 +84,9 @@ impl AnisetteData {
     }
 
     /// New headers after GrandSlam asked for a synchronization (hsc 434, `sim` being its
-    /// `X-Apple-I-MD-DATA`): the anisette server synchronizes the identity with Apple first.
+    /// `X-Apple-I-MD-DATA`): the anisette server synchronizes the identity with Apple first. A server
+    /// that has lost the identity (-45061) makes a new one instead: the data are then those of an
+    /// identity Apple has never seen (`fresh_identity`), which is asked to synchronize in its turn.
     pub async fn resync(&self, sim: &str) -> Result<Self, Error> {
         let mut b = AnisetteHeaders::get_anisette_headers_provider(self.config.clone())?;
         let headers = b.provider.resync_anisette_headers(sim).await?;
@@ -95,8 +99,8 @@ impl AnisetteData {
                 .provider
                 .user_agent()
                 .unwrap_or_else(|| self.user_agent.clone()),
-            fresh_identity: false,
-            config: self.config.clone(),
+            fresh_identity: b.provider.identity_is_new(),
+            config: self.config.clone().set_preferred_url_v3(b.provider.server_used()),
         })
     }
 

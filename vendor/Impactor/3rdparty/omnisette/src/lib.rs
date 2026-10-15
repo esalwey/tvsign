@@ -62,6 +62,10 @@ pub enum AnisetteError {
     /// Apple's provisioning service (gsa.apple.com) answered HTTP `status` without a usable plist.
     #[error("Apple answered HTTP {status} to the anisette provisioning: {message}")]
     AppleRefused { status: u16, message: String },
+    /// The server announces a platform that Apple refuses (anything but Windows since 2026-10-12):
+    /// nothing is sent to Apple with its data.
+    #[error("anisette server not usable: {0}")]
+    UnsupportedServer(String),
     /// The provider cannot synchronize with a SIM (hsc 434).
     #[error("anisette resync is not supported by this provider")]
     ResyncUnsupported,
@@ -173,11 +177,31 @@ pub fn resolve_servers(requested: Option<&str>, fallback_override: Option<&str>)
     }
 }
 
+/// Servers to try, in order: the primary then the fallback, the one that served last (`preferred`)
+/// first.
+pub fn server_order(primary: &str, fallback: Option<&str>, preferred: Option<&str>) -> Vec<String> {
+    let mut order = vec![primary.to_string()];
+    if let Some(fallback) = fallback.filter(|f| *f != primary) {
+        order.push(fallback.to_string());
+    }
+    if let Some(preferred) = preferred
+        && let Some(position) = order.iter().position(|server| server == preferred)
+        && position > 0
+    {
+        let server = order.remove(position);
+        order.insert(0, server);
+    }
+    order
+}
+
 #[derive(Clone, Debug)]
 pub struct AnisetteConfiguration {
     anisette_url: String,
     anisette_url_v3: String,
     anisette_fallback_url_v3: Option<String>,
+    /// Server that produced the last data of the sign-in this configuration belongs to: tried first
+    /// from then on (see [`AnisetteConfiguration::set_preferred_url_v3`]).
+    anisette_preferred_url_v3: Option<String>,
     configuration_path: PathBuf,
     macos_serial: String,
 }
@@ -202,6 +226,7 @@ impl AnisetteConfiguration {
                 .unwrap_or_else(|| DEFAULT_ANISETTE_URL.to_string()),
             anisette_url_v3: servers.primary,
             anisette_fallback_url_v3: servers.fallback,
+            anisette_preferred_url_v3: None,
             configuration_path: PathBuf::new(),
             macos_serial: "0".to_string(),
         }
@@ -229,12 +254,47 @@ impl AnisetteConfiguration {
     pub fn set_anisette_url_v3(mut self, url: String) -> AnisetteConfiguration {
         self.anisette_url_v3 = url.trim_end_matches('/').to_string();
         self.anisette_fallback_url_v3 = None;
+        self.anisette_preferred_url_v3 = None;
         self
     }
 
     pub fn set_fallback_url_v3(mut self, url: Option<String>) -> AnisetteConfiguration {
         self.anisette_fallback_url_v3 = url;
         self
+    }
+
+    /// Anisette v3 server tried first: the one that served the previous data of the same sign-in, so
+    /// that a dead default server costs its connection timeout once, not at every refresh.
+    pub fn preferred_url_v3(&self) -> Option<&String> {
+        self.anisette_preferred_url_v3.as_ref()
+    }
+
+    pub fn set_preferred_url_v3(mut self, url: Option<String>) -> AnisetteConfiguration {
+        self.anisette_preferred_url_v3 = url;
+        self
+    }
+
+    /// The anisette v3 servers in the order they are tried.
+    pub fn servers_v3(&self) -> Vec<String> {
+        server_order(
+            &self.anisette_url_v3,
+            self.anisette_fallback_url_v3.as_deref(),
+            self.anisette_preferred_url_v3.as_deref(),
+        )
+    }
+
+    /// The other configured server is tried first from now on: Apple kept refusing the data of the
+    /// one that produced them. False (nothing changes) when there is no other server.
+    pub fn prefer_other_server_v3(&mut self) -> bool {
+        let order = self.servers_v3();
+        match order.get(1) {
+            Some(other) => {
+                log::warn!("Apple refuses the data of {}: trying {other} first from now on", order[0]);
+                self.anisette_preferred_url_v3 = Some(other.clone());
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn set_anisette_url(mut self, anisette_url: String) -> AnisetteConfiguration {
@@ -297,7 +357,8 @@ impl AnisetteHeaders {
                 configuration.configuration_path.clone(),
                 configuration.macos_serial.clone(),
             )
-            .with_fallback(configuration.anisette_fallback_url_v3),
+            .with_fallback(configuration.anisette_fallback_url_v3)
+            .with_preferred(configuration.anisette_preferred_url_v3),
         )));
     }
 
@@ -317,11 +378,11 @@ impl AnisetteHeaders {
     }
 }
 
-/// Forget the provisioning of the anisette identity (the identity itself is kept) so that the next
-/// request provisions it again. Used when Apple or the server says the provisioning is not valid.
+/// Forget the anisette identity (device identifier and provisioning) so that the next request makes
+/// and provisions a new one. Used when Apple or the server says the identity is not valid.
 #[cfg(feature = "remote-anisette-v3")]
-pub fn invalidate_provisioning(configuration_path: &std::path::Path) -> Result<(), AnisetteError> {
-    remote_anisette_v3::invalidate_provisioning(configuration_path)
+pub fn reset_identity(configuration_path: &std::path::Path) -> Result<(), AnisetteError> {
+    remote_anisette_v3::reset_identity(configuration_path)
 }
 
 #[cfg(test)]
@@ -390,6 +451,44 @@ mod server_tests {
         assert_eq!(s.primary, "https://anisette.example.org");
         assert_eq!(s.fallback, None);
         assert!(s.warnings.is_empty());
+    }
+
+    #[test]
+    fn the_server_that_served_last_goes_first() {
+        let p = "https://a.example";
+        let f = "https://b.example";
+        assert_eq!(server_order(p, Some(f), None), vec![p, f]);
+        assert_eq!(server_order(p, Some(f), Some(p)), vec![p, f]);
+        assert_eq!(server_order(p, Some(f), Some(f)), vec![f, p]);
+        // a server that is not configured is ignored
+        assert_eq!(server_order(p, Some(f), Some("https://c.example")), vec![p, f]);
+        assert_eq!(server_order(p, None, Some(f)), vec![p]);
+        assert_eq!(server_order(p, Some(p), None), vec![p]);
+    }
+
+    #[test]
+    fn the_other_server_goes_first_after_a_refusal() {
+        // (set explicitly: the default configuration reads the environment of whoever runs the tests)
+        let mut config = AnisetteConfiguration::default()
+            .set_anisette_url_v3(DEFAULT_ANISETTE_URL_V3.to_string())
+            .set_fallback_url_v3(Some(FALLBACK_ANISETTE_URL_V3.to_string()));
+        // default pair: primary first, then the fallback, then the primary again
+        assert_eq!(config.servers_v3(), vec![DEFAULT_ANISETTE_URL_V3, FALLBACK_ANISETTE_URL_V3]);
+        assert!(config.prefer_other_server_v3());
+        assert_eq!(config.servers_v3(), vec![FALLBACK_ANISETTE_URL_V3, DEFAULT_ANISETTE_URL_V3]);
+        assert_eq!(config.preferred_url_v3().map(String::as_str), Some(FALLBACK_ANISETTE_URL_V3));
+        assert!(config.prefer_other_server_v3());
+        assert_eq!(config.servers_v3(), vec![DEFAULT_ANISETTE_URL_V3, FALLBACK_ANISETTE_URL_V3]);
+
+        // a server chosen by the user has no other: nothing changes
+        let mut alone = AnisetteConfiguration::default().set_anisette_url_v3("https://own.example/".into());
+        assert!(!alone.prefer_other_server_v3());
+        assert_eq!(alone.servers_v3(), vec!["https://own.example"]);
+        assert!(alone.preferred_url_v3().is_none());
+
+        // choosing another server forgets the preference
+        let reset = config.set_anisette_url_v3("https://own.example".into());
+        assert!(reset.preferred_url_v3().is_none());
     }
 
     #[test]

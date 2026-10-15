@@ -130,7 +130,9 @@ pub async fn probe_gsa_init(
     legacy_user_agent: Option<&str>,
 ) -> Result<ProbeReport, Error> {
     std::fs::create_dir_all(&state_dir)?;
-    let mut provider = RemoteAnisetteProviderV3::new(server.to_string(), state_dir, "0".to_string());
+    // any platform: the point is to compare what Apple answers to each kind of server
+    let mut provider = RemoteAnisetteProviderV3::new(server.to_string(), state_dir, "0".to_string())
+        .allow_any_platform(true);
     let base_headers: HashMap<String, String> = provider.get_authentication_headers().await?;
     let server_ua = provider.user_agent().unwrap_or_else(|| DEFAULT_USER_AGENT.to_string());
     let user_agent = legacy_user_agent.map(str::to_owned).unwrap_or_else(|| server_ua.clone());

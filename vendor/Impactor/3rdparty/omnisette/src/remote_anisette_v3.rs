@@ -2,8 +2,9 @@
 //
 // tvsign: the default server serves Windows anisette (Apple refuses Android anisette since
 // 2026-10-12) with a fallback server, the client info AND the user agent of the server are kept,
-// the identity lives in its own state file, a server answer of -45061 provisions again, Apple's
-// synchronization request (hsc 434) is relayed to the server. See vendor/Impactor/PATCHES.md.
+// the identity lives in its own state file, a server answer of -45061 makes a new identity, Apple's
+// synchronization request (hsc 434) is relayed to the server, a server that does not serve Windows
+// is not used. See vendor/Impactor/PATCHES.md.
 // The protocol handling follows isideload (https://github.com/nab138/isideload, MIT).
 
 use std::{
@@ -11,7 +12,6 @@ use std::{
     fs,
     io::Cursor,
     path::{Path, PathBuf},
-    sync::Mutex,
     time::Duration,
 };
 
@@ -29,7 +29,7 @@ use std::fmt::Write;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
 
-use crate::{AnisetteError, anisette_headers_provider::AnisetteHeadersProvider};
+use crate::{AnisetteError, anisette_headers_provider::AnisetteHeadersProvider, server_order};
 
 /// File holding the anisette identity (device identifier + provisioning). The name changed with the
 /// Windows anisette: the Android identities kept in `state.plist` are useless to Apple now.
@@ -38,6 +38,47 @@ pub const STATE_FILE: &str = "anisette-state-windows.plist";
 pub const LEGACY_STATE_FILE: &str = "state.plist";
 
 const PROVISIONING_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// `X-Xcode-Version` of every request to GrandSlam (plume_core uses this value as well).
+pub const XCODE_VERSION: &str = "27.0 (27A5218g)";
+/// `X-Apple-App-Info` of every request to GrandSlam.
+const APP_INFO: &str = "com.apple.gs.xcode.auth";
+/// Apple's URL bag, which lists the two provisioning URLs.
+const LOOKUP_URL: &str = "https://gsa.apple.com/grandslam/GsService2/lookup";
+/// Client info of a Mac. The URL bag can depend on the client info it is asked with (isideload asks
+/// for it with this one every time, because an Android one got a wrong bag): it is the second chance
+/// when the bag asked with the server's own client info lacks the provisioning URLs.
+const URL_BAG_CLIENT_INFO: &str =
+    "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
+/// Environment variable that lets a server through whatever platform it announces (set it to `1`),
+/// for the day Apple accepts more than Windows.
+pub const ALLOW_ANY_PLATFORM_ENV: &str = "PLUMESIGN_ANISETTE_ALLOW_ANY_PLATFORM";
+
+thread_local! {
+    /// Where the calling thread asks for Apple's URL bag instead of `gsa.apple.com`: only the tests
+    /// of the sign-in set it, to point the provisioning at a local imitation of Apple.
+    static LOOKUP_URL_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Point the URL bag lookup of the calling thread at `url` (`None`: Apple again). For tests only.
+#[doc(hidden)]
+pub fn set_lookup_url_for_tests(url: Option<String>) {
+    LOOKUP_URL_OVERRIDE.with(|current| *current.borrow_mut() = url);
+}
+
+fn lookup_url() -> String {
+    LOOKUP_URL_OVERRIDE
+        .with(|url| url.borrow().clone())
+        .unwrap_or_else(|| LOOKUP_URL.to_string())
+}
+
+fn is_truthy(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| is_truthy(&value))
+}
 
 fn plist_to_string<T: serde::Serialize>(value: &T) -> Result<String, plist::Error> {
     plist_to_buf(value).map(|val| String::from_utf8(val).unwrap())
@@ -209,14 +250,18 @@ fn save_state(dir: &Path, state: &AnisetteState) -> Result<(), AnisetteError> {
     Ok(())
 }
 
-/// Forget the provisioning but keep the device identifier (see [`crate::invalidate_provisioning`]).
-pub fn invalidate_provisioning(dir: &Path) -> Result<(), AnisetteError> {
-    if !dir.join(STATE_FILE).exists() {
-        return Ok(());
+/// Forget the identity, device identifier included (see [`crate::reset_identity`]): the next request
+/// makes a new one and provisions it. A server that answers "not provisioned" (-45061) is not
+/// always willing to provision the same identifier again, a new one always starts clean.
+pub fn reset_identity(dir: &Path) -> Result<(), AnisetteError> {
+    for name in [STATE_FILE.to_string(), format!("{STATE_FILE}.tmp")] {
+        match fs::remove_file(dir.join(&name)) {
+            Ok(()) => info!("anisette identity {name} forgotten: a new one will be made"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
     }
-    let mut state = load_state(dir);
-    state.adi_pb = None;
-    save_state(dir, &state)
+    Ok(())
 }
 
 pub struct AnisetteClient {
@@ -346,23 +391,32 @@ impl AnisetteClient {
         &self.client_info
     }
 
-    /// Apple only accepts Windows anisette now, whatever a server announces about itself is
-    /// judged here (a Mac client info over Android data is refused as well).
+    /// Apple only accepts Windows anisette now. A server that announces anything else (Android
+    /// servers, which answer a Mac client info, included) is not used.
     pub fn serves_windows(&self) -> bool {
         self.client_info.client_info.contains("Windows")
     }
 
+    /// A request to Apple's provisioning service: the headers GrandSlam gets from a client (client
+    /// info and user agent of the server as a pair, Xcode version, app info, a connection that is
+    /// not kept), plus the identity. `client_info` is the server's own, except for the second URL
+    /// bag lookup.
     fn build_apple_request(
         &self,
         state: &AnisetteState,
         builder: RequestBuilder,
+        client_info: &str,
     ) -> RequestBuilder {
         let dt: DateTime<Utc> = Utc::now().round_subsecs(0);
 
         builder
-            .header("X-Mme-Client-Info", &self.client_info.client_info)
+            .header("X-Mme-Client-Info", client_info)
             .header("User-Agent", &self.client_info.user_agent)
             .header("Content-Type", "text/x-xml-plist")
+            .header("Accept", "text/x-xml-plist")
+            .header("X-Xcode-Version", XCODE_VERSION)
+            .header("X-Apple-App-Info", APP_INFO)
+            .header("Connection", "close")
             .header("X-Apple-I-MD-LU", encode_hex(&state.md_lu()))
             .header("X-Mme-Device-Id", state.device_id())
             .header("X-Apple-I-Client-Time", dt.format("%+").to_string())
@@ -446,14 +500,15 @@ impl AnisetteClient {
         }
     }
 
-    pub async fn provision(&self, state: &mut AnisetteState) -> Result<(), AnisetteError> {
-        debug!("Provisioning Anisette");
+    /// The two provisioning URLs from Apple's URL bag, asked with `client_info`.
+    async fn provisioning_urls(
+        &self,
+        state: &AnisetteState,
+        client_info: &str,
+    ) -> Result<(String, String), AnisetteError> {
         let http_client = make_reqwest()?;
         let resp = self
-            .build_apple_request(
-                &state,
-                http_client.get("https://gsa.apple.com/grandslam/GsService2/lookup"),
-            )
+            .build_apple_request(state, http_client.get(lookup_url()), client_info)
             .send()
             .await?;
         let bag = apple_dict(resp).await?;
@@ -461,8 +516,34 @@ impl AnisetteClient {
             .get("urls")
             .and_then(Value::as_dictionary)
             .ok_or_else(|| AnisetteError::ProvisioningFailed("Apple's URL bag has no urls".to_string()))?;
-        let start_provisioning_url = plist_string(urls, "midStartProvisioning")?;
-        let end_provisioning_url = plist_string(urls, "midFinishProvisioning")?;
+        Ok((
+            plist_string(urls, "midStartProvisioning")?,
+            plist_string(urls, "midFinishProvisioning")?,
+        ))
+    }
+
+    pub async fn provision(&self, state: &mut AnisetteState) -> Result<(), AnisetteError> {
+        debug!("Provisioning Anisette");
+        // The bag asked with the server's own client info (the one the rest of the sign-in uses) is
+        // tried first; a bag without the provisioning URLs, or an HTML refusal, gets one more try
+        // with the Mac client info that isideload sends every time.
+        let (start_provisioning_url, end_provisioning_url) = match self
+            .provisioning_urls(state, &self.client_info.client_info)
+            .await
+        {
+            Ok(urls) => urls,
+            Err(first @ (AnisetteError::ProvisioningFailed(_) | AnisetteError::AppleRefused { .. })) => {
+                warn!("Apple's URL bag is not usable ({first}): asking again with a Mac client info");
+                self.provisioning_urls(state, URL_BAG_CLIENT_INFO)
+                    .await
+                    .map_err(|second| {
+                        AnisetteError::ProvisioningFailed(format!(
+                            "{first}; asked again with a Mac client info: {second}"
+                        ))
+                    })?
+            }
+            Err(other) => return Err(other),
+        };
         debug!(
             "Got provisioning urls: {} and {}",
             start_provisioning_url, end_provisioning_url
@@ -548,7 +629,11 @@ impl AnisetteClient {
                             request: Dictionary::new(),
                         };
                         let resp = self
-                            .build_apple_request(state, http_client.post(start_provisioning_url))
+                            .build_apple_request(
+                                state,
+                                http_client.post(start_provisioning_url),
+                                &self.client_info.client_info,
+                            )
                             .body(plist_to_string(&body_data)?)
                             .send()
                             .await?;
@@ -571,7 +656,11 @@ impl AnisetteClient {
                             request: Dictionary::from_iter([("cpim", cpim)].into_iter()),
                         };
                         let resp = self
-                            .build_apple_request(state, http_client.post(end_provisioning_url))
+                            .build_apple_request(
+                                state,
+                                http_client.post(end_provisioning_url),
+                                &self.client_info.client_info,
+                            )
                             .body(plist_to_string(&body_data)?)
                             .send()
                             .await?;
@@ -632,36 +721,6 @@ impl AnisetteClient {
     }
 }
 
-/// Server that served the last request of this process: tried first next time, so a dead default
-/// server costs its connection timeout once, not at every refresh of the headers.
-static LAST_WORKING_SERVER: Mutex<Option<String>> = Mutex::new(None);
-
-fn remember_server(url: &str) {
-    if let Ok(mut last) = LAST_WORKING_SERVER.lock() {
-        *last = Some(url.to_string());
-    }
-}
-
-fn last_server() -> Option<String> {
-    LAST_WORKING_SERVER.lock().ok().and_then(|last| last.clone())
-}
-
-/// Servers to try, in order: the primary then the fallback, the one that worked last first.
-fn server_order(primary: &str, fallback: Option<&str>, last: Option<&str>) -> Vec<String> {
-    let mut order = vec![primary.to_string()];
-    if let Some(fallback) = fallback.filter(|f| *f != primary) {
-        order.push(fallback.to_string());
-    }
-    if let Some(last) = last
-        && let Some(position) = order.iter().position(|server| server == last)
-        && position > 0
-    {
-        let server = order.remove(position);
-        order.insert(0, server);
-    }
-    order
-}
-
 /// A failure that another server could fix (as opposed to a disk problem on this machine).
 fn is_server_problem(error: &AnisetteError) -> bool {
     !matches!(
@@ -673,11 +732,16 @@ fn is_server_problem(error: &AnisetteError) -> bool {
 pub struct RemoteAnisetteProviderV3 {
     client_url: String,
     fallback_url: Option<String>,
+    /// Server tried first (the one that served the previous data of the same sign-in).
+    preferred_url: Option<String>,
+    /// Server that produced the last headers.
+    served_by: Option<String>,
     client_info: Option<AnisetteClientInfo>,
     pub state: Option<AnisetteState>,
     configuration_path: PathBuf,
     serial: String,
     new_identity: bool,
+    allow_any_platform: bool,
 }
 
 impl RemoteAnisetteProviderV3 {
@@ -689,11 +753,14 @@ impl RemoteAnisetteProviderV3 {
         RemoteAnisetteProviderV3 {
             client_url: url,
             fallback_url: None,
+            preferred_url: None,
+            served_by: None,
             client_info: None,
             state: None,
             configuration_path,
             serial,
             new_identity: false,
+            allow_any_platform: false,
         }
     }
 
@@ -703,7 +770,21 @@ impl RemoteAnisetteProviderV3 {
         self
     }
 
-    /// Headers from one server: provisions the identity when needed, provisions it again when the
+    /// Server to try first: a dead default server costs its connection timeout once per sign-in,
+    /// not at every refresh of the headers.
+    pub fn with_preferred(mut self, preferred_url: Option<String>) -> RemoteAnisetteProviderV3 {
+        self.preferred_url = preferred_url;
+        self
+    }
+
+    /// Use a server that does not announce Windows anisette (a diagnostic, to compare what Apple
+    /// answers to each kind). The environment variable [`ALLOW_ANY_PLATFORM_ENV`] does the same.
+    pub fn allow_any_platform(mut self, allow: bool) -> RemoteAnisetteProviderV3 {
+        self.allow_any_platform = allow;
+        self
+    }
+
+    /// Headers from one server: provisions the identity when needed, makes a new one when the
     /// server says it is not valid (-45061), synchronizes first when a `sim` is given.
     async fn headers_from(
         &mut self,
@@ -712,10 +793,17 @@ impl RemoteAnisetteProviderV3 {
     ) -> Result<HashMap<String, String>, AnisetteError> {
         let client = AnisetteClient::new(server.to_string()).await?;
         if !client.serves_windows() {
-            warn!(
-                "{server} announces `{}`: only Windows anisette is accepted by Apple, expect an error (-80045, HTTP 503)",
+            // Whatever such a server produces, Apple answers -80045 or an HTML 503: do not send it
+            // there (every request to Apple counts against the account and the connection).
+            let message = format!(
+                "{server} announces `{}`: Apple only accepts Windows anisette since 2026-10-12 (use the default server, or one that serves Windows anisette)",
                 client.client_info().client_info
             );
+            if self.allow_any_platform || env_flag(ALLOW_ANY_PLATFORM_ENV) {
+                warn!("{message}: used anyway");
+            } else {
+                return Err(AnisetteError::UnsupportedServer(message));
+            }
         }
 
         if self.state.is_none() {
@@ -731,12 +819,16 @@ impl RemoteAnisetteProviderV3 {
         let data = match client.get_headers(state, sim).await {
             Ok(data) => data,
             Err(AnisetteError::AnisetteNotProvisioned) => {
-                warn!("{server} answered -45061 (identity not provisioned): provisioning again");
-                state.adi_pb = None;
+                // As isideload does: a new device identifier and a full provisioning, not the same
+                // identifier provisioned again (a server that lost track of it may refuse that).
+                warn!("{server} answered -45061 (identity not provisioned): making a new identity");
+                *state = AnisetteState::new();
                 client.provision(state).await?;
                 self.new_identity = true;
                 save_state(&self.configuration_path, state)?;
-                client.get_headers(state, sim).await?
+                // The synchronization data of Apple (`sim`) belonged to the identity that is gone:
+                // GrandSlam will ask the new one to synchronize by itself.
+                client.get_headers(state, None).await?
             }
             Err(e) => return Err(e),
         };
@@ -754,14 +846,14 @@ impl RemoteAnisetteProviderV3 {
         let order = server_order(
             &self.client_url,
             self.fallback_url.as_deref(),
-            last_server().as_deref(),
+            self.preferred_url.as_deref(),
         );
         let mut failures: Vec<String> = Vec::new();
         let mut first_error: Option<AnisetteError> = None;
         for server in order {
             match self.headers_from(&server, sim).await {
                 Ok(headers) => {
-                    remember_server(&server);
+                    self.served_by = Some(server);
                     return Ok(headers);
                 }
                 Err(e) if is_server_problem(&e) => {
@@ -801,6 +893,10 @@ impl AnisetteHeadersProvider for RemoteAnisetteProviderV3 {
 
     fn identity_is_new(&self) -> bool {
         self.new_identity
+    }
+
+    fn server_used(&self) -> Option<String> {
+        self.served_by.clone()
     }
 }
 
@@ -846,18 +942,6 @@ mod tests {
     }
 
     #[test]
-    fn servers_are_tried_in_order_with_the_last_good_one_first() {
-        let p = "https://a.example";
-        let f = "https://b.example";
-        assert_eq!(server_order(p, Some(f), None), vec![p, f]);
-        assert_eq!(server_order(p, Some(f), Some(p)), vec![p, f]);
-        assert_eq!(server_order(p, Some(f), Some(f)), vec![f, p]);
-        assert_eq!(server_order(p, Some(f), Some("https://c.example")), vec![p, f]);
-        assert_eq!(server_order(p, None, Some(f)), vec![p]);
-        assert_eq!(server_order(p, Some(p), None), vec![p]);
-    }
-
-    #[test]
     fn disk_problems_do_not_trigger_the_fallback() {
         assert!(is_server_problem(&AnisetteError::ServerError("x".into())));
         assert!(is_server_problem(&AnisetteError::ProvisioningFailed("x".into())));
@@ -883,10 +967,14 @@ mod tests {
         assert_eq!(loaded.keychain_identifier, state.keychain_identifier);
         assert_eq!(loaded.adi_pb, Some(vec![1, 2, 3]));
 
-        invalidate_provisioning(&dir).unwrap();
+        // forgetting the identity takes the identifier with it, and does not mind a second time
+        reset_identity(&dir).unwrap();
+        assert!(!dir.join(STATE_FILE).exists());
         let loaded = load_state(&dir);
-        assert_eq!(loaded.keychain_identifier, state.keychain_identifier);
+        assert_ne!(loaded.keychain_identifier, state.keychain_identifier);
         assert!(!loaded.is_provisioned());
+        reset_identity(&dir).unwrap();
+        reset_identity(&dir.join("never-existed")).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1095,8 +1183,8 @@ mod tests {
         assert_eq!(count(&fallback_seen, "/v3/client_info"), 1);
         assert_eq!(count(&fallback_seen, "/v3/get_headers"), 1);
         assert_eq!(count(&primary_seen, "/v3/get_headers"), 0);
-        // the server that worked is remembered: the next provider of this process starts with it
-        assert_eq!(last_server().as_deref(), Some(fallback.as_str()));
+        // the server that worked is reported, to be tried first by the next refresh of the sign-in
+        assert_eq!(provider.server_used().as_deref(), Some(fallback.as_str()));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1143,5 +1231,429 @@ mod tests {
         let error = run(provider.get_authentication_headers()).unwrap_err();
         assert!(matches!(&error, AnisetteError::ServerError(m) if m.contains("busy")), "{error}");
         fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+/// The provisioning and the choice of a server against a local imitation of the anisette server
+/// (HTTP and the provisioning socket) and of Apple's provisioning service: no Apple, no Internet.
+#[cfg(test)]
+mod provisioning_tests {
+    use super::*;
+    use crate::anisette_headers_provider::AnisetteHeadersProvider;
+    use std::io::{BufRead, BufReader, Read, Write as IoWrite};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+    use tokio_tungstenite::tungstenite;
+
+    const WINDOWS: &str =
+        "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iTunes/12.12.4.1)>";
+    const MAC: &str = "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
+    const USER_AGENT: &str = "akd/1.0 CFNetwork/808.1.4";
+    const HEADERS: &str = r#"{"result":"Headers","X-Apple-I-MD-M":"machine","X-Apple-I-MD":"otp","X-Apple-I-MD-RINFO":"17106176"}"#;
+    const NOT_PROVISIONED: &str = r#"{"result":"GetHeadersError","message":"ADI error -45061 (not provisioned)"}"#;
+
+    #[derive(Clone, Debug)]
+    struct Seen {
+        path: String,
+        headers: HashMap<String, String>,
+        /// Names of the headers as they came (a header sent twice shows twice).
+        header_names: Vec<String>,
+        body: String,
+    }
+
+    /// What the imitation says.
+    struct Script {
+        client_info: &'static str,
+        /// X-Mme-Client-Info values for which Apple's URL bag lists the provisioning URLs
+        bag_lists_urls: fn(&str) -> bool,
+        /// (HTTP status, JSON) of the n-th (from 0) /v3/get_headers
+        get_headers: fn(usize) -> (u16, &'static str),
+    }
+
+    impl Script {
+        fn windows() -> Script {
+            Script {
+                client_info: WINDOWS,
+                bag_lists_urls: |_| true,
+                get_headers: |_| (200, HEADERS),
+            }
+        }
+    }
+
+    struct Mock {
+        url: String,
+        seen: Arc<Mutex<Vec<Seen>>>,
+        /// Identifiers (base64) given on the provisioning socket.
+        identifiers: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Mock {
+        fn requests(&self, path: &str) -> Vec<Seen> {
+            self.seen.lock().unwrap().iter().filter(|r| r.path == path).cloned().collect()
+        }
+
+        fn lookup(&self) -> String {
+            format!("{}/apple/lookup", self.url)
+        }
+    }
+
+    fn serve(script: Script) -> Mock {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let mock = Mock {
+            url: url.clone(),
+            seen: Arc::new(Mutex::new(Vec::new())),
+            identifiers: Arc::new(Mutex::new(Vec::new())),
+        };
+        let script = Arc::new(script);
+        let (seen, identifiers) = (mock.seen.clone(), mock.identifiers.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let (script, seen, identifiers, url) =
+                    (script.clone(), seen.clone(), identifiers.clone(), url.clone());
+                std::thread::spawn(move || handle(stream, &script, &seen, &identifiers, &url));
+            }
+        });
+        mock
+    }
+
+    fn handle(
+        mut stream: TcpStream,
+        script: &Script,
+        seen: &Mutex<Vec<Seen>>,
+        identifiers: &Mutex<Vec<String>>,
+        url: &str,
+    ) {
+        // the provisioning socket is left to tungstenite, request line included
+        let mut start = [0u8; 40];
+        let peeked = stream.peek(&mut start).unwrap_or(0);
+        if start[..peeked].starts_with(b"GET /v3/provisioning_session") {
+            provisioning_socket(stream, identifiers);
+            return;
+        }
+
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+            return;
+        }
+        let path = request_line.split_whitespace().nth(1).unwrap_or("").to_string();
+        let mut headers = HashMap::new();
+        let mut header_names = Vec::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                header_names.push(name.trim().to_ascii_lowercase());
+                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+            }
+        }
+        let length = headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0usize);
+        let mut body = vec![0u8; length];
+        let _ = reader.read_exact(&mut body);
+        let body = String::from_utf8_lossy(&body).to_string();
+
+        let earlier = seen.lock().unwrap().iter().filter(|r| r.path == path).count();
+        let client_info = headers.get("x-mme-client-info").cloned().unwrap_or_default();
+        seen.lock().unwrap().push(Seen { path: path.clone(), headers, header_names, body });
+
+        let plist = |inner: &str| {
+            format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict>{inner}</dict></plist>")
+        };
+        let (status, answer) = match path.as_str() {
+            "/v3/client_info" => (
+                200,
+                format!(r#"{{"client_info":"{}","user_agent":"{USER_AGENT}"}}"#, script.client_info),
+            ),
+            "/v3/get_headers" => {
+                let (status, json) = (script.get_headers)(earlier);
+                (status, json.to_string())
+            }
+            "/apple/lookup" if (script.bag_lists_urls)(&client_info) => (
+                200,
+                plist(&format!(
+                    "<key>urls</key><dict><key>midStartProvisioning</key><string>{url}/apple/start</string><key>midFinishProvisioning</key><string>{url}/apple/finish</string></dict>"
+                )),
+            ),
+            "/apple/lookup" => (200, plist("<key>urls</key><dict></dict>")),
+            "/apple/start" => (200, plist("<key>Response</key><dict><key>spim</key><string>c3BpbQ==</string></dict>")),
+            "/apple/finish" => (
+                200,
+                plist("<key>Response</key><dict><key>ptm</key><string>cHRt</string><key>tk</key><string>dGs=</string></dict>"),
+            ),
+            _ => (404, "404 page not found".to_string()),
+        };
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {status} X\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+            answer.len()
+        );
+    }
+
+    /// What the anisette server says on its provisioning socket, whatever Apple answers.
+    fn provisioning_socket(stream: TcpStream, identifiers: &Mutex<Vec<String>>) {
+        let text = |json: &str| tungstenite::Message::Text(json.to_string().into());
+        let mut socket = tungstenite::accept(stream).unwrap();
+        socket.send(text(r#"{"result":"GiveIdentifier"}"#)).unwrap();
+        let reply: serde_json::Value = serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+        identifiers.lock().unwrap().push(reply["identifier"].as_str().unwrap().to_string());
+        socket.send(text(r#"{"result":"GiveStartProvisioningData"}"#)).unwrap();
+        let reply: serde_json::Value = serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(reply["spim"], "c3BpbQ==");
+        socket.send(text(r#"{"result":"GiveEndProvisioningData","cpim":"Y3BpbQ=="}"#)).unwrap();
+        let reply: serde_json::Value = serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!((reply["ptm"].as_str(), reply["tk"].as_str()), (Some("cHRt"), Some("dGs=")));
+        socket
+            .send(text(&format!(
+                r#"{{"result":"ProvisioningSuccess","adi_pb":"{}"}}"#,
+                base64_encode(b"adi-provisioned")
+            )))
+            .unwrap();
+        let _ = socket.read();
+    }
+
+    /// Points the URL bag lookup of this thread at the imitation of Apple.
+    struct LookupOverride;
+
+    impl LookupOverride {
+        fn to(mock: &Mock) -> LookupOverride {
+            set_lookup_url_for_tests(Some(mock.lookup()));
+            LookupOverride
+        }
+    }
+
+    impl Drop for LookupOverride {
+        fn drop(&mut self) {
+            set_lookup_url_for_tests(None);
+        }
+    }
+
+    fn run<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    fn new_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("omnisette-provisioning-{}", rand::random::<u64>()))
+    }
+
+    /// A directory holding an identity that is provisioned already.
+    fn provisioned_dir() -> (PathBuf, AnisetteState) {
+        let dir = new_dir();
+        let state = AnisetteState {
+            keychain_identifier: [9; 16],
+            adi_pb: Some(vec![1, 2, 3]),
+        };
+        save_state(&dir, &state).unwrap();
+        (dir, state)
+    }
+
+    fn json(text: &str) -> serde_json::Value {
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn provisioning_requests_carry_the_headers_of_a_client() {
+        let mock = serve(Script::windows());
+        let _apple = LookupOverride::to(&mock);
+        let dir = new_dir();
+        let mut provider = RemoteAnisetteProviderV3::new(mock.url.clone(), dir.clone(), "0".to_string());
+        let headers = run(provider.get_authentication_headers()).unwrap();
+        assert_eq!(headers["X-Apple-I-MD"], "otp");
+        assert!(provider.identity_is_new());
+
+        for path in ["/apple/lookup", "/apple/start", "/apple/finish"] {
+            let requests = mock.requests(path);
+            assert_eq!(requests.len(), 1, "{path}");
+            let h = &requests[0].headers;
+            // the pair Apple compares, the same set a sign-in sends, and the identity
+            assert_eq!(h["x-mme-client-info"], WINDOWS, "{path}");
+            assert_eq!(h["user-agent"], USER_AGENT, "{path}");
+            assert_eq!(h["content-type"], "text/x-xml-plist", "{path}");
+            assert_eq!(h["accept"], "text/x-xml-plist", "{path}");
+            assert_eq!(h["x-xcode-version"], XCODE_VERSION, "{path}");
+            assert_eq!(h["x-apple-app-info"], "com.apple.gs.xcode.auth", "{path}");
+            assert_eq!(h["connection"], "close", "{path}");
+            assert_eq!(h["x-apple-i-md-lu"].len(), 64, "{path}");
+            assert_eq!(h["x-mme-device-id"].len(), 36, "{path}");
+        }
+
+        // the identity that went through the provisioning is the one that was saved
+        let saved = load_state(&dir);
+        assert!(saved.is_provisioned());
+        assert_eq!(*mock.identifiers.lock().unwrap(), vec![base64_encode(&saved.keychain_identifier)]);
+        assert_eq!(
+            mock.requests("/apple/start")[0].headers["x-mme-device-id"],
+            saved.device_id()
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_bag_without_the_urls_is_asked_again_with_a_mac_client_info() {
+        let mock = serve(Script {
+            bag_lists_urls: |client_info| client_info.contains("Mac15,7"),
+            ..Script::windows()
+        });
+        let _apple = LookupOverride::to(&mock);
+        let dir = new_dir();
+        let mut provider = RemoteAnisetteProviderV3::new(mock.url.clone(), dir.clone(), "0".to_string());
+        run(provider.get_authentication_headers()).unwrap();
+
+        let lookups = mock.requests("/apple/lookup");
+        assert_eq!(lookups.len(), 2);
+        assert_eq!(lookups[0].headers["x-mme-client-info"], WINDOWS);
+        assert_eq!(lookups[1].headers["x-mme-client-info"], URL_BAG_CLIENT_INFO);
+        // the Mac client info is for the bag only: the provisioning itself is a Windows one
+        for path in ["/apple/start", "/apple/finish"] {
+            assert_eq!(mock.requests(path)[0].headers["x-mme-client-info"], WINDOWS, "{path}");
+        }
+        // one client info header each time, not the server's and the Mac's together
+        for lookup in &lookups {
+            assert_eq!(lookup.header_names.iter().filter(|n| *n == "x-mme-client-info").count(), 1);
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_bag_that_never_lists_the_urls_is_an_error_after_two_tries() {
+        let mock = serve(Script {
+            bag_lists_urls: |_| false,
+            ..Script::windows()
+        });
+        let _apple = LookupOverride::to(&mock);
+        let dir = new_dir();
+        let mut provider = RemoteAnisetteProviderV3::new(mock.url.clone(), dir.clone(), "0".to_string());
+        let error = run(provider.get_authentication_headers()).unwrap_err().to_string();
+        assert!(error.contains("midStartProvisioning") && error.contains("Mac client info"), "{error}");
+        assert_eq!(mock.requests("/apple/lookup").len(), 2);
+        assert!(mock.requests("/apple/start").is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_server_that_lost_the_identity_gets_a_new_one_without_the_old_sim() {
+        let mock = serve(Script {
+            get_headers: |n| if n == 0 { (500, NOT_PROVISIONED) } else { (200, HEADERS) },
+            ..Script::windows()
+        });
+        let _apple = LookupOverride::to(&mock);
+        let (dir, old) = provisioned_dir();
+        let mut provider = RemoteAnisetteProviderV3::new(mock.url.clone(), dir.clone(), "0".to_string());
+        let headers = run(provider.resync_anisette_headers("SIM")).unwrap();
+        assert_eq!(headers["X-Apple-I-MD"], "otp");
+
+        let asked = mock.requests("/v3/get_headers");
+        assert_eq!(asked.len(), 2);
+        let (first, second) = (json(&asked[0].body), json(&asked[1].body));
+        // first the old identity, with the synchronization data of Apple...
+        assert_eq!(first["identifier"], base64_encode(&old.keychain_identifier));
+        assert_eq!(first["sim"], "SIM");
+        // ... then a new identity, provisioned from scratch, without them (they belonged to the old one)
+        assert_ne!(second["identifier"], first["identifier"]);
+        assert!(second.get("sim").is_none() && second.get("md_lu").is_none());
+        assert_eq!(*mock.identifiers.lock().unwrap(), vec![second["identifier"].as_str().unwrap().to_string()]);
+        assert_ne!(second["adi_pb"], first["adi_pb"]);
+        assert!(provider.identity_is_new());
+
+        let saved = load_state(&dir);
+        assert_eq!(base64_encode(&saved.keychain_identifier), second["identifier"].as_str().unwrap());
+        assert_eq!(saved.adi_pb, Some(b"adi-provisioned".to_vec()));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_server_that_keeps_saying_not_provisioned_is_asked_once_more_and_no_more() {
+        let mock = serve(Script {
+            get_headers: |_| (500, NOT_PROVISIONED),
+            ..Script::windows()
+        });
+        let _apple = LookupOverride::to(&mock);
+        let (dir, _) = provisioned_dir();
+        let mut provider = RemoteAnisetteProviderV3::new(mock.url.clone(), dir.clone(), "0".to_string());
+        let error = run(provider.get_authentication_headers()).unwrap_err();
+        assert!(matches!(error, AnisetteError::AnisetteNotProvisioned), "{error}");
+        assert_eq!(mock.requests("/v3/get_headers").len(), 2);
+        assert_eq!(mock.identifiers.lock().unwrap().len(), 1, "one provisioning, no loop");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_server_that_is_not_windows_is_not_used_and_nothing_is_sent_to_apple() {
+        let mock = serve(Script {
+            client_info: MAC,
+            ..Script::windows()
+        });
+        let _apple = LookupOverride::to(&mock);
+        let (dir, _) = provisioned_dir();
+        let mut provider = RemoteAnisetteProviderV3::new(mock.url.clone(), dir.clone(), "0".to_string());
+        let error = run(provider.get_authentication_headers()).unwrap_err();
+        assert!(matches!(error, AnisetteError::UnsupportedServer(_)), "{error}");
+        let text = error.to_string();
+        assert!(text.contains("only accepts Windows anisette") && text.contains("macOS"), "{text}");
+        assert!(mock.requests("/v3/get_headers").is_empty());
+        assert!(mock.requests("/apple/lookup").is_empty());
+
+        // the diagnostic tool compares what Apple answers to each kind of server
+        let mut anyway = RemoteAnisetteProviderV3::new(mock.url.clone(), dir.clone(), "0".to_string())
+            .allow_any_platform(true);
+        let headers = run(anyway.get_authentication_headers()).unwrap();
+        assert_eq!(headers["X-Mme-Client-Info"], MAC);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_server_that_is_not_windows_gives_way_to_the_fallback() {
+        let android = serve(Script {
+            client_info: MAC,
+            ..Script::windows()
+        });
+        let windows = serve(Script::windows());
+        let (dir, _) = provisioned_dir();
+        let mut provider = RemoteAnisetteProviderV3::new(android.url.clone(), dir.clone(), "0".to_string())
+            .with_fallback(Some(windows.url.clone()));
+        run(provider.get_authentication_headers()).unwrap();
+        assert_eq!(provider.server_used().as_deref(), Some(windows.url.as_str()));
+        assert!(android.requests("/v3/get_headers").is_empty());
+        assert_eq!(windows.requests("/v3/get_headers").len(), 1);
+
+        // a sign-in that went through the fallback asks it first from then on
+        let mut next = RemoteAnisetteProviderV3::new(android.url.clone(), dir.clone(), "0".to_string())
+            .with_fallback(Some(windows.url.clone()))
+            .with_preferred(provider.server_used());
+        run(next.get_authentication_headers()).unwrap();
+        assert_eq!(android.requests("/v3/client_info").len(), 1, "the first provider asked it, the next did not");
+        assert_eq!(windows.requests("/v3/get_headers").len(), 2);
+
+        // both unusable: one error that names them both
+        let other = serve(Script {
+            client_info: MAC,
+            ..Script::windows()
+        });
+        let mut hopeless = RemoteAnisetteProviderV3::new(android.url.clone(), dir.clone(), "0".to_string())
+            .with_fallback(Some(other.url.clone()));
+        let error = run(hopeless.get_authentication_headers()).unwrap_err();
+        let AnisetteError::AllServersFailed(text) = &error else {
+            panic!("{error}")
+        };
+        assert!(text.contains(&android.url) && text.contains(&other.url), "{text}");
+        assert!(text.contains("only accepts Windows anisette"), "{text}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_override_flag_is_read_like_the_other_flags() {
+        for yes in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(is_truthy(yes), "{yes}");
+        }
+        for no in ["", "0", "false", "no", "off", "2"] {
+            assert!(!is_truthy(no), "{no}");
+        }
     }
 }

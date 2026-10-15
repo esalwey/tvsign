@@ -16,22 +16,30 @@ use srp::ClientVerifier;
 
 use crate::Error;
 
-/// Retries of a GrandSlam request that was shed (HTTP 429/502/503/504), after the first try.
-const GSA_RETRIES: u32 = 3;
-
-/// The edge in front of GrandSlam answers `503 Service Temporarily Unavailable` (HTML) to requests it
-/// refuses: anisette data or a client info it does not accept, but also, in bursts, perfectly
-/// good requests while the shared anisette machines are busy. 429 asks to slow down.
-pub(crate) fn is_retryable_status(status: u16) -> bool {
-    matches!(status, 429 | 502 | 503 | 504)
+/// Retries of a GrandSlam request that was shed, after the first try: 429 asks to slow down (the
+/// answer to wait and try again, three times at most); the edge in front of GrandSlam answers
+/// `503 Service Temporarily Unavailable` (HTML) to requests it refuses (anisette data or a client
+/// info it does not accept) but also, in bursts, to good ones. A refusal gives the same page every
+/// time, so a 502/503/504 gets one more chance only: more tries would just be more requests to Apple.
+pub(crate) fn retries_for(status: u16) -> u32 {
+    match status {
+        429 => 3,
+        502 | 503 | 504 => 1,
+        _ => 0,
+    }
 }
 
-/// Pause before retry number `attempt` (0 for the first retry): 2 s, 4 s, 6 s.
-pub(crate) fn retry_delay(attempt: u32) -> Duration {
-    Duration::from_secs(2 * (u64::from(attempt) + 1))
+/// Pause before retry number `attempt` (0 for the first retry) when the answer gives no
+/// `Retry-After`: 2 s, 4 s, 6 s after a 429, 3 s after a 5xx.
+pub(crate) fn retry_delay(status: u16, attempt: u32) -> Duration {
+    if status == 429 {
+        Duration::from_secs(2 * (u64::from(attempt) + 1))
+    } else {
+        Duration::from_secs(3)
+    }
 }
 
-/// Send a GrandSlam request, trying again a few times when the answer says "not now".
+/// Send a GrandSlam request, trying again when the answer says "not now" (see [`retries_for`]).
 /// `make` builds the request anew for each try. A server that keeps refusing is reported by the
 /// caller from the last answer.
 pub(crate) async fn send_with_retry(
@@ -41,7 +49,8 @@ pub(crate) async fn send_with_retry(
     loop {
         let res = make().send().await?;
         let status = res.status().as_u16();
-        if !is_retryable_status(status) || attempt >= GSA_RETRIES {
+        let retries = retries_for(status);
+        if attempt >= retries {
             return Ok(res);
         }
         let wait = res
@@ -50,10 +59,10 @@ pub(crate) async fn send_with_retry(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(|secs| Duration::from_secs(secs.min(30)))
-            .unwrap_or_else(|| retry_delay(attempt));
+            .unwrap_or_else(|| retry_delay(status, attempt));
         // worded so that it is not taken for the final refusal when something else fails later
         log::warn!(
-            "GrandSlam is busy (HTTP {status}): trying again in {} s ({}/{GSA_RETRIES})",
+            "GrandSlam is busy (HTTP {status}): trying again in {} s ({}/{retries})",
             wait.as_secs(),
             attempt + 1
         );
@@ -182,17 +191,20 @@ mod tests {
     #[test]
     fn shed_requests_are_retried_refusals_are_not() {
         for status in [429, 502, 503, 504] {
-            assert!(is_retryable_status(status), "{status}");
+            assert!(retries_for(status) > 0, "{status}");
         }
         for status in [200, 201, 400, 401, 403, 404, 409, 412, 500] {
-            assert!(!is_retryable_status(status), "{status}");
+            assert_eq!(retries_for(status), 0, "{status}");
         }
-        assert_eq!(retry_delay(0), Duration::from_secs(2));
-        assert_eq!(retry_delay(1), Duration::from_secs(4));
-        assert_eq!(retry_delay(2), Duration::from_secs(6));
-        // at most 2 + 4 + 6 s of waiting in total
-        let total: u64 = (0..GSA_RETRIES).map(|a| retry_delay(a).as_secs()).sum();
-        assert_eq!(total, 12);
+        // 429 asks to slow down: three more tries, 2 s, 4 s, 6 s; a 5xx gets one, after 3 s
+        assert_eq!(retries_for(429), 3);
+        assert_eq!(retry_delay(429, 0), Duration::from_secs(2));
+        assert_eq!(retry_delay(429, 1), Duration::from_secs(4));
+        assert_eq!(retry_delay(429, 2), Duration::from_secs(6));
+        for status in [502, 503, 504] {
+            assert_eq!(retries_for(status), 1, "{status}");
+            assert_eq!(retry_delay(status, 0), Duration::from_secs(3));
+        }
     }
 
     /// Local HTTP server answering with `statuses` in turn (the last one repeats), `Retry-After: 0`
@@ -237,8 +249,14 @@ mod tests {
     #[test]
     fn a_shed_request_is_sent_again_until_it_goes_through() {
         use std::sync::atomic::Ordering;
-        let (url, hits) = serve(vec![503, 503, 200]);
         let client = reqwest::Client::new();
+        // a 5xx burst: one more try
+        let (url, hits) = serve(vec![503, 200]);
+        let res = block_on(send_with_retry(|| client.get(&url))).unwrap();
+        assert_eq!(res.status().as_u16(), 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        // a 429: more patience
+        let (url, hits) = serve(vec![429, 429, 200]);
         let res = block_on(send_with_retry(|| client.get(&url))).unwrap();
         assert_eq!(res.status().as_u16(), 200);
         assert_eq!(hits.load(Ordering::SeqCst), 3);
@@ -247,11 +265,18 @@ mod tests {
     #[test]
     fn a_refusal_that_lasts_is_reported_after_the_last_try() {
         use std::sync::atomic::Ordering;
-        let (url, hits) = serve(vec![503]);
         let client = reqwest::Client::new();
+        // a refusal of the data gives the same page again: one try more, no more
+        for status in [502, 503, 504] {
+            let (url, hits) = serve(vec![status]);
+            let res = block_on(send_with_retry(|| client.get(&url))).unwrap();
+            assert_eq!(res.status().as_u16(), status);
+            assert_eq!(hits.load(Ordering::SeqCst), 2, "{status}");
+        }
+        let (url, hits) = serve(vec![429]);
         let res = block_on(send_with_retry(|| client.get(&url))).unwrap();
-        assert_eq!(res.status().as_u16(), 503);
-        assert_eq!(hits.load(Ordering::SeqCst), 1 + GSA_RETRIES as usize);
+        assert_eq!(res.status().as_u16(), 429);
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
     }
 
     #[test]

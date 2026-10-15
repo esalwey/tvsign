@@ -45,6 +45,8 @@ macro_rules! plist_get_string {
     }};
 }
 
+/// `init` requests after which the answer is taken as it is, whatever it asks for.
+const MAX_INIT_REQUESTS: u8 = 4;
 /// Steps (2FA prompts, new logins) after which a conversation that does not end is given up.
 const MAX_LOGIN_STEPS: u8 = 15;
 /// Prompts for a code after which Apple is considered to be asking in a loop (a code that was
@@ -90,6 +92,83 @@ pub(crate) fn state_after_complete(status: &Dictionary) -> LoginState {
     LoginState::LoggedIn
 }
 
+/// What the sign-in does with an answer to its `init` request before reading it as the login.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InitStep {
+    /// Apple asks the anisette identity to synchronize (hsc 434): `sim` goes to the anisette server.
+    Resync(String),
+    /// Apple does not know the provisioning (-45061): make a new identity and provision it.
+    Reprovision,
+    /// Nothing to do first: this is the answer.
+    Proceed,
+}
+
+/// The budget of the `init` step. Each correction is allowed once per anisette identity (a new
+/// identity has never been seen by Apple, so it needs its own synchronization), and the request is
+/// sent [`MAX_INIT_REQUESTS`] times at most: no answer of Apple can make the sign-in loop.
+pub(crate) struct InitPlan {
+    sent: u8,
+    can_resync: bool,
+    can_reprovision: bool,
+    can_switch_server: bool,
+}
+
+impl InitPlan {
+    pub(crate) fn new() -> InitPlan {
+        InitPlan {
+            sent: 0,
+            can_resync: true,
+            can_reprovision: true,
+            can_switch_server: true,
+        }
+    }
+
+    /// An `init` request is about to be sent.
+    pub(crate) fn request_sent(&mut self) {
+        self.sent = self.sent.saturating_add(1);
+    }
+
+    fn exhausted(&self) -> bool {
+        self.sent >= MAX_INIT_REQUESTS
+    }
+
+    /// What the answer to the request that was just sent asks for.
+    pub(crate) fn after_answer(&mut self, answer: &Dictionary) -> InitStep {
+        if self.exhausted() {
+            return InitStep::Proceed;
+        }
+        if self.can_resync
+            && let Some(sim) = resync_sim(answer)
+        {
+            self.can_resync = false;
+            return InitStep::Resync(sim);
+        }
+        if self.can_reprovision
+            && matches!(check_error(answer), Err(Error::AuthSrpWithMessage(-45061, _)))
+        {
+            self.can_reprovision = false;
+            return InitStep::Reprovision;
+        }
+        InitStep::Proceed
+    }
+
+    /// The request got no usable answer, only an HTML 503 (after the retries): may the data of the
+    /// other anisette server be tried? Once.
+    pub(crate) fn may_switch_server(&mut self) -> bool {
+        if self.exhausted() || !self.can_switch_server {
+            return false;
+        }
+        self.can_switch_server = false;
+        true
+    }
+
+    /// The anisette data now belong to an identity Apple has not seen: it will ask it to
+    /// synchronize as well.
+    pub(crate) fn identity_replaced(&mut self) {
+        self.can_resync = true;
+    }
+}
+
 /// The "init" request of the SRP login: sends the public ephemeral and the anisette data.
 async fn send_init(
     client: &Client,
@@ -131,11 +210,11 @@ async fn send_init(
 impl AnisetteData {
     /// An anisette identity that was just provisioned has never been seen by Apple: its first
     /// GrandSlam request is answered with hsc 434 and the data to synchronize with. A sign-in does
-    /// that on its own; the stored sessions of a renewal never talk to GrandSlam, so this asks once
-    /// with a throwaway Apple ID (no account is touched) and synchronizes, so that the first request
-    /// to the developer portal carries data Apple has already seen. Best effort: the caller keeps
-    /// its data when this fails.
-    pub async fn synchronize_with_apple(&self) -> Result<AnisetteData, Error> {
+    /// that on its own; the stored sessions of a renewal never talk to GrandSlam. When the developer
+    /// portal refuses the data of a fresh identity, this asks GrandSlam once with a throwaway Apple
+    /// ID (no account is touched) and synchronizes. `None` when Apple did not ask for a
+    /// synchronization (it knows the identity already).
+    pub async fn synchronize_with_apple(&self) -> Result<Option<AnisetteData>, Error> {
         let client = crate::client()?;
         let username = format!("tvsign-sync-{:016x}@example.invalid", rand::random::<u64>());
         let srp_client = srp::Client::<G2048, Sha256>::new_with_options(false);
@@ -146,9 +225,9 @@ impl AnisetteData {
         match resync_sim(&res) {
             Some(sim) => {
                 log::info!("Apple asked the new anisette identity to synchronize");
-                self.resync(&sim).await
+                self.resync(&sim).await.map(Some)
             }
-            None => Ok(self.clone()),
+            None => Ok(None),
         }
     }
 }
@@ -309,28 +388,51 @@ impl Account {
             version: "1.0.1".to_string(),
         };
 
-        // The first answer may ask for something before the login proper: hsc 434 (synchronize the
-        // anisette identity with Apple, once) or -45061 (the provisioning is not valid: provision
-        // again, once).
-        let mut resynced = false;
-        let mut reprovisioned = false;
+        // The first answers may ask for something before the login proper: hsc 434 (synchronize the
+        // anisette identity with Apple), -45061 (the provisioning is not valid: make a new
+        // identity), or only a 503 page, which is how Apple refuses the data of an anisette server
+        // (try the other server). Each once per identity, and never more than MAX_INIT_REQUESTS
+        // requests.
+        let mut plan = InitPlan::new();
         let res = loop {
-            let res = send_init(&self.client, &anisette, &a_pub, &username_for_spd).await?;
-            if !resynced && let Some(sim) = resync_sim(&res) {
-                resynced = true;
-                log::info!("Apple asks the anisette identity to synchronize (hsc 434)");
-                anisette = self.resync_anisette(&sim).await?;
-                continue;
-            }
-            match check_error(&res) {
-                Err(Error::AuthSrpWithMessage(-45061, _)) if !reprovisioned => {
-                    reprovisioned = true;
-                    log::warn!("Apple answered -45061: provisioning the anisette identity again");
-                    anisette = self.reprovision_anisette().await?;
+            plan.request_sent();
+            let answer = match send_init(&self.client, &anisette, &a_pub, &username_for_spd).await {
+                Ok(answer) => answer,
+                Err(error @ Error::GsaHttp { status: 503, .. }) if plan.may_switch_server() => {
+                    match self.switch_anisette_server().await {
+                        Ok(Some(fresh)) => {
+                            anisette = fresh;
+                            if anisette.fresh_identity {
+                                plan.identity_replaced();
+                            }
+                            continue;
+                        }
+                        Ok(None) => return Err(error),
+                        Err(e) => {
+                            log::warn!("the other anisette server cannot be used either: {e}");
+                            return Err(error);
+                        }
+                    }
                 }
-                other => {
-                    other?;
-                    break res;
+                Err(error) => return Err(error),
+            };
+            match plan.after_answer(&answer) {
+                InitStep::Resync(sim) => {
+                    log::info!("Apple asks the anisette identity to synchronize (hsc 434)");
+                    anisette = self.resync_anisette(&sim).await?;
+                    if anisette.fresh_identity {
+                        // the server had lost the identity and made a new one, unknown to Apple
+                        plan.identity_replaced();
+                    }
+                }
+                InitStep::Reprovision => {
+                    log::warn!("Apple answered -45061: making a new anisette identity");
+                    anisette = self.reprovision_anisette().await?;
+                    plan.identity_replaced();
+                }
+                InitStep::Proceed => {
+                    check_error(&answer)?;
+                    break answer;
                 }
             }
         };
@@ -447,13 +549,26 @@ impl Account {
         Ok(fresh)
     }
 
-    /// Provision the anisette identity again (Apple answered -45061) and use the new data.
+    /// Make a new anisette identity and provision it (Apple answered -45061), and use the new data.
     async fn reprovision_anisette(&self) -> Result<AnisetteData, Error> {
         let mut locked = self.anisette.lock().await;
-        omnisette::invalidate_provisioning(locked.config.configuration_path())?;
+        omnisette::reset_identity(locked.config.configuration_path())?;
         let fresh = AnisetteData::new(locked.config.clone()).await?;
         *locked = fresh.clone();
         Ok(fresh)
+    }
+
+    /// Apple keeps refusing the data of the anisette server in use (a 503 page again and again):
+    /// take the data of the other configured server instead. `None` when there is no other server.
+    async fn switch_anisette_server(&self) -> Result<Option<AnisetteData>, Error> {
+        let mut locked = self.anisette.lock().await;
+        let mut config = locked.config.clone();
+        if !config.prefer_other_server_v3() {
+            return Ok(None);
+        }
+        let fresh = AnisetteData::new(config).await?;
+        *locked = fresh.clone();
+        Ok(Some(fresh))
     }
 }
 
@@ -520,6 +635,84 @@ mod tests {
         assert_eq!(normalize_code(" 123 456\n"), "123456");
         assert_eq!(normalize_code("123-456"), "123456");
         assert_eq!(normalize_code(""), "");
+    }
+
+    /// The `Response` of a GrandSlam answer whose `Status` holds `entries`.
+    fn answer(entries: &str) -> Dictionary {
+        let text = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Response</key><dict><key>Status</key><dict>{entries}</dict></dict></dict></plist>"
+        );
+        parse_gsa_text(200, &text).unwrap()
+    }
+
+    const ASK_SYNC: &str = "<key>hsc</key><integer>434</integer><key>X-Apple-I-MD-DATA</key><string>SIM</string><key>ec</key><integer>-22421</integer><key>em</key><string>Try again.</string>";
+    const NOT_PROVISIONED: &str = "<key>ec</key><integer>-45061</integer><key>em</key><string>not provisioned</string>";
+
+    #[test]
+    fn a_new_identity_is_synchronized_once() {
+        let mut plan = InitPlan::new();
+        plan.request_sent();
+        assert_eq!(plan.after_answer(&answer(ASK_SYNC)), InitStep::Resync("SIM".to_string()));
+        // asked again after the synchronization: Apple's answer is final (it is the error -22421)
+        plan.request_sent();
+        assert_eq!(plan.after_answer(&answer(ASK_SYNC)), InitStep::Proceed);
+    }
+
+    #[test]
+    fn a_provisioning_that_is_not_valid_is_made_again_once() {
+        let mut plan = InitPlan::new();
+        plan.request_sent();
+        assert_eq!(plan.after_answer(&answer(NOT_PROVISIONED)), InitStep::Reprovision);
+        plan.request_sent();
+        assert_eq!(plan.after_answer(&answer(NOT_PROVISIONED)), InitStep::Proceed);
+    }
+
+    #[test]
+    fn the_new_identity_of_a_reprovisioning_is_synchronized_in_its_turn() {
+        // 434 -> synchronized; -45061 -> a new identity; 434 again: the new identity is not known to
+        // Apple either, and it used to be answered with -22421 and a reset of the identity
+        let mut plan = InitPlan::new();
+        plan.request_sent();
+        assert_eq!(plan.after_answer(&answer(ASK_SYNC)), InitStep::Resync("SIM".to_string()));
+        plan.request_sent();
+        assert_eq!(plan.after_answer(&answer(NOT_PROVISIONED)), InitStep::Reprovision);
+        plan.identity_replaced();
+        plan.request_sent();
+        assert_eq!(plan.after_answer(&answer(ASK_SYNC)), InitStep::Resync("SIM".to_string()));
+        plan.request_sent();
+        assert_eq!(plan.after_answer(&answer("<key>ec</key><integer>-20970</integer>")), InitStep::Proceed);
+    }
+
+    #[test]
+    fn nothing_makes_the_init_loop_for_ever() {
+        // an Apple that asks for a synchronization every time, whatever is done
+        let mut plan = InitPlan::new();
+        let mut requests = 0;
+        loop {
+            plan.request_sent();
+            requests += 1;
+            match plan.after_answer(&answer(ASK_SYNC)) {
+                InitStep::Proceed => break,
+                InitStep::Resync(_) => plan.identity_replaced(),
+                InitStep::Reprovision => unreachable!(),
+            }
+            assert!(requests < 20, "the loop does not end");
+        }
+        assert_eq!(requests, usize::from(MAX_INIT_REQUESTS));
+        // and a server that is switched back and forth
+        let mut plan = InitPlan::new();
+        assert!(plan.may_switch_server());
+        assert!(!plan.may_switch_server());
+    }
+
+    #[test]
+    fn the_server_is_not_switched_when_the_requests_are_spent() {
+        let mut plan = InitPlan::new();
+        for _ in 0..MAX_INIT_REQUESTS {
+            plan.request_sent();
+        }
+        assert!(!plan.may_switch_server());
+        assert_eq!(plan.after_answer(&answer(NOT_PROVISIONED)), InitStep::Proceed);
     }
 
     #[test]

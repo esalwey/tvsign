@@ -41,6 +41,11 @@ pub trait AnisetteHeadersProvider: Send + Sync {
         false
     }
 
+    /// The server that produced the last headers, for a provider that chooses between several.
+    fn server_used(&self) -> Option<String> {
+        None
+    }
+
     /// Headers again, after GrandSlam asked for a synchronization (`hsc` 434 with an
     /// `X-Apple-I-MD-DATA` value, passed as `sim`).
     #[cfg_attr(not(feature = "async"), remove_async_await::remove_async_await)]
