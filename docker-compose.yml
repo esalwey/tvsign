@@ -14,8 +14,10 @@ services:
     image: ghcr.io/esalwey/tvsign:1
     container_name: tvsign
     restart: unless-stopped
-    # Required: mDNS discovery of the Apple TVs (multicast does not cross a bridge network).
-    # The tunnel to the Apple TV runs in user space: no NET_ADMIN, no /dev/net/tun, no root.
+    # Required: mDNS discovery of the devices (multicast does not cross a bridge network).
+    # The tunnel to the device runs in user space: no NET_ADMIN, no /dev/net/tun, no root.
+    # No USB either, on purpose: an iPhone / iPad is paired once on a computer that has usbmuxd
+    # (`plumesign pair usb`) and the pairing file is imported in the web UI (see the README).
     network_mode: host
     security_opt:
       - no-new-privileges:true
@@ -28,7 +30,8 @@ services:
       # TVSIGN_HOST: 127.0.0.1      # only when a reverse proxy on this host serves the UI
       # TVSIGN_PASSWORD_FILE: /run/secrets/tvsign_password   # otherwise chosen in the web UI
       # TVSIGN_NTFY_URL: https://ntfy.sh/your-topic          # or set it in Settings
+      # TVSIGN_RENEW_BEFORE_HOURS_MOBILE: "96"               # iPhone / iPad: renew earlier than an Apple TV (60 h)
     volumes:
-      # Apple session, certificate private key, Apple TV pairings, database.
+      # Apple session, certificate private key, device pairings, database.
       # BACK IT UP, NEVER SHARE IT (no SMB/NFS share, no cloud sync folder in clear).
       - ./tvsign-data:/data

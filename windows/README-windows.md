@@ -61,6 +61,18 @@ Vérifiez aussi que votre réseau domestique est en profil **Privé** et non **P
 
 La page **Diagnostic** de tvsign indique combien d'Apple TV sont visibles sur le réseau.
 
+### Appairer un iPhone ou un iPad (iOS / iPadOS 17 ou plus récent)
+
+Un iPhone n'affiche pas de code : l'appairage se fait **une seule fois par câble USB**, puis tout se passe en Wi-Fi.
+
+1. Sur l'appareil, activez le **Mode développeur** (*Réglages > Confidentialité et sécurité > Mode développeur*, puis redémarrage). L'option n'apparaît qu'après qu'une app signée ou Xcode a touché l'appareil ; tvsign affiche une bannière tant qu'il est désactivé.
+2. Installez le pilote USB d'Apple si ce n'est pas fait : **iTunes** ou l'app **Appareils Apple** du Microsoft Store (elles installent *Apple Mobile Device Service*). tvsign ne l'embarque pas.
+3. Branchez l'appareil au PC, déverrouillez-le et touchez **Se fier**.
+4. Dans tvsign : **Appairer**, onglet **iPhone / iPad**, puis **Appairer en USB**.
+5. Après la première installation d'une app : *Réglages > Général > VPN et gestion de l'appareil*, touchez votre Apple ID puis **Faire confiance** (une fois par Apple ID).
+
+Un iPhone ou un iPad est renouvelé **96 heures** avant l'expiration, et dès qu'il revient sur le réseau de la maison. Il ne répond que réveillé (écran allumé ou en charge, c'est mieux). Utilisez un Apple ID réservé à tvsign : AltStore, SideStore ou Sideloadly sur le même compte révoquent leurs certificats mutuellement.
+
 ## 5. Le PC doit être allumé pour les renouvellements
 
 Une app signée avec un compte gratuit expire au bout de **7 jours**. tvsign la renouvelle **60 heures avant** l'expiration, ce qui laisse environ deux jours et demi de marge.

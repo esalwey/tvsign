@@ -23,7 +23,11 @@ const ICONS = {
   alerte: '<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5 2.5 20h19z"/><path d="M12 10v4.5M12 17.2v.1"/></svg>',
   cle: '<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="m11 12 8-8M16 7l2 2M14 9l2 2"/></svg>',
   ok: '<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>',
+  phone: '<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x="6.5" y="2.5" width="11" height="19" rx="2.5"/><path d="M11 18.5h2"/></svg>',
 };
+const OS_NAME = { tvos: "tvOS", ios: "iOS", ipados: "iPadOS", visionos: "visionOS" };
+const estMobile = (famille) => famille === "ios" || famille === "ipados";   // iPhone / iPad
+const platformOf = (famille) => (estMobile(famille) ? "iphoneos" : "appletvos");
 
 // ---------- erreurs de l'API ----------
 // Codes stables renvoyés par le serveur (« code » ou « code:paramètre »).
@@ -95,8 +99,11 @@ const CAUSES = [
   [/plumesign occupé/i, "c_busy"],
   [/ouverte sur l'Apple TV|app ouverte sur la TV|installd ne progresse plus/i, "c_app_open"],
   [/plumesign trop ancien/i, "c_plumesign_old"],
+  [/verrouillé depuis son démarrage|locked since (boot|it started)/i, "c_locked"],
+  [/l'installation n'avance plus|installation bloquée à/i, "c_stalled"],
+  [/seules les apps (tvOS|iPhone)|réservée à l'iPad|demande .* ou plus récent|pas encore pris en charge/i, "c_platform"],
   [/réseau ou Apple injoignable/i, "c_apple_net"],
-  [/maximum (number )?of (apps|app ids)|too many (apps|app ids)|app id limit|limit of \d+ (apps|app ids)/i, "c_limit"],
+  [/maximum (number )?of (installed )?(apps|app ids)|free developer profile|too many (apps|app ids)|app id limit|limit of \d+ (apps|app ids)/i, "c_limit"],
   [/identifiant d'app changé/i, "c_bundle"],
   [/empreinte SHA-256/i, "c_digest"],
   [/certificat|certificate/i, "c_cert"],
@@ -141,7 +148,7 @@ function flash(ton, titre, texte = "") {
 
 // ---------- rendu sans perte de focus ----------
 const CLES = ["data-renew", "data-toggle", "data-edit", "data-del-app", "data-refresh-dev", "data-del-dev", "data-check",
-  "data-select", "data-relogin", "data-logout", "data-open", "data-key"];
+  "data-select", "data-relogin", "data-logout", "data-devmode", "data-open", "data-key"];
 function cleDe(el) {
   if (!el?.getAttribute) return null;
   for (const a of CLES) if (el.hasAttribute(a)) return [a, el.getAttribute(a)];
@@ -237,15 +244,37 @@ function jauge(a, now, s, ton) {
 
 // App ouverte sur l'Apple TV : installation en attente (installd tient la mise à jour jusqu'à sa fermeture).
 function noteApp(a, now) {
-  const tv = a.device_name || "Apple TV";
+  const tv = a.device_name || t("device");
+  const mobile = estMobile(a.device_family);
   let titre, texte;
   if (a.running && a.phase?.step === "waiting_app") {
-    titre = t("wait_app_t", { name: a.name });
-    texte = t("wait_app", { tv, when: relatif(a.phase.deadline, now) });
+    // iOS remplace une app ouverte : une attente y vient d'ailleurs (appareil verrouillé, occupé, plein)
+    titre = t(mobile ? "wait_phone_t" : "wait_app_t", { name: mobile ? tv : a.name });
+    texte = t(mobile ? "wait_phone" : "wait_app", { tv, when: relatif(a.phase.deadline, now) });
   } else return "";
   return `<div class="probleme probleme--info" role="status">
-      <span class="probleme__ic">${ICONS.tv}</span>
+      <span class="probleme__ic">${mobile ? ICONS.phone : ICONS.tv}</span>
       <div class="probleme__texte"><p class="probleme__titre">${esc(titre)}</p><p>${esc(texte)}</p></div>
+    </div>`;
+}
+
+// Limites du compte gratuit repérées dans l'IPA (extensions, push, iCloud, domaines associés).
+function avertissementsApp(a) {
+  const w = (a.warnings || "").split(",").filter(Boolean);
+  if (!w.length) return "";
+  const lignes = w.map((x) => (x.startsWith("appex:") ? t("warn_appex", { n: x.slice(6) }) : t("warn_" + x.replace(/-/g, "_"))));
+  return `<div class="probleme probleme--info" role="status">
+      <span class="probleme__ic">${ICONS.alerte}</span>
+      <div class="probleme__texte"><p class="probleme__titre">${esc(t("warn_t"))}</p>${lignes.map((l) => `<p>${esc(l)}</p>`).join("")}</div>
+    </div>`;
+}
+
+// Première installation sur iPhone / iPad : le certificat du développeur est à approuver une fois par Apple ID.
+function noteConfiance(a, now) {
+  if (!estMobile(a.device_family) || !a.created_at || now - a.created_at > 3 * 86400) return "";
+  return `<div class="probleme probleme--info" role="status">
+      <span class="probleme__ic">${ICONS.phone}</span>
+      <div class="probleme__texte"><p class="probleme__titre">${esc(t("phone_trust_t"))}</p><p>${esc(t("phone_trust"))}</p></div>
     </div>`;
 }
 
@@ -290,9 +319,11 @@ function carteApp(a, now, s) {
     </div>
     ${jauge(a, now, s, ton)}
     ${noteApp(a, now)}
+    ${noteConfiance(a, now)}
+    ${avertissementsApp(a)}
     ${problemeApp(a, now)}
     <dl class="meta">
-      <div><dt>Apple TV</dt><dd>${a.device_id ? esc(a.device_name || "Apple TV") : `<span class="texte-err">${t("none_f")}</span>`}</dd></div>
+      <div><dt>${t("device")}</dt><dd>${a.device_id ? esc(a.device_name || t("device")) : `<span class="texte-err">${t("none_m")}</span>`}</dd></div>
       <div><dt>${t("account")}</dt><dd>${compte ? esc(compte) : t("default_account")}</dd></div>
       ${essai ? `<div><dt>${t("last_attempt")}</dt><dd>${essai}</dd></div>` : a.signed_at ? `<div><dt>${t("signed")}</dt><dd>${esc(relatif(a.signed_at, now))}</dd></div>` : ""}
       ${a.bad_tag ? `<div><dt>${t("skipped_version")}</dt><dd class="mono">${esc(a.bad_tag)}</dd></div>` : ""}
@@ -307,7 +338,7 @@ function carteApp(a, now, s) {
 }
 // déclencheurs enregistrés par le serveur (en français) -> libellé traduit
 const trigger = (x) => ({ auto: t("tr_auto"), manuel: t("tr_manual"), ajout: t("tr_added"), "nouvelle version": t("tr_new_version"),
-  "nouvelle source": t("tr_new_source"), "nouvelle destination": t("tr_new_dest") }[x] || x);
+  "nouvelle source": t("tr_new_source"), "nouvelle destination": t("tr_new_dest"), "présence": t("tr_presence") }[x] || x);
 
 // ---------- synthèse globale ----------
 const boucleArretee = (h, now) => !!h && (h.loop_stalled || (!!h.last_loop_at && now - h.last_loop_at > 3 * (h.check_interval || 600) + 2700));
@@ -378,6 +409,10 @@ function renderAlertes() {
       html.push(`<div class="banner banner--info"><p><strong>${t("no_tv_t")}</strong>${t("no_tv")}</p>
         <button class="btn btn--primary" data-open="dlg-pair">${t("pair")}</button></div>`);
     }
+    for (const d of s.devices.filter((x) => estMobile(x.family) && x.dev_mode === 0)) {
+      html.push(`<div class="banner"><p><strong>${esc(t("devmode_off_t", { name: d.name }))}</strong>${esc(t("devmode_off"))}</p>
+        <button class="btn" data-devmode="${d.id}">${t("devmode_check")}</button></div>`);
+    }
     const legacy = s.devices.filter((x) => x.legacy_pairing);
     if (legacy.length) {
       html.push(`<div class="banner banner--info"><p><strong>${esc(tn("legacy_t", legacy.length, { names: legacy.map((d) => d.name).join(", ") }))}</strong>${t("legacy")}</p>
@@ -385,7 +420,7 @@ function renderAlertes() {
     }
     for (const d of s.devices.filter((x) => x.pairing_lost && !x.legacy_pairing)) {
       html.push(`<div class="banner"><p><strong>${esc(t("lost_t", { name: d.name }))}</strong>${t("lost")}</p>
-        <button class="btn btn--primary" data-open="dlg-pair">${t("pair")}</button></div>`);
+        <button class="btn btn--primary" data-open="dlg-pair" data-pair-kind="${estMobile(d.family) ? "phone" : "tv"}">${t("pair")}</button></div>`);
     }
   }
   setHTML($("#alertes"), html.join(""));
@@ -412,17 +447,25 @@ function renderDevices(s, now) {
   setHTML($("#devices"), s.devices.length ? `<div class="list">${s.devices.map((d) => {
     const [ton, mot, errRecente] = etatTV(d);
     const apps = s.apps.filter((a) => a.device_id === d.id).map((a) => a.name);
+    const mobile = estMobile(d.family), fam = d.family || "tvos";
+    const vieux = mobile && parseInt(d.os_version, 10) < 17;
+    const notes = [];
+    if (mobile && d.dev_mode === 1) notes.push(["", t("devmode_row_on")]);
+    if (mobile && d.dev_mode === 0) notes.push(["texte-err", t("devmode_row_off")]);
+    if (mobile && d.app_count >= 3) notes.push(["texte-err", t("dev_apps_limit", { n: d.app_count })]);
+    if (vieux) notes.push(["texte-err", t("dev_old_os")]);
     return `<div class="row">
-      <span class="row__icon row__icon--${COULEUR[ton]}">${ICONS.tv}</span>
+      <span class="row__icon row__icon--${COULEUR[ton]}">${mobile ? ICONS.phone : ICONS.tv}</span>
       <div class="row__label">
-        <p class="row__title">${esc(d.name)}</p>
-        <p class="row__sub"><span class="etat etat--${ton}">${mot}</span> · ${esc(d.model || t("unknown_model"))} · tvOS ${esc(d.os_version || "?")}${d.last_ip ? ` · ${esc(d.last_ip)}` : ""}</p>
+        <p class="row__title">${esc(d.name)}<small>${esc(t("family_" + fam))}</small></p>
+        <p class="row__sub"><span class="etat etat--${ton}">${mot}</span> · ${esc(d.model || t("unknown_model"))} · ${OS_NAME[fam] || "tvOS"} ${esc(d.os_version || "?")}${d.last_ip ? ` · ${esc(d.last_ip)}` : ""}</p>
         <p class="row__sub">${esc(t("last_contact", { when: relatif(d.last_seen, now) }))}${apps.length ? ` · ${esc(apps.join(", "))}` : ""}</p>
+        ${notes.map(([cls, txt]) => `<p class="row__sub ${cls}">${esc(txt)}</p>`).join("")}
         ${d.legacy_pairing ? `<p class="row__sub">${t("legacy_row")}</p>`
           : errRecente ? `<p class="row__sub texte-err">${esc(enClair(d.last_error).titre)} ${d.last_error_at ? `(${esc(relatif(d.last_error_at, now))})` : ""}</p>` : ""}
       </div>
       <div class="row__buttons">
-        ${d.pairing_lost || d.legacy_pairing ? `<button class="row__action row__action--go" data-open="dlg-pair">${t("repair")}</button>` : ""}
+        ${d.pairing_lost || d.legacy_pairing ? `<button class="row__action row__action--go" data-open="dlg-pair" data-pair-kind="${mobile ? "phone" : "tv"}">${t("repair")}</button>` : ""}
         ${d.legacy_pairing ? "" : `<button class="row__action" data-refresh-dev="${d.id}">${t("test_connection")}</button>`}
         <button class="row__action row__action--danger" data-del-dev="${d.id}" data-nom="${esc(d.name)}">${t("forget")}</button>
       </div>
@@ -444,6 +487,7 @@ function renderAccounts(s, now) {
       <div class="row__label">
         <p class="row__title">${esc(a.email)}${a.selected ? `<small>${t("default_account")}</small>` : ""}</p>
         <p class="row__sub">${etat}${a.team_id ? ` · ${t("team")} <span class="mono">${esc(a.team_id)}</span>` : ""} · ${esc(t("checked_when", { when: relatif(a.checked_at, now) }))}</p>
+        ${a.apps ? `<p class="row__sub ${a.app_ids >= 8 ? "texte-err" : ""}">${esc(t("acc_budget", { apps: a.apps, ids: a.app_ids }))}</p>` : ""}
         ${note}
       </div>
       <div class="row__buttons">
@@ -454,7 +498,7 @@ function renderAccounts(s, now) {
       </div>
     </div>`;
   }).join("")}</div>
-    <p class="group__footer">${esc(heures ? t("acc_footer_h", { h: Math.round(heures) }) : t("acc_footer"))}</p>`
+    <p class="group__footer">${esc(heures ? t("acc_footer_h", { h: Math.round(heures) }) : t("acc_footer"))}${s.accounts.some((x) => x.apps) ? " " + esc(t("acc_budget_note")) : ""}</p>`
     : `<div class="vide"><p>${t("acc_empty")}</p><button class="btn" data-open="dlg-login">${t("add_account")}</button></div>`);
 }
 
@@ -570,7 +614,7 @@ document.addEventListener("click", async (ev) => {
   const b = ev.target.closest("button");
   if (!b || b.closest("dialog") || !b.closest("#vue-main, #vue-onboarding")) return;
   const d = b.dataset;
-  if (d.open) return openDialog(d.open);
+  if (d.open) return openDialog(d.open, d.pairKind);
   if (d.relogin) {
     openDialog("dlg-login");
     $("#form-login").email.value = d.relogin;
@@ -578,7 +622,7 @@ document.addEventListener("click", async (ev) => {
     return;
   }
   if (d.edit) return openEdit(+d.edit);
-  if (!(d.renew || d.toggle || d.delApp || d.refreshDev || d.delDev || d.check || d.select || d.logout)) return;
+  if (!(d.renew || d.toggle || d.delApp || d.refreshDev || d.delDev || d.check || d.select || d.logout || d.devmode)) return;
   try {
     if (d.renew) {
       await busy(b, "data-renew", t("starting"), async () => {
@@ -600,6 +644,15 @@ document.addEventListener("click", async (ev) => {
       await busy(b, "data-refresh-dev", t("connecting"), async () => {
         await api(`/api/devices/${d.refreshDev}/refresh`, { method: "POST" });
         flash("ok", t("tv_ok_t"), " " + t("tv_ok"));
+      });
+    }
+    if (d.devmode) {
+      await busy(b, "data-devmode", t("devmode_checking"), async () => {
+        const r = await api(`/api/devices/${d.devmode}/devmode`, { method: "POST" });
+        const nom = STATE?.devices.find((x) => String(x.id) === d.devmode)?.name || "";
+        if (r.dev_mode === true) flash("ok", t("devmode_on_t"));
+        else if (r.dev_mode === false) flash("err", t("devmode_off_t", { name: nom }), " " + t("devmode_off"));
+        else flash("info", t("devmode_unknown_t"));
       });
     }
     if (d.delDev) {
@@ -632,10 +685,13 @@ $("#journal-bloc").addEventListener("change", (e) => {
 $("#journal-bloc").addEventListener("toggle", (e) => store.set("tvsign.journal.ouvert", e.target.open ? "1" : "0"));
 if (store.get("tvsign.journal.ouvert") === "1") $("#journal-bloc").open = true;
 
-function openDialog(id) {
+function openDialog(id, kind) {
   if (!STATE && id !== "dlg-login") return flash("err", t("sum_unreachable_t"), " " + t("retry_moment"));
   if (id === "dlg-app") fillAppForm();
-  if (id === "dlg-pair") scan();
+  if (id === "dlg-pair") {
+    $(`input[name="pair_kind"][value="${kind === "phone" ? "phone" : "tv"}"]`).checked = true;
+    syncPairKind();
+  }
   if (id === "dlg-login") {
     $("#login-session").innerHTML = ""; $("#login-error").textContent = "";
     $("#login-submit").disabled = false;
@@ -659,7 +715,10 @@ function presetCartes(list, nom) {
         <span class="row__sub mono">${esc(p.repo)}</span></span>
     </label>`).join("")}</div>` : `<div class="vide"><p>${t("no_presets")}</p></div>`;
 }
-const optionsTV = (choix) => STATE.devices.map((d) => `<option value="${d.id}" ${d.id === choix ? "selected" : ""}>${esc(d.name)}</option>`).join("");
+const optionsTV = (choix) => STATE.devices.map((d) => `<option value="${d.id}" ${d.id === choix ? "selected" : ""}>${esc(d.name)} (${esc(t("family_" + (d.family || "tvos")))})</option>`).join("");
+// préréglages qui conviennent à la famille de l'appareil choisi (Apple TV : apps tvOS ; iPhone / iPad : apps iPhone)
+const presetsFor = (list, device) => list.filter((p) => (p.platform || "appletvos") === platformOf(device?.family));
+const appareilChoisi = () => STATE.devices.find((d) => String(d.id) === $("#form-app").device_id.value);
 async function fillAppForm() {
   const f = $("#form-app");
   f.device_id.innerHTML = optionsTV(STATE.devices[0]?.id) || `<option value="">${t("no_tv_paired")}</option>`;
@@ -668,7 +727,11 @@ async function fillAppForm() {
   $("#app-error").textContent = STATE.devices.length ? "" : t("pair_first");
   $("#app-submit").disabled = !STATE.devices.length;
   syncTabs();
-  const list = await presets();
+  await presetsDeAppareil();
+}
+async function presetsDeAppareil() {
+  const f = $("#form-app");
+  const list = presetsFor(await presets(), appareilChoisi());
   $("#app-presets").innerHTML = presetCartes(list, "preset");
   canalDuPreset("preset", "channel");
   if (!list.length && f.source_type.value === "preset") { f.source_type.value = "github"; syncTabs(); }
@@ -688,7 +751,10 @@ function syncTabs() {
   const type = $("#form-app").source_type.value;
   $$("#form-app [data-for]").forEach((el) => (el.hidden = !el.dataset.for.split(" ").includes(type)));
 }
-$("#form-app").addEventListener("change", (e) => { if (e.target.name === "source_type") syncTabs(); });
+$("#form-app").addEventListener("change", (e) => {
+  if (e.target.name === "source_type") syncTabs();
+  if (e.target.name === "device_id") presetsDeAppareil();
+});
 $("#form-app").addEventListener("submit", async (ev) => {
   if (ev.submitter && ev.submitter.value !== "ok") return;
   ev.preventDefault();
@@ -874,6 +940,53 @@ $("#dlg-login").addEventListener("close", () => { annulerSession("login"); $("#l
 $("#dlg-pair").addEventListener("close", () => annulerSession("pair"));
 
 // ---------- appairage ----------
+const pairKind = () => $('input[name="pair_kind"]:checked')?.value || "tv";
+function syncPairKind() {
+  const k = pairKind();
+  $$("#dlg-pair [data-pair]").forEach((el) => (el.hidden = el.dataset.pair !== k));
+  $("#pair-rescan").hidden = k !== "tv";
+  if (k === "tv") return scan();
+  annulerSession("pair");
+  $("#pair-session").innerHTML = "";
+  $("#import-error").textContent = "";
+  $("#pair-phone-steps").innerHTML = t("phone_steps");
+  const usb = STATE?.capabilities?.usb_pairing !== false;
+  $("#pair-usb").disabled = !usb;
+  $("#pair-usb-none").hidden = usb;
+}
+$("#dlg-pair").addEventListener("change", (e) => { if (e.target.name === "pair_kind") syncPairKind(); });
+$("#pair-usb").onclick = async () => {
+  const box = $("#pair-session");
+  $("#import-error").textContent = "";
+  box.innerHTML = `<p class="statut"><span class="etat etat--cours">${t("pair_usb_running")}</span></p>`;
+  try {
+    const sess = await api("/api/devices/pair-usb", { json: {} });
+    watchSession(sess, box, { cle: "pair", label: t("pair_usb"), doneText: t("pair_usb_done"), numerique: false });
+  } catch (e) {
+    box.innerHTML = `<p class="erreur">${esc(e.message)}</p>`;
+  }
+};
+$("#import-go").onclick = async (ev) => {
+  const b = ev.currentTarget, dlg = $("#dlg-pair"), err = $("#import-error"), box = $("#pair-session");
+  const file = dlg.querySelector('[name="pfile"]').files[0];
+  err.textContent = ""; box.innerHTML = "";
+  if (!file) return (err.textContent = t("import_choose"));
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("name", dlg.querySelector('[name="pname"]').value.trim());
+  fd.append("udid", dlg.querySelector('[name="pudid"]').value.trim());
+  fd.append("family", dlg.querySelector('[name="pfamily"]').value);
+  await busy(b, "id", t("uploading"), async () => {
+    try {
+      const r = await api("/api/devices/import-pairing", { method: "POST", body: fd });
+      const nom = dlg.querySelector('[name="pname"]').value.trim() || t("device");
+      box.innerHTML = `<p class="statut"><span class="etat etat--${r.info_error ? "warn" : "ok"}">${esc(t("import_done", { name: nom }))}</span></p>`
+        + (r.info_error ? `<p class="code__invite">${esc(t("import_offline"))}</p>` : "");
+      dlg.querySelector('[name="pfile"]').value = "";
+      refresh();
+    } catch (e) { err.textContent = e.message; }
+  });
+};
 async function scan() {
   const list = $("#pair-list");
   annulerSession("pair");
@@ -1064,10 +1177,11 @@ const WIZ_RENDU = {
   app: () => {
     const apps = STATE?.apps || [];
     const tvs = (STATE?.devices || []).filter((d) => !d.legacy_pairing);
+    const proposes = PRESETS ? presetsFor(PRESETS, tvs[0]) : null;
     if (apps.length) return `${titreEtape("wiz_app_title", "")}${apps.map((a) => fait(t("wiz_app_done", { name: a.name }))).join("")}
       <p class="assistant__texte">${t("wiz_app_more")}</p>`;
     return `${titreEtape("wiz_app_title", t("wiz_app_text"))}
-      ${PRESETS ? presetCartes(PRESETS, "wiz-preset") : `<p class="statut"><span class="etat etat--cours">${t("loading")}</span></p>`}
+      ${proposes ? presetCartes(proposes, "wiz-preset") : `<p class="statut"><span class="etat etat--cours">${t("loading")}</span></p>`}
       <p class="group__header espace">${t("channel")}</p>
       <div class="segmented" role="radiogroup" aria-label="${esc(t("channel"))}">
         <label><input type="radio" name="wiz-canal" value="stable" ${PRESETS?.[0]?.default_channel === "beta" ? "" : "checked"}><span>${t("channel_stable")}</span></label>
@@ -1076,7 +1190,7 @@ const WIZ_RENDU = {
       <p class="group__footer">${t("channel_note")}</p>
       ${tvs.length ? "" : `<p class="erreur">${t("pair_first")}</p>`}
       <div class="actions-form">
-        <button class="btn btn--primary" id="wiz-installer" ${tvs.length && PRESETS?.length ? "" : "disabled"}>${t("install")}</button>
+        <button class="btn btn--primary" id="wiz-installer" ${tvs.length && proposes?.length ? "" : "disabled"}>${t("install")}</button>
         <button class="btn" data-open="dlg-app">${t("other_app")}</button>
       </div>
       <p class="erreur" id="wiz-erreur" role="alert"></p>`;

@@ -355,9 +355,11 @@ def _error_line(res: Result) -> str:
 
 
 async def _wireless(device: dict, command: str, *extra, timeout: float = 120, ok_codes=(0,),
-                    on_line=None, on_timeout=None) -> Result:
+                    on_line=None, on_timeout=None, soft: bool = False) -> Result:
     """Lance `plumesign pair <command> -i <UDID> …` et traduit les codes de sortie.
-    on_timeout() fournit le message d'un délai dépassé (contexte de l'appelant)."""
+    on_timeout() fournit le message d'un délai dépassé (contexte de l'appelant).
+    soft : une commande annexe (mode développeur) dont l'échec ordinaire ne doit pas être affiché
+    comme une panne de l'appareil."""
     target = _target(device)
     e = plume.env()
     res = await run(PLUMESIGN, "pair", command, *target, *extra, env=e, timeout=timeout, split=True,
@@ -397,7 +399,8 @@ async def _wireless(device: dict, command: str, *extra, timeout: float = 120, ok
                f"avec son code [{why}]")
         _failed(device, msg)
         raise DeviceLocked(msg)
-    _failed(device, f"{command} : {why}")
+    if not soft:
+        _failed(device, f"{command} : {why}")
     raise RuntimeError(f"{command} : {why}")
 
 
@@ -436,6 +439,11 @@ async def refresh_info(device_id: int) -> dict:
     if families.is_mobile(fam) and major and major[0] < 17:
         db.log(f"« {device['name']} » est en {info.get('ProductVersion')} : le renouvellement sans fil demande "
                "iOS / iPadOS 17 ou plus récent", "warn")
+    if families.is_mobile(fam or device.get("family")):
+        try:        # mode développeur : information en plus, jamais une raison d'échouer
+            await check_devmode({**device, "family": fam or device.get("family")})
+        except Exception:  # noqa: BLE001
+            pass
     if info.get("udid_matches_pairing") is False:
         db.log(f"« {device['name']} » : UDID matériel {info.get('UniqueDeviceID')} différent de "
                f"l'UDID d'appairage {device['pairing_udid']}", "warn")
@@ -450,7 +458,7 @@ async def check_devmode(device: dict) -> bool | None:
     lance pas. True / False, mémorisé ; plumesign trop ancien : None, sans bloquer."""
     try:
         async with lock(device["id"]):
-            res = await _wireless(device, "devmode", timeout=60)
+            res = await _wireless(device, "devmode", timeout=60, soft=True)
     except OldPlumesign:
         return None
     on = next((m.group(1) == "on" for l in res.lines() if (m := _DEVMODE.match(l))), None)
@@ -509,8 +517,8 @@ async def install(device: dict, ipas: list[Path], on_event=None, wait_cap: float
                         if is_mobile(device):
                             # iOS remplace une app ouverte : l'attente vient d'ailleurs (appareil verrouillé, stockage…)
                             raise AppInUse(
-                                f"installd ne progresse plus depuis {waited / 60:.0f} min sur « {device['name']} », "
-                                "installation abandonnée : vérifie que l'appareil est déverrouillé, branché, "
+                                f"l'installation n'avance plus depuis {waited / 60:.0f} min sur « {device['name']} », "
+                                "abandonnée : vérifie que l'appareil est déverrouillé, branché, "
                                 "et son espace de stockage")
                         raise AppInUse(
                             f"installd ne progresse plus depuis {waited / 60:.0f} min sur « {device['name']} », "

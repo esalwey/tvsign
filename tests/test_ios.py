@@ -540,6 +540,36 @@ class DeviceMessages(unittest.TestCase):
         devices.run = fake
         self.assertIsNone(asyncio.run(devices.check_devmode(dev)))
 
+    def test_a_failing_devmode_check_is_not_shown_as_a_device_failure(self):
+        dev_id = add_device("Soft", "ios")
+        dev = db.row("SELECT * FROM devices WHERE id = ?", dev_id)
+
+        async def fake(*a, **k):
+            return Result(1, "ERROR FAILED amfi service not available")
+        devices.run = fake
+        with self.assertRaises(RuntimeError):
+            asyncio.run(devices.check_devmode(dev))
+        self.assertIsNone(db.row("SELECT last_error FROM devices WHERE id = ?", dev_id)["last_error"])
+
+    def test_stalled_install_on_a_phone_does_not_ask_to_close_the_app(self):
+        dev = {"id": add_device("Stall", "ios"), "name": "Stall", "family": "ios", "pairing_udid": "U", "pair_host": "x"}
+
+        async def fake(*a, on_line=None, **k):
+            on_line("UPLOADED")
+            on_line("WAITING 40 1900")
+            return Result(0, "INSTALLED")
+        devices.run = fake
+        ipa_file = Path(tempfile.mkdtemp(dir=DATA)) / "a.ipa"
+        ipa_file.write_bytes(b"x")
+        with self.assertRaises(devices.AppInUse) as cm:
+            asyncio.run(devices.install(dev, [ipa_file], wait_cap=60, app_name="App"))
+        self.assertNotIn("ferme", str(cm.exception))
+        self.assertIn("déverrouillé", str(cm.exception))
+        dev["family"] = "tvos"
+        with self.assertRaises(devices.AppInUse) as cm:
+            asyncio.run(devices.install(dev, [ipa_file], wait_cap=60, app_name="App"))
+        self.assertIn("ferme-la", str(cm.exception))
+
     def test_refresh_info_records_family_and_version(self):
         dev_id = add_device("Info", "ios", None, None)
         info = ('{"UniqueDeviceID":"U-1","ProductType":"iPad13,4","ProductVersion":"18.1",'

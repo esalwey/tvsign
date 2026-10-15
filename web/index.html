@@ -77,7 +77,7 @@
 
     <section class="group" aria-labelledby="tv-titre">
       <div class="group__titre">
-        <h2 class="group__header" id="tv-titre">Apple TV</h2>
+        <h2 class="group__header" id="tv-titre" data-i18n="devices">Devices</h2>
         <button class="lien" data-open="dlg-pair" data-i18n="pair">Pair</button>
       </div>
       <div id="devices"></div>
@@ -126,8 +126,11 @@
             </select></label>
           <label class="field"><span data-i18n="renew_before">Renew before expiry</span>
             <span class="field__unite"><input name="renew_before_hours" type="number" min="12" max="150" step="1" inputmode="numeric"><span aria-hidden="true">h</span></span></label>
+          <label class="field"><span data-i18n="renew_before_mobile">Renew before expiry (iPhone / iPad)</span>
+            <span class="field__unite"><input name="renew_before_hours_mobile" type="number" min="12" max="150" step="1" inputmode="numeric"><span aria-hidden="true">h</span></span></label>
         </div>
         <p class="group__footer" data-i18n="renew_before_note">A free Apple ID profile lasts 7 days (168 h). The default, 60 h, leaves two and a half days of margin if the Apple TV or this computer is off.</p>
+        <p class="group__footer" data-i18n="renew_before_mobile_note">A phone is often off the network or asleep: 96 h by default, never less than the setting above.</p>
       </section>
 
       <section class="group">
@@ -243,7 +246,7 @@
 
         <p class="group__header espace" data-i18n="destination">Destination</p>
         <div class="list">
-          <label class="field"><span>Apple TV</span><select name="device_id"></select></label>
+          <label class="field"><span data-i18n="device">Device</span><select name="device_id"></select></label>
           <label class="field"><span data-i18n="account">Account</span><select name="account_email"></select></label>
         </div>
         <p class="erreur" id="app-error" role="alert"></p>
@@ -262,7 +265,7 @@
       <div class="sheet__body">
         <p class="group__header" data-i18n="destination">Destination</p>
         <div class="list">
-          <label class="field"><span>Apple TV</span><select name="device_id"></select></label>
+          <label class="field"><span data-i18n="device">Device</span><select name="device_id"></select></label>
           <label class="field"><span data-i18n="account">Account</span><select name="account_email"></select></label>
         </div>
         <p class="group__footer" data-i18n="account_change_note">Changing the account installs a second copy of the app: each free account signs under its own team.</p>
@@ -292,12 +295,39 @@
     <form method="dialog">
       <header class="sheet__bar">
         <button class="sheet__link" type="button" data-close data-i18n="close">Close</button>
-        <h2 id="t-pair" data-i18n="pair_title">Pair an Apple TV</h2>
+        <h2 id="t-pair" data-i18n="pair_title">Pair a device</h2>
         <button class="sheet__link" type="button" id="pair-rescan" data-i18n="search">Search</button>
       </header>
       <div class="sheet__body">
-        <ol class="consigne" id="pair-consigne"></ol>
-        <div id="pair-list" aria-live="polite"></div>
+        <div class="segmented" role="radiogroup" data-i18n-aria="dev_type">
+          <label><input type="radio" name="pair_kind" value="tv" checked><span data-i18n="dev_tv">Apple TV</span></label>
+          <label><input type="radio" name="pair_kind" value="phone"><span data-i18n="dev_phone">iPhone / iPad</span></label>
+        </div>
+
+        <div data-pair="tv">
+          <ol class="consigne" id="pair-consigne"></ol>
+          <div id="pair-list" aria-live="polite"></div>
+        </div>
+
+        <div data-pair="phone" hidden>
+          <ol class="consigne" id="pair-phone-steps"></ol>
+          <p class="group__footer" data-i18n="phone_wifi_note"></p>
+          <div class="actions-form"><button class="btn btn--primary" type="button" id="pair-usb" data-i18n="pair_usb">Pair over USB</button></div>
+          <p class="group__footer" id="pair-usb-none" data-i18n="pair_usb_none" hidden></p>
+
+          <p class="group__header espace" data-i18n="import_title">Import a pairing file</p>
+          <p class="group__footer" data-i18n="import_hint"></p>
+          <div class="list">
+            <label class="field"><span data-i18n="import_file">.plist file</span><input type="file" name="pfile" accept=".plist"></label>
+            <label class="field"><span data-i18n="import_name">Name</span><input name="pname" data-i18n-placeholder="import_name_ph" placeholder="My iPhone" autocomplete="off"></label>
+            <label class="field"><span data-i18n="import_udid">UDID</span><input name="pudid" class="mono" data-i18n-placeholder="import_udid_ph" placeholder="if not in the file name" autocomplete="off" spellcheck="false"></label>
+            <label class="field"><span data-i18n="import_kind">Type</span>
+              <select name="pfamily"><option value="ios" data-i18n="family_ios">iPhone</option><option value="ipados" data-i18n="family_ipados">iPad</option></select></label>
+          </div>
+          <p class="erreur" id="import-error" role="alert"></p>
+          <div class="actions-form"><button class="btn" type="button" id="import-go" data-i18n="import_btn">Import</button></div>
+        </div>
+
         <div id="pair-session" aria-live="polite"></div>
       </div>
     </form>
