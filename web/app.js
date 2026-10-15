@@ -82,6 +82,9 @@ function relatif(ts, now) {
 // ---------- erreurs en clair ----------
 // Chaque cause connue (messages du serveur et de plumesign) : un titre lisible et ce que l'utilisateur peut faire.
 const CAUSES = [
+  [/adresse introuvable/i, "c_host_unresolved"],
+  [/oubli de l'appairage/i, "c_forget_failed"],
+  [/recherche des Apple TV/i, "c_discover_failed"],
   [/ntfy/i, "c_ntfy"],
   [/8220|no devices from which/i, "c_8220"],
   [/NO_TEAM|MULTIPLE_TEAMS/, "c_team"],
@@ -615,7 +618,7 @@ document.addEventListener("click", async (ev) => {
         try { await api(`/api/devices/${d.delDev}`, { method: "DELETE" }); }
         catch (e) {
           // l'appairage n'a pas pu être effacé (plumesign absent ou bloqué…) : on propose de retirer la TV quand même
-          if (e.status !== 502 || !confirm(t("confirm_force_del_tv", { why: e.message }))) throw e;
+          if (e.status !== 502 || !confirm(t("confirm_force_del_tv", { why: enClair(e.message).titre }))) throw e;
           await api(`/api/devices/${d.delDev}?force=1`, { method: "DELETE" });
         }
       }
@@ -648,7 +651,7 @@ if (store.get("tvsign.journal.ouvert") === "1") $("#journal-bloc").open = true;
 function openDialog(id) {
   if (!STATE && id !== "dlg-login") return flash("err", t("sum_unreachable_t"), " " + t("retry_moment"));
   if (id === "dlg-app") fillAppForm();
-  if (id === "dlg-pair") { $("#pair-manuel").open = false; scan($("#pair-host").value.trim() || undefined); }
+  if (id === "dlg-pair") { $("#pair-manuel").open = false; $("#pair-host").value = ""; scan(); }   // une adresse saisie avant ne doit pas masquer la recherche automatique
   if (id === "dlg-login") {
     $("#login-session").innerHTML = ""; $("#login-error").textContent = "";
     $("#login-submit").disabled = false;
@@ -816,7 +819,8 @@ $("#form-addr").addEventListener("submit", async (ev) => {
   } catch (e) {
     ok.innerHTML = "";
     // l'adresse est enregistrée même si la TV ne répond pas (en veille) : on le dit
-    err.textContent = e.status === 502 ? t("addr_saved_unreachable", { why: enClair(e.message).titre }) : e.message;
+    err.textContent = e.status === 502 ? t("addr_saved_unreachable", { why: enClair(e.message).titre })
+      : e.status === 409 ? t("addr_saved_busy") : e.message;
   } finally {
     btn.disabled = false;
     refresh();
@@ -968,7 +972,7 @@ async function scan(host) {
     };
     if (!r.pairable.length) $("#pair-manuel").open = true;     // rien trouvé : l'adresse à la main est la suite
   } catch (e) {
-    list.innerHTML = `<p class="erreur">${esc(e.message)}</p>`;
+    list.innerHTML = `<p class="erreur">${esc(enClair(e.message).titre)}</p>`;
     $("#pair-manuel").open = true;
   } finally {
     $("#pair-rescan").disabled = $("#pair-host-go").disabled = false;
@@ -983,7 +987,8 @@ async function startPair(d) {
     $("#pair-session").innerHTML = `<p class="erreur">${esc(e.message)}</p>`;
   }
 }
-$("#pair-rescan").onclick = () => scan($("#pair-host").value.trim() || undefined);
+// « Chercher » n'envoie l'adresse que si la section est ouverte et le champ rempli
+$("#pair-rescan").onclick = () => scan($("#pair-manuel").open ? $("#pair-host").value.trim() || undefined : undefined);
 $("#pair-host-go").onclick = () => scan($("#pair-host").value.trim() || undefined);
 $("#pair-host").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("#pair-host-go").click(); } });
 // Annuler / Fermer : type=button, pour qu'Entrée dans un champ déclenche l'action principale

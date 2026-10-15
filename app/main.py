@@ -755,6 +755,9 @@ async def app_copy(app_id: int, body: AppCopy):
     """La même app sur une autre Apple TV (même source, même compte) : une fiche par TV, chacune avec
     son état, sa signature et son échéance. L'IPA déjà téléchargée est reprise, sans nouveau téléchargement."""
     a = app_or_404(app_id)
+    if not a["enabled"] or not a["bundle_id"]:
+        # fiche en cours d'ajout : l'IPA n'est pas encore validée, elle pourrait être partielle
+        raise HTTPException(409, "app_not_ready")
     if not db.row("SELECT id FROM devices WHERE id = ?", body.device_id):
         raise HTTPException(400, "unknown_device")
     account = a["account_email"] or plume.default_account()
@@ -775,7 +778,8 @@ async def app_copy(app_id: int, body: AppCopy):
         await asyncio.to_thread(shutil.copy2, src, renew.app_dir(new_id) / "original.ipa")
     except OSError as e:
         _abort_add(new_id)
-        raise HTTPException(500, f"copie de l'IPA impossible : {e}") from None
+        db.log(f"{a['name']} : copie de l'IPA impossible : {e}", "error", app_id=app_id)   # chemins du serveur : dans le journal seulement
+        raise HTTPException(500, "copy_failed") from None
     db.update("apps", new_id, enabled=1)
     db.log(f"App ajoutée : {a['name']} {a['version']} ({a['bundle_id']}), copie pour une autre Apple TV", app_id=new_id)
     renew.spawn(new_id, "ajout")

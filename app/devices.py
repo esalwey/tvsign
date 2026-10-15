@@ -102,8 +102,7 @@ async def resolve_host(value: str | None) -> str | None:
     if not value:
         return None
     try:
-        ipaddress.ip_address(value.split("%")[0])
-        return value
+        return str(ipaddress.ip_address(value.split("%")[0]))     # sans zone (« %eth0 ») : plumesign n'accepte qu'une IP
     except ValueError:
         pass
     try:
@@ -340,9 +339,10 @@ def _error_line(res: Result) -> str:
 
 
 async def _wireless(device: dict, command: str, *extra, timeout: float = 120, ok_codes=(0,),
-                    on_line=None, on_timeout=None, use_hint: bool = True) -> Result:
+                    on_line=None, on_timeout=None, use_hint: bool = True, quiet: bool = False) -> Result:
     """Lance `plumesign pair <command> -i <UDID> …` et traduit les codes de sortie.
-    on_timeout() fournit le message d'un délai dépassé (contexte de l'appelant)."""
+    on_timeout() fournit le message d'un délai dépassé (contexte de l'appelant).
+    quiet : une TV injoignable (en veille) ne laisse pas d'erreur sur sa fiche (contrôles périodiques)."""
     hint = await hint_ip(device) if use_hint else None
     target = _target(device, hint)
     e = plume.env()
@@ -356,7 +356,7 @@ async def _wireless(device: dict, command: str, *extra, timeout: float = 120, ok
         if hint and "hint-ip" in res.err:
             # plumesign plus ancien que tvsign : sans la requête dirigée, par multicast seul
             return await _wireless(device, command, *extra, timeout=timeout, ok_codes=ok_codes,
-                                   on_line=on_line, on_timeout=on_timeout, use_hint=False)
+                                   on_line=on_line, on_timeout=on_timeout, use_hint=False, quiet=quiet)
         # pas une perte d'appairage : plumesign trop ancien (TVSIGN_PLUMESIGN vers un autre binaire ?)
         raise OldPlumesign(f"plumesign trop ancien pour « pair {command} » : {res.tail(1)}")
     if res.code == EXIT_PAIRING_LOST:
@@ -366,11 +366,13 @@ async def _wireless(device: dict, command: str, *extra, timeout: float = 120, ok
         raise PairingLost(msg)
     if res.code == EXIT_NOT_FOUND:
         msg = f"Apple TV « {device['name']} » introuvable sur le réseau (éteinte ou en veille ?) [{why}]"
-        _failed(device, "introuvable sur le réseau : " + why)
+        if not quiet:
+            _failed(device, "introuvable sur le réseau : " + why)
         raise Unreachable(msg)
     if res.code == -1:
         msg = on_timeout() if on_timeout else f"délai dépassé ({command})"
-        _failed(device, msg)
+        if not quiet:
+            _failed(device, msg)
         raise Unreachable(f"Apple TV « {device['name']} » : {msg}")
     _failed(device, f"{command} : {why}")
     raise RuntimeError(f"{command} : {why}")
@@ -411,10 +413,11 @@ async def refresh_info(device_id: int, wait: bool = True) -> dict:
     return info
 
 
-async def installed_apps(device: dict, bundle_id: str | None = None, wait: bool = True) -> list[dict]:
+async def installed_apps(device: dict, bundle_id: str | None = None, wait: bool = True,
+                         quiet: bool = False) -> list[dict]:
     extra = ["--json"] + (["-b", bundle_id] if bundle_id else [])
     async with _held(device["id"], wait):
-        res = await _wireless(device, "apps", *extra, timeout=90)
+        res = await _wireless(device, "apps", *extra, timeout=90, quiet=quiet)
     out = []
     for line in res.lines():
         if line.startswith("{"):
@@ -483,8 +486,8 @@ async def audit_installed(now: float | None = None) -> None:
         if not mine:
             continue
         try:
-            apps = await installed_apps(device, wait=False)
-        except Exception:  # noqa: BLE001 - TV en veille, occupée… : on réessaie dans une heure
+            apps = await installed_apps(device, wait=False, quiet=True)
+        except Exception:  # noqa: BLE001 - TV en veille, occupée… : on réessaie dans une heure, sans erreur sur la fiche
             _AUDIT_NEXT[device["id"]] = now + 3600
             continue
         _AUDIT_NEXT[device["id"]] = now + INSTALL_CHECK_HOURS * 3600

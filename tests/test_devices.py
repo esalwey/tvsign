@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app import db, devices, diag, main, proc, renew  # noqa: E402
+from app import db, devices, diag, main, plume, proc, renew  # noqa: E402
 from app.proc import Result, Session  # noqa: E402
 
 HEADERS = {"X-Tvsign": "1"}
@@ -304,6 +304,25 @@ class SeveralTvs(unittest.TestCase):
             self.assertEqual(self.client.post(f"/api/apps/{a['id']}/copy", headers=HEADERS,
                                               json={"device_id": 99999}).status_code, 400)
 
+    def test_copy_of_an_app_still_being_added_is_refused(self):
+        salon, chambre = make_device("SalonP"), make_device("ChambreP")
+        half = make_app(salon, enabled=0, bundle_id=None)
+        nobundle = make_app(salon, bundle_id=None)
+        for app_id in (half, nobundle):
+            r = self.client.post(f"/api/apps/{app_id}/copy", headers=HEADERS, json={"device_id": chambre})
+            self.assertEqual((r.status_code, r.json()["detail"]), (409, "app_not_ready"))
+
+    def test_failed_copy_does_not_leak_server_paths(self):
+        salon, chambre = make_device("SalonF"), make_device("ChambreF")
+        with Calls():
+            a = self.add(salon, "com.example.copyfail").json()
+            with mock.patch.object(main.shutil, "copy2", side_effect=OSError("/data/apps/9/original.ipa: disque plein")):
+                r = self.client.post(f"/api/apps/{a['id']}/copy", headers=HEADERS, json={"device_id": chambre})
+        self.assertEqual((r.status_code, r.json()["detail"]), (500, "copy_failed"))
+        self.assertNotIn("/data/", r.text)
+        self.assertIsNone(db.row("SELECT id FROM apps WHERE device_id = ?", chambre))      # fiche à moitié créée retirée
+        self.assertTrue(any("disque plein" in e["message"] for e in db.rows("SELECT message FROM events")))
+
     def test_moving_an_app_to_a_tv_that_has_it_is_refused(self):
         salon, chambre = make_device("SalonM"), make_device("ChambreM")
         with Calls():
@@ -331,6 +350,25 @@ class ManualAddress(unittest.TestCase):
         self.assertEqual(asyncio.run(devices.resolve_host("10.1.2.3")), "10.1.2.3")
         self.assertIsNone(asyncio.run(devices.resolve_host(None)))
         self.assertEqual(asyncio.run(devices.resolve_host("localhost")) in ("127.0.0.1", "::1"), True)
+
+    def test_zone_is_stripped_before_plumesign_sees_the_address(self):
+        self.assertEqual(asyncio.run(devices.resolve_host("fe80::1%eth0")), "fe80::1")
+        self.assertEqual(asyncio.run(devices.resolve_host("10.1.2.3%eth0")), "10.1.2.3")
+
+    def test_discover_passes_a_zone_free_ip(self):
+        seen = []
+
+        async def fake_run(*args, **k):
+            seen.append([str(a) for a in args])
+            return Result(0, "")
+        with mock.patch.object(plume, "run", fake_run):
+            try:
+                asyncio.run(plume.discover(1, ip=asyncio.run(devices.resolve_host("fe80::1%eth0"))))
+            except Exception:  # noqa: BLE001 - seule la ligne de commande compte ici
+                pass
+        flat = [a for call in seen for a in call]
+        self.assertIn("fe80::1", flat)
+        self.assertFalse(any("%" in a for a in flat))
 
     def test_hint_prefers_manual_address_then_last_ip(self):
         dev = {"host_hint": "10.9.9.9", "last_ip": "192.168.1.7"}
@@ -379,7 +417,7 @@ class Installed(unittest.TestCase):
         clean_tables()
 
     def installed(self, answers):
-        async def fake(device, bundle_id=None, wait=True):
+        async def fake(device, bundle_id=None, wait=True, **k):
             a = answers.pop(0)
             if isinstance(a, Exception):
                 raise a
@@ -411,7 +449,7 @@ class Installed(unittest.TestCase):
         app_id = make_app(dev, **app_over)
         devices._AUDIT_NEXT.pop(dev, None)
 
-        async def fake(device, bundle_id=None, wait=True):
+        async def fake(device, bundle_id=None, wait=True, **k):
             if isinstance(answer, Exception):
                 raise answer
             return answer
@@ -439,6 +477,30 @@ class Installed(unittest.TestCase):
         self.assertEqual(db.row("SELECT status FROM apps WHERE id = ?", app_id)["status"], "ok")
         self.assertEqual(calls, [])
         self.assertGreater(devices._AUDIT_NEXT[dev], time.time())     # revue plus tard, pas à chaque passage
+
+    def test_audit_of_a_sleeping_tv_leaves_no_error_on_its_card(self):
+        dev = make_device("Dort")
+        make_app(dev)
+        devices._AUDIT_NEXT.pop(dev, None)
+
+        async def fake_run(*args, **k):
+            return Result(devices.EXIT_NOT_FOUND, "", "ERROR NOT_FOUND introuvable")
+        with mock.patch.object(devices, "run", fake_run):
+            asyncio.run(devices.audit_installed())
+        row = db.row("SELECT last_error, last_error_at FROM devices WHERE id = ?", dev)
+        self.assertEqual((row["last_error"], row["last_error_at"]), (None, None))
+        self.assertGreater(devices._AUDIT_NEXT[dev], time.time())     # revue dans une heure
+
+    def test_a_normal_probe_still_records_the_failure(self):
+        dev = make_device("Dort2")
+        device = db.row("SELECT * FROM devices WHERE id = ?", dev)
+
+        async def fake_run(*args, **k):
+            return Result(devices.EXIT_NOT_FOUND, "", "ERROR NOT_FOUND introuvable")
+        with mock.patch.object(devices, "run", fake_run):
+            with self.assertRaises(devices.Unreachable):
+                asyncio.run(devices.installed_apps(device))
+        self.assertTrue(db.row("SELECT last_error FROM devices WHERE id = ?", dev)["last_error"])
 
     def test_audit_ignores_a_fresh_install_and_running_apps(self):
         dev, app_id, calls = self.audit([], signed_at=time.time() - 30)
@@ -540,6 +602,89 @@ class RenewCallSites(unittest.TestCase):
         with mock.patch.object(renew, "renew", fake_renew), mock.patch.object(renew, "STOPPING", False):
             asyncio.run(renew._loop_app(app_id, False))
         self.assertEqual(seen, [(app_id, "auto")])
+
+
+class QueuesPerTv(unittest.TestCase):
+    """Une file par Apple TV, qui continue d'un passage à l'autre : une TV lente ne retient pas les autres."""
+
+    def setUp(self):
+        clean_tables()
+        renew._QUEUES.clear()
+        renew._RELEASES_MISSED.clear()
+
+    def tearDown(self):
+        renew._QUEUES.clear()
+        renew._RELEASES_MISSED.clear()
+
+    def test_a_waiting_tv_does_not_hold_back_the_others(self):
+        tv_a, tv_b = make_device("A"), make_device("B")
+        app_a = make_app(tv_a, status="error", expires_at=time.time() + 3600)
+        app_b = make_app(tv_b, status="error", expires_at=time.time() + 3600)
+        seen = []
+
+        async def scenario():
+            gate = asyncio.Event()
+
+            async def fake_renew(i, trigger="manuel"):
+                seen.append(i)
+                if i == app_a:
+                    await gate.wait()           # la TV A attend qu'on ferme une app
+            with mock.patch.object(renew, "renew", fake_renew), mock.patch.object(renew, "STOPPING", False):
+                first = renew.start_queues(False)
+                await asyncio.sleep(0.05)
+                self.assertEqual(sorted(seen), sorted([app_a, app_b]))
+                # passage suivant : la file de A tourne encore, elle n'est pas relancée ; celle de B repart
+                second = renew.start_queues(False)
+                await asyncio.sleep(0.05)
+                self.assertEqual((seen.count(app_a), seen.count(app_b)), (1, 2))
+                self.assertEqual(len([t for t in second if not t.done()]), 1)     # seule la file de A est encore en cours
+                gate.set()
+                await asyncio.gather(*first)
+        asyncio.run(scenario())
+
+    def test_a_crashing_queue_does_not_stop_the_others(self):
+        tv_a, tv_b = make_device("A2"), make_device("B2")
+        app_a, app_b = make_app(tv_a), make_app(tv_b)
+        seen = []
+
+        async def fake_loop_app(app_id, check_releases):
+            if app_id == app_a:
+                raise RuntimeError("base de données verrouillée")
+            seen.append(app_id)
+
+        async def scenario():
+            with mock.patch.object(renew, "_loop_app", fake_loop_app), mock.patch.object(renew, "STOPPING", False):
+                tasks = renew.start_queues(False)
+                await asyncio.gather(*tasks)           # ne lève rien : l'erreur est journalisée
+        asyncio.run(scenario())
+        self.assertEqual(seen, [app_b])
+        self.assertIn("verrouillée", renew.HEALTH["loop_error"])
+
+    def test_release_check_is_not_lost_when_the_queue_was_busy(self):
+        tv = make_device("Lente")
+        make_app(tv)
+        flags = []
+
+        async def scenario():
+            gate = asyncio.Event()
+
+            async def fake_loop_app(i, check_releases):
+                flags.append(check_releases)
+                await gate.wait()
+            with mock.patch.object(renew, "_loop_app", fake_loop_app), mock.patch.object(renew, "STOPPING", False):
+                first = renew.start_queues(False)
+                await asyncio.sleep(0.02)
+                renew.start_queues(True)               # file occupée : la vérification est mise de côté
+                self.assertIn(tv, renew._RELEASES_MISSED)
+                gate.set()
+                await asyncio.gather(*first)
+                gate.clear()
+                again = renew.start_queues(False)      # libre : la vérification manquée est faite maintenant
+                await asyncio.sleep(0.02)
+                gate.set()
+                await asyncio.gather(*again)
+        asyncio.run(scenario())
+        self.assertEqual(flags, [False, True])
 
 
 # ---------- diagnostic réseau ----------
