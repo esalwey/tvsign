@@ -1,5 +1,6 @@
 """tvsign : signe et maintient installées des apps tvOS sur des Apple TV, avec un compte Apple gratuit."""
 import asyncio
+import json
 import re
 import shutil
 import time
@@ -16,7 +17,7 @@ from pydantic import BaseModel
 from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import auth, backup, db, devices, diag, ipa, plume, proc, renew, settings
+from . import auth, backup, db, devices, diag, ipa, notifier, plume, proc, renew, settings
 from .config import MAX_UPLOAD_MB, ROOT, SHUTDOWN_DRAIN_SECONDS, TMP_DIR, VERSION
 from .proc import SESSIONS
 
@@ -35,11 +36,13 @@ async def lifespan(_: FastAPI):
     for f in TMP_DIR.glob("*"):
         if f.is_file() and time.time() - f.stat().st_mtime > 3600:
             f.unlink(missing_ok=True)
-    task = asyncio.create_task(renew.loop())
+    # supervise() relance la boucle si une exception lui échappe ; watchdog() prévient si elle se fige
+    tasks = [asyncio.create_task(renew.supervise()), asyncio.create_task(renew.watchdog())]
     yield
     # arrêt : une installation en cours peut finir avant que l'arrêt ne l'interrompe
     await renew.drain(SHUTDOWN_DRAIN_SECONDS)
-    task.cancel()
+    for task in tasks:
+        task.cancel()
     for s in SESSIONS.values():
         s.cancel()
 
@@ -90,6 +93,8 @@ async def security(request: Request, call_next):
         response = await call_next(request)          # supervision : jamais filtrée
     elif not auth.host_allowed(request):
         response = _deny(421, "host_not_allowed")
+    elif backup.RESTORING and path.startswith("/api/") and path != "/api/backup/import":
+        response = _deny(503, "restoring")           # base et dossiers en cours de remplacement
     else:
         response = await _guarded(request, path, call_next)
     for k, v in HEADERS.items():
@@ -324,7 +329,17 @@ def state():
         # moment où la boucle lancera le renouvellement automatique (None : dès que possible)
         a["renew_at"] = exp - before * 3600 if exp else None
         a["effective_account"] = a["account_email"] or default
+        # les notes de version sont longues : à la demande (/api/apps/{id}/notes), pas à chaque sondage
+        a["has_notes"] = bool(a.pop("release_notes", None) or a.get("avail_notes"))
+        a.pop("avail_notes", None)
     health = renew.health(now)
+    notices = []
+    try:
+        revoked = json.loads(settings.raw_get("revocation_notice") or "null")
+    except ValueError:
+        revoked = None
+    if isinstance(revoked, dict):
+        notices.append({"id": "revocation", **revoked})
     return {
         "now": now,
         "version": VERSION,
@@ -336,6 +351,7 @@ def state():
         "devices": db.rows("SELECT * FROM devices ORDER BY name"),
         "accounts": plume.accounts(),
         "events": db.rows("SELECT * FROM events ORDER BY id DESC LIMIT 80"),
+        "notices": notices,
     }
 
 
@@ -368,7 +384,7 @@ def api_health(request: Request):
 def session_or_404(sid: str):
     s = SESSIONS.get(sid)
     if not s:
-        raise HTTPException(404, "session expirée")
+        raise HTTPException(404, "session_expired")
     return s
 
 
@@ -385,7 +401,7 @@ class Answer(BaseModel):
 async def session_answer(sid: str, body: Answer):
     s = session_or_404(sid)
     if s.state != "waiting":
-        raise HTTPException(409, "aucune saisie attendue")
+        raise HTTPException(409, "no_input_expected")
     await s.send(body.value)
     return s.public()
 
@@ -457,7 +473,7 @@ class Pair(BaseModel):
 @app.post("/api/devices/pair")
 async def device_pair(body: Pair):
     if not re.fullmatch(r"[0-9A-Fa-f:.%\w-]+", body.ip) or not 0 < body.port < 65536:
-        raise HTTPException(400, "adresse invalide")
+        raise HTTPException(400, "invalid_address")
     return devices.start_pairing(body.identifier, body.ip, body.port, body.name.strip() or "Apple TV").public()
 
 
@@ -526,7 +542,7 @@ async def _check_source(source_type: str, source: str | None) -> str | None:
             # résolution DNS hors de la boucle d'événements : un résolveur lent ne gèle pas l'interface
             await asyncio.to_thread(ipa._check_url, source)
         except (ValueError, ConnectionError) as e:
-            raise HTTPException(400, str(e)) from None
+            raise HTTPException(400, getattr(e, "code", None) or str(e)) from None
     return source
 
 
@@ -593,6 +609,13 @@ async def app_create(
             raise HTTPException(400, "not_an_ipa") from None
         if info["platform"] != "appletvos":
             raise HTTPException(400, f"not_tvos:{info['platform'] or 'unknown'}")
+        # tvOS de l'Apple TV choisie trop ancienne pour cette IPA : on le dit tout de suite, avant de signer
+        if device_id is not None:
+            tv = db.row("SELECT os_version FROM devices WHERE id = ?", device_id)
+            try:
+                ipa.check_min_os(info, (tv or {}).get("os_version"))
+            except ipa.SourceRejected as e:
+                raise HTTPException(400, e.code) from None
         # même app, même compte : une 2e fiche signerait deux fois et les copies s'écraseraient sur la TV
         if info["bundle_id"] and db.row(
                 "SELECT id FROM apps WHERE id != ? AND bundle_id = ? AND COALESCE(account_email, '') = ?",
@@ -603,7 +626,10 @@ async def app_create(
         raise
     except Exception as e:  # noqa: BLE001
         _abort_add(app_id)
-        raise HTTPException(400, str(e))
+        if isinstance(e, renew.NoRelease):
+            raise HTTPException(400, f"no_release_beta:{e.beta_tag}" if e.beta_tag else "no_release") from None
+        # SourceRejected porte un code stable que l'interface traduit ; sinon le texte brut (français)
+        raise HTTPException(400, getattr(e, "code", None) or str(e)) from None
 
     db.update("apps", app_id, name=info["name"], bundle_id=info["bundle_id"], version=info["version"], enabled=1)
     db.log(f"App ajoutée : {info['name']} {info['version']} ({info['bundle_id']})", app_id=app_id)
@@ -618,6 +644,7 @@ class AppPatch(BaseModel):
     source: Optional[str] = None           # dépôt GitHub (owner/repo) ou URL https
     source_filter: Optional[str] = None    # préfixe de tag (github)
     channel: Optional[str] = None          # stable | beta (github)
+    auto_update: Optional[bool] = None     # false : une nouvelle version est proposée, pas installée seule
 
 
 def app_or_404(app_id: int) -> dict:
@@ -635,6 +662,12 @@ async def app_patch(app_id: int, body: AppPatch):
         fields.pop("enabled", None)          # null n'a pas de sens : ignoré
     else:
         fields["enabled"] = int(fields["enabled"])
+    if fields.get("auto_update") is None:
+        fields.pop("auto_update", None)
+    else:
+        fields["auto_update"] = int(fields["auto_update"])
+        if fields["auto_update"]:
+            fields.update(avail_tag=None, avail_notes=None)   # le prochain passage installe la dernière version
     if "account_email" in fields:
         fields["account_email"] = fields["account_email"] or plume.default_account()
     if "source" in fields:
@@ -664,6 +697,35 @@ async def app_patch(app_id: int, body: AppPatch):
     if source_changed:
         renew.spawn(app_id, "nouvelle source")
     return db.row("SELECT * FROM apps WHERE id = ?", app_id)
+
+
+@app.post("/api/apps/{app_id}/update")
+async def app_update(app_id: int):
+    """Installe maintenant la version disponible d'une app dont les mises à jour automatiques sont coupées."""
+    a = app_or_404(app_id)
+    if a["source_type"] == "upload":
+        raise HTTPException(400, "no_source")
+    db.update("apps", app_id, next_attempt_at=None)
+    return {"ok": True, "started": renew.spawn(app_id, "mise à jour")}
+
+
+@app.post("/api/apps/{app_id}/rollback")
+async def app_rollback(app_id: int):
+    """Revient à la version précédente conservée et coupe les mises à jour automatiques de l'app."""
+    app_or_404(app_id)
+    if app_id in renew._RUNNING:
+        raise HTTPException(409, "app_busy")
+    if not renew.rollback(app_id):
+        raise HTTPException(404, "no_previous_version")
+    return {"ok": True}
+
+
+@app.get("/api/apps/{app_id}/notes")
+def app_notes(app_id: int):
+    """Notes de version : celles de la version téléchargée et celles de la version disponible."""
+    a = app_or_404(app_id)
+    return {"release_notes": a.get("release_notes"), "avail_notes": a.get("avail_notes"),
+            "version": a["version"], "avail_tag": a.get("avail_tag"), "prev_version": a.get("prev_version")}
 
 
 @app.post("/api/apps/{app_id}/renew")
@@ -714,13 +776,14 @@ class NotifyTest(BaseModel):
 
 @app.post("/api/settings/test-notification")
 async def settings_test_notification(body: NotifyTest):
-    url = (body.url or "").strip() or None
-    if url and not re.match(r"^https?://", url):
-        raise HTTPException(400, "adresse http(s):// attendue")
+    """Ancien point d'entrée (adresse ntfy seule) ; l'interface utilise /api/notifications/test."""
+    url = (body.url or "").strip() or settings.ntfy_url()
     try:
-        await renew.notify_test(url)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, str(e))
+        await notifier.test({"type": "ntfy", "url": url})
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
+    except notifier.NotifyFailed as e:
+        raise HTTPException(502, f"notify_failed:{e}") from None
     return {"ok": True}
 
 
@@ -741,8 +804,8 @@ async def backup_export(uploads: bool = False):
 
 @app.post("/api/backup/import")
 async def backup_import(file: UploadFile = File(...)):
-    if renew._RUNNING or proc.busy():
-        raise HTTPException(409, "renouvellement, connexion ou appairage en cours : réessaie dans un instant")
+    if renew._RUNNING or proc.busy() or backup.RESTORING:
+        raise HTTPException(409, "busy")
     tmp = TMP_DIR / f"import-{int(time.time())}.zip"
     try:
         limit, got = MAX_UPLOAD_MB * 1024 * 1024, 0
@@ -752,13 +815,29 @@ async def backup_import(file: UploadFile = File(...)):
                 if got > limit:
                     raise HTTPException(413, f"too_large:{MAX_UPLOAD_MB}")
                 f.write(chunk)
-        async with plume._locked():
-            try:
-                counts = await asyncio.to_thread(backup.restore, tmp)
-            except ValueError as e:
-                raise HTTPException(400, str(e)) from None
-        renew.startup()
-        await devices.sync_store()
+        # l'envoi a pu durer : un renouvellement a pu démarrer entre-temps. Aucun await entre cette
+        # vérification et le drapeau : la boucle et l'API se mettent en retrait avant tout remplacement.
+        if renew._RUNNING or proc.busy() or backup.RESTORING:
+            raise HTTPException(409, "busy")
+        backup.RESTORING = True
+        try:
+            async with plume._locked():
+                try:
+                    counts = await asyncio.to_thread(backup.restore, tmp)
+                except backup.BackupError as e:
+                    raise HTTPException(400 if e.code != "restore_failed" else 500, e.code) from None
+                except ValueError as e:
+                    raise HTTPException(400, str(e)) from None
+            renew.startup()
+            await devices.sync_store()
+        finally:
+            backup.RESTORING = False
         return {"ok": True, **counts}
     finally:
         tmp.unlink(missing_ok=True)
+
+
+# ---------- routes ajoutées : notifications, journal, support (voir routes_extra.py) ----------
+from . import routes_extra  # noqa: E402
+
+app.include_router(routes_extra.router)
