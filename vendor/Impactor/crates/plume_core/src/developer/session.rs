@@ -28,11 +28,10 @@ impl DeveloperSession {
         let adsid = account
             .spd
             .as_ref()
-            .unwrap()
-            .get("adsid")
-            .unwrap()
-            .as_string()
-            .unwrap();
+            .and_then(|spd| spd.get("adsid"))
+            .and_then(Value::as_string)
+            .ok_or(Error::Parse)?
+            .to_string();
         let xcode_gs_token = account
             .get_app_token("com.apple.gs.xcode.auth")
             .await?
@@ -41,7 +40,7 @@ impl DeveloperSession {
         Ok(DeveloperSession {
             anisette: account.anisette.clone(),
             client: account.client.clone(),
-            adsid: adsid.into(),
+            adsid,
             xcode_gs_token,
         })
     }
@@ -51,7 +50,15 @@ impl DeveloperSession {
         xcode_gs_token: String,
         config: AnisetteConfiguration,
     ) -> Result<Self, Error> {
-        let anisette = AnisetteData::new(config).await?;
+        let mut anisette = AnisetteData::new(config).await?;
+        if anisette.fresh_identity {
+            // A renewal never signs in, so nothing else would let Apple see the new identity
+            // synchronize before this session's first request. Best effort.
+            match anisette.synchronize_with_apple().await {
+                Ok(synced) => anisette = synced,
+                Err(e) => log::warn!("anisette synchronization with Apple skipped: {e}"),
+            }
+        }
         Self::new_with_anisette(adsid, xcode_gs_token, Arc::new(Mutex::new(anisette))).await
     }
 
@@ -95,7 +102,7 @@ impl DeveloperSession {
         headers.insert("Content-Type", HeaderValue::from_static("text/x-xml-plist"));
         headers.insert("Accept", HeaderValue::from_static("text/x-xml-plist"));
         self.insert_identity_headers(&mut headers).await;
-        self.insert_anisette_headers(&mut headers).await;
+        self.insert_anisette_headers(&mut headers).await?;
 
         let mut body = body.unwrap_or_default();
         body.insert(
@@ -149,7 +156,7 @@ impl DeveloperSession {
         if let Some(RequestType::Get) = request_type {
             headers.insert("X-HTTP-Method-Override", HeaderValue::from_static("GET"));
         }
-        self.insert_anisette_headers(&mut headers).await;
+        self.insert_anisette_headers(&mut headers).await?;
 
         let mut request_builder = match request_type {
             Some(RequestType::Patch) => self.client.patch(url).headers(headers.clone()),
@@ -182,7 +189,6 @@ impl DeveloperSession {
     // TODO: this can be deduplicated as well, for reuse in `fn build_2fa_headers`
     async fn insert_identity_headers(&self, headers: &mut HeaderMap) {
         headers.insert("Accept-Language", HeaderValue::from_static("en-us"));
-        headers.insert("User-Agent", HeaderValue::from_static("Xcode"));
         headers.insert(
             "X-Apple-I-Identity-Id",
             HeaderValue::from_str(&self.adsid).unwrap(),
@@ -193,26 +199,36 @@ impl DeveloperSession {
         );
     }
 
-    async fn insert_anisette_headers(&self, headers: &mut HeaderMap) {
-        let valid_anisette = self.get_anisette().await;
+    /// The anisette data and the device they belong to: the client info and the user agent that
+    /// the anisette server reported (the user agent used to be a fixed `Xcode`).
+    async fn insert_anisette_headers(&self, headers: &mut HeaderMap) -> Result<(), Error> {
+        let valid_anisette = self.get_anisette().await?;
         for (k, v) in valid_anisette.generate_headers(false, true, true) {
-            headers.insert(
-                HeaderName::from_bytes(k.as_bytes()).unwrap(),
-                HeaderValue::from_str(&v).unwrap(),
-            );
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(k.as_bytes()),
+                HeaderValue::from_str(&v),
+            ) {
+                headers.insert(name, value);
+            }
+        }
+        if let Ok(value) = HeaderValue::from_str(&valid_anisette.user_agent) {
+            headers.insert("User-Agent", value);
         }
         if let Ok(locale) = valid_anisette.get_header("x-apple-locale") {
-            headers.insert("X-Apple-Locale", HeaderValue::from_str(&locale).unwrap());
+            if let Ok(value) = HeaderValue::from_str(&locale) {
+                headers.insert("X-Apple-Locale", value);
+            }
         }
+        Ok(())
     }
 
     // TODO: deduplicate?
-    pub async fn get_anisette(&self) -> AnisetteData {
+    pub async fn get_anisette(&self) -> Result<AnisetteData, Error> {
         let mut locked = self.anisette.lock().await;
         if locked.needs_refresh() {
-            *locked = locked.refresh().await.unwrap();
+            *locked = locked.refresh().await?;
         }
-        locked.clone()
+        Ok(locked.clone())
     }
 }
 

@@ -4,43 +4,41 @@ use aes_gcm::aes::Aes256;
 use aes_gcm::{AeadInOut, Nonce};
 use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
-use reqwest::header::{HeaderMap, HeaderValue};
 
 use crate::Error;
 use sha2::Sha256;
 
-use crate::auth::account::{check_error, parse_response};
+use crate::auth::account::{check_error, parse_response, send_with_retry};
 use crate::auth::{
-    Account, AppToken, AuthTokenRequest, AuthTokenRequestBody, GSA_ENDPOINT, RequestHeader,
+    Account, AppToken, AuthTokenRequest, AuthTokenRequestBody, GSA_SERVICE, RequestHeader, gsa_url,
 };
 
 impl Account {
     pub async fn get_app_token(&self, app_name: &str) -> Result<AppToken, Error> {
-        let spd = self.spd.as_ref().unwrap();
-        let dsid = spd.get("adsid").unwrap().as_string().unwrap();
-        let auth_token = spd.get("GsIdmsToken").unwrap().as_string().unwrap();
+        let spd = self.spd.as_ref().ok_or(Error::Parse)?;
+        let dsid = spd
+            .get("adsid")
+            .and_then(plist::Value::as_string)
+            .ok_or(Error::Parse)?;
+        let auth_token = spd
+            .get("GsIdmsToken")
+            .and_then(plist::Value::as_string)
+            .ok_or(Error::Parse)?;
 
-        let valid_anisette = self.get_anisette().await;
+        let valid_anisette = self.get_anisette().await?;
 
-        let sk = spd.get("sk").unwrap().as_data().unwrap();
-        let c = spd.get("c").unwrap().as_data().unwrap();
+        let sk = spd
+            .get("sk")
+            .and_then(plist::Value::as_data)
+            .ok_or(Error::Parse)?;
+        let c = spd
+            .get("c")
+            .and_then(plist::Value::as_data)
+            .ok_or(Error::Parse)?;
 
         let checksum = Self::create_checksum(&sk.to_vec(), dsid, app_name);
 
-        let mut gsa_headers = HeaderMap::new();
-        gsa_headers.insert(
-            "Content-Type",
-            HeaderValue::from_str("text/x-xml-plist").unwrap(),
-        );
-        gsa_headers.insert("Accept", HeaderValue::from_str("*/*").unwrap());
-        gsa_headers.insert(
-            "User-Agent",
-            HeaderValue::from_str("akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0").unwrap(),
-        );
-        gsa_headers.insert(
-            "X-MMe-Client-Info",
-            HeaderValue::from_str(&valid_anisette.get_header("x-mme-client-info")?).unwrap(),
-        );
+        let gsa_headers = valid_anisette.grandslam_headers(false)?;
 
         let header = RequestHeader {
             version: "1.0.1".to_string(),
@@ -64,13 +62,14 @@ impl Account {
         plist::to_writer_xml(&mut buffer, &packet)?;
         let buffer = String::from_utf8(buffer).unwrap();
 
-        let res = self
-            .client
-            .post(GSA_ENDPOINT)
-            .headers(gsa_headers.clone())
-            .body(buffer)
-            .send()
-            .await;
+        let url = gsa_url(GSA_SERVICE);
+        let res = send_with_retry(|| {
+            self.client
+                .post(&url)
+                .headers(gsa_headers.clone())
+                .body(buffer.clone())
+        })
+        .await;
         let res = parse_response(res).await?;
         let err_check = check_error(&res);
         if err_check.is_err() {

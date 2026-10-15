@@ -156,6 +156,10 @@ async fn login(args: LoginArgs) -> Result<()> {
         let can_use_sms = !req.trusted_phone_numbers.is_empty();
         match req.method {
             TwoFactorMethod::Sms => log::info!("Enter the code sent via SMS: "),
+            // Apple answered 403 to the SMS: its code was already pushed to the trusted devices.
+            TwoFactorMethod::Device if req.sms_refused => log::info!(
+                "Enter 2FA code from a trusted Apple device (SMS refused by Apple): "
+            ),
             TwoFactorMethod::Device if can_use_sms && req.trusted_phone_numbers.len() > 1 => {
                 let endings: Vec<String> = req
                     .trusted_phone_numbers

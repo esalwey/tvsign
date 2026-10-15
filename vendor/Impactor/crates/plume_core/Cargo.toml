@@ -8,7 +8,7 @@ license = "MPL-2.0"
 repository.workspace = true
 
 [dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
 plist.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
@@ -51,5 +51,7 @@ srp = "0.7.0-rc.1"
 reqwest = { version = "0.13", features = ["json", "gzip", "native-tls", "system-proxy"] }
 
 [features]
-default = []
+# `tweaks` is on by default: lib.rs and utils/provision.rs use MachO without the feature, so the
+# crate did not compile alone (`cargo test -p plume_core`). Every dependent already enables it.
+default = ["tweaks"]
 tweaks = []

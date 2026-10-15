@@ -10,7 +10,25 @@ use tokio::sync::Mutex;
 use crate::auth::anisette_data::AnisetteData;
 use crate::{Error, client};
 
-const GSA_ENDPOINT: &str = "https://gsa.apple.com/grandslam/GsService2";
+const GSA_HOST: &str = "https://gsa.apple.com";
+/// Path of the GrandSlam service (SRP login, app tokens).
+const GSA_SERVICE: &str = "/grandslam/GsService2";
+
+#[cfg(test)]
+thread_local! {
+    /// The tests of the sign-in point GrandSlam at a local server (the whole sign-in runs on the
+    /// thread of the test).
+    pub(crate) static TEST_GSA_HOST: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `https://gsa.apple.com` followed by `path`.
+pub(crate) fn gsa_url(path: &str) -> String {
+    #[cfg(test)]
+    if let Some(host) = TEST_GSA_HOST.with(|host| host.borrow().clone()) {
+        return format!("{host}{path}");
+    }
+    format!("{GSA_HOST}{path}")
+}
 
 #[derive(Debug, Clone)]
 pub struct Account {
@@ -161,7 +179,11 @@ pub enum TwoFactorMethod {
 #[derive(Debug, Clone)]
 pub struct TwoFactorRequest {
     pub method: TwoFactorMethod,
+    /// Numbers a code can be sent to. Empty once Apple refused the SMS: do not offer it again.
     pub trusted_phone_numbers: Vec<TrustedPhoneNumber>,
+    /// Apple refused to send the code by SMS (HTTP 403) during this sign-in: only the code of a
+    /// trusted Apple device can be entered.
+    pub sms_refused: bool,
 }
 
 /// How the caller chose to respond to a 2FA prompt
