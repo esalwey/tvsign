@@ -121,10 +121,7 @@ validated on every device and iOS release yet: treat it as experimental and repo
 
 **One-time setup, per device**
 
-1. **Developer Mode** on the device (Settings › Privacy & Security › Developer Mode, then restart).
-   The option only appears once a signed app or Xcode has touched the device; tvsign shows a banner
-   when it is off (a signed app installs but will not launch).
-2. **Pair once.** An iPhone shows no PIN screen like an Apple TV, so the pairing keys are created over
+1. **Pair once.** An iPhone shows no PIN screen like an Apple TV, so the pairing keys are created over
    USB (`plumesign pair usb`). After that every renewal runs over Wi-Fi.
    - *Windows edition:* plug the device in, unlock it, tap **Trust**, then Pair › iPhone / iPad ›
      **Pair over USB**. This needs Apple's USB driver (Apple Mobile Device Service): install iTunes or
@@ -133,13 +130,18 @@ validated on every device and iOS release yet: treat it as experimental and repo
      Pair on any computer that has usbmuxd (Windows with iTunes / Apple Devices, macOS, Linux with the
      `usbmuxd` package) with `plumesign pair usb` (`plumesign.exe` sits in the Windows edition's install
      folder; other systems: build it from `vendor/Impactor`, see [docs/building.md](docs/building.md)).
-     Then in tvsign: Pair › iPhone / iPad › **Import a pairing file** and upload the `.plist` created in
-     plumesign's `remotepairing` folder (`%APPDATA%\PlumeImpactor\remotepairing` on Windows,
-     `~/.config/PlumeImpactor/remotepairing` elsewhere). The UDID is read from the file name
-     (`<UDID>.plist`, `plume_<UDID>.plist`), otherwise type it. A pairing file made by Impactor
-     is accepted too.
-3. **Trust the developer** after the first install: Settings › General › VPN & Device Management ›
+     Then in tvsign: Pair › iPhone / iPad › **Import a pairing file** and upload the `<UDID>.plist`
+     created in plumesign's `remotepairing` folder (`%APPDATA%\PlumeImpactor\remotepairing` on
+     Windows, `~/.config/PlumeImpactor/remotepairing` elsewhere), **not** the `<UDID>.info.plist` next
+     to it. The UDID is read from the file name (`<UDID>.plist`, `plume_<UDID>.plist`), otherwise
+     type it. A pairing file made by Impactor is accepted too.
+2. **Install a first app** from tvsign. It installs even though Developer Mode is still off, but it
+   may not launch yet.
+3. **Trust the developer** once the app is installed: Settings › General › VPN & Device Management ›
    your Apple ID › Trust (once per Apple ID). tvsign cannot do it for you.
+4. **Turn on Developer Mode:** Settings › Privacy & Security › Developer Mode, then restart the
+   device. The option does not exist on a device that never ran a signed app, so it only appears
+   after step 2; tvsign cannot reveal or enable it, but shows a banner while it is off.
 
 **What is different from an Apple TV**
 
@@ -351,10 +353,7 @@ considérez-le comme expérimental et signalez ce que vous constatez.**
 
 **Mise en place, une fois par appareil**
 
-1. **Mode développeur** sur l'appareil (Réglages › Confidentialité et sécurité › Mode développeur,
-   puis redémarrage). L'option n'apparaît qu'après qu'une app signée ou Xcode a touché l'appareil ;
-   tvsign affiche une bannière quand il est désactivé (une app signée s'installe mais ne se lance pas).
-2. **Appairer une fois.** Un iPhone n'affiche pas d'écran de code comme l'Apple TV : les clés
+1. **Appairer une fois.** Un iPhone n'affiche pas d'écran de code comme l'Apple TV : les clés
    d'appairage sont créées par USB (`plumesign pair usb`). Ensuite, tous les renouvellements passent
    par le Wi-Fi.
    - *Édition Windows :* branchez l'appareil, déverrouillez-le, touchez **Se fier**, puis Appairer ›
@@ -365,14 +364,20 @@ considérez-le comme expérimental et signalez ce que vous constatez.**
      Apple, macOS, Linux avec le paquet `usbmuxd`) avec `plumesign pair usb` (`plumesign.exe` est dans
      le dossier d'installation de l'édition Windows ; ailleurs, le compiler depuis `vendor/Impactor`,
      voir [docs/building.md](docs/building.md)). Puis dans tvsign : Appairer › iPhone / iPad ›
-     **Importer un fichier d'appairage** et envoyez le `.plist` créé dans le dossier `remotepairing`
-     de plumesign (`%APPDATA%\PlumeImpactor\remotepairing` sous Windows,
-     `~/.config/PlumeImpactor/remotepairing` ailleurs). L'UDID est lu dans le nom du fichier
-     (`<UDID>.plist`, `plume_<UDID>.plist`), sinon saisissez-le. Un fichier fait par Impactor est
-     accepté aussi.
-3. **Faire confiance au développeur** après la première installation : Réglages › Général › VPN et
+     **Importer un fichier d'appairage** et envoyez le `<UDID>.plist` créé dans le dossier
+     `remotepairing` de plumesign (`%APPDATA%\PlumeImpactor\remotepairing` sous Windows,
+     `~/.config/PlumeImpactor/remotepairing` ailleurs), **pas** le `<UDID>.info.plist` qui est à côté.
+     L'UDID est lu dans le nom du fichier (`<UDID>.plist`, `plume_<UDID>.plist`), sinon saisissez-le.
+     Un fichier fait par Impactor est accepté aussi.
+2. **Installer une première app** depuis tvsign. Elle s'installe même si le Mode développeur est
+   encore désactivé, mais peut ne pas se lancer pour l'instant.
+3. **Faire confiance au développeur** une fois l'app installée : Réglages › Général › VPN et
    gestion de l'appareil › votre Apple ID › Faire confiance (une fois par Apple ID). tvsign ne peut pas
    le faire à votre place.
+4. **Activer le Mode développeur :** Réglages › Confidentialité et sécurité › Mode développeur, puis
+   redémarrage de l'appareil. L'option n'existe pas sur un appareil qui n'a jamais exécuté d'app
+   signée : elle n'apparaît qu'après l'étape 2. tvsign ne peut ni la faire apparaître ni l'activer,
+   mais affiche une bannière tant qu'il est désactivé.
 
 **Ce qui change par rapport à une Apple TV**
 

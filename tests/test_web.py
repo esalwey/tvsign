@@ -62,6 +62,19 @@ class ErrorTable(unittest.TestCase):
         # une TV garde son explication « app ouverte »
         self.assertEqual(cause_of("installd ne progresse plus depuis 30 min sur « TV »"), "c_app_open")
 
+    def test_usb_pairing_failures_are_explained(self):
+        # messages de plumesign pair usb (wireless/usb.rs), affichés tels quels dans la sortie de l'appairage
+        for msg, key in (
+                ("usbmuxd is not reachable (os error 2): install iTunes or Apple Devices on Windows, or the usbmuxd "
+                 "package on Linux", "c_usbmuxd"),
+                ("No iPhone or iPad connected over USB (plug it in, unlock it and accept \"Trust this computer\")",
+                 "c_usb_none"),
+                ("No device 00008110-AAAA0000BBBB0001 connected over USB (unlock it and accept \"Trust this "
+                 "computer\")", "c_usb_none"),
+                ("2 devices are connected over USB: pass the one to pair with --udid", "c_usb_many"),
+                ("The device offers no tunnel service (iOS 17 or later is required)", "c_ios17")):
+            self.assertEqual(cause_of(msg), key, msg)
+
 
 @unittest.skipUnless(shutil.which("node"), "node absent")
 class Strings(unittest.TestCase):

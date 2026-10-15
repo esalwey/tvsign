@@ -65,11 +65,12 @@ La page **Diagnostic** de tvsign indique combien d'Apple TV sont visibles sur le
 
 Un iPhone n'affiche pas de code : l'appairage se fait **une seule fois par câble USB**, puis tout se passe en Wi-Fi.
 
-1. Sur l'appareil, activez le **Mode développeur** (*Réglages > Confidentialité et sécurité > Mode développeur*, puis redémarrage). L'option n'apparaît qu'après qu'une app signée ou Xcode a touché l'appareil ; tvsign affiche une bannière tant qu'il est désactivé.
-2. Installez le pilote USB d'Apple si ce n'est pas fait : **iTunes** ou l'app **Appareils Apple** du Microsoft Store (elles installent *Apple Mobile Device Service*). tvsign ne l'embarque pas.
-3. Branchez l'appareil au PC, déverrouillez-le et touchez **Se fier**.
-4. Dans tvsign : **Appairer**, onglet **iPhone / iPad**, puis **Appairer en USB**.
-5. Après la première installation d'une app : *Réglages > Général > VPN et gestion de l'appareil*, touchez votre Apple ID puis **Faire confiance** (une fois par Apple ID).
+1. Installez le pilote USB d'Apple si ce n'est pas fait : **iTunes** ou l'app **Appareils Apple** du Microsoft Store (elles installent *Apple Mobile Device Service*). tvsign ne l'embarque pas.
+2. Branchez l'appareil au PC, déverrouillez-le et touchez **Se fier**.
+3. Dans tvsign : **Appairer**, onglet **iPhone / iPad**, puis **Appairer en USB**.
+4. Installez une première app depuis tvsign. Elle s'installe même si le Mode développeur est désactivé, mais peut ne pas se lancer pour l'instant.
+5. Une fois l'app installée : *Réglages > Général > VPN et gestion de l'appareil*, touchez votre Apple ID puis **Faire confiance** (une fois par Apple ID).
+6. Activez le **Mode développeur** : *Réglages > Confidentialité et sécurité > Mode développeur*, puis redémarrage. L'option n'apparaît qu'après la première installation (étape 4) ; tvsign affiche une bannière tant qu'il est désactivé.
 
 Un iPhone ou un iPad est renouvelé **96 heures** avant l'expiration, et dès qu'il revient sur le réseau de la maison. Il ne répond que réveillé (écran allumé ou en charge, c'est mieux). Utilisez un Apple ID réservé à tvsign : AltStore, SideStore ou Sideloadly sur le même compte révoquent leurs certificats mutuellement.
 

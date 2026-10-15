@@ -89,6 +89,10 @@ const CAUSES = [
   [/8220|no devices from which/i, "c_8220"],
   [/NO_TEAM|MULTIPLE_TEAMS/, "c_team"],
   [/ancienne version de tvsign/i, "c_legacy"],
+  [/usbmuxd is not reachable/i, "c_usbmuxd"],
+  [/No (iPhone or iPad|device \S+) connected over USB/i, "c_usb_none"],
+  [/\d+ devices are connected over USB/i, "c_usb_many"],
+  [/offers no tunnel service|iOS 17 or later is required/i, "c_ios17"],
   [/appairage perdu|PAIRING_LOST|pairing record|not paired|No stored pairing/i, "c_lost"],
   [/aucune Apple TV/i, "c_no_tv"],
   [/aucun compte Apple/i, "c_no_account"],
@@ -190,9 +194,11 @@ async function busy(b, attr, label, fn) {
 }
 
 // ---------- état d'une app ----------
+// Délai de renouvellement de l'app, en heures : celui de son appareil (iPhone / iPad : plus long), sinon le général.
+const fenetreRenouv = (a, s) => a.renew_before_hours ?? s.renew_before_hours;
 // [ton, libellé] ; ton : ok | warn | err | cours | neutre
 function etatApp(a, now, s) {
-  const exp = a.expires_at, fenetre = s.renew_before_hours * 3600;
+  const exp = a.expires_at, fenetre = fenetreRenouv(a, s) * 3600;
   const expiree = exp ? exp <= now : false;
   if (a.running) {
     const ph = a.phase || {};
@@ -226,7 +232,7 @@ function jauge(a, now, s, ton) {
   const debut = a.signed_at && a.signed_at < exp ? a.signed_at : exp - 7 * 86400;
   const total = Math.max(1, exp - debut);
   const pct = Math.min(100, Math.max(0, ((exp - now) / total) * 100));
-  const renouv = a.renew_at ?? exp - s.renew_before_hours * 3600;
+  const renouv = a.renew_at ?? exp - fenetreRenouv(a, s) * 3600;
   const posRenouv = Math.min(100, Math.max(0, ((renouv - debut) / total) * 100));
   const reste = exp - now;
   const label = reste > 0 ? t("gauge_valid", { left: restant(reste), date: fmtDate(exp) }) : t("gauge_expired", { date: fmtDate(exp) });
@@ -350,7 +356,7 @@ function synthese(s, now) {
   const echecs = actives.filter((a) => a.status === "error" || !a.device_id);
   const lim = 2 * ((h && h.check_interval) || 600) + 900;   // un passage peut durer ~15 min (installation)
   const enRetard = actives.filter((a) => !a.running && a.status !== "error" && a.expires_at && a.expires_at > now
-    && (a.renew_at ?? a.expires_at - s.renew_before_hours * 3600) < now - lim);
+    && (a.renew_at ?? a.expires_at - fenetreRenouv(a, s) * 3600) < now - lim);
   const arret = boucleArretee(h, now);
   const cours = s.apps.filter((a) => a.running);
   const attente = cours.filter((a) => a.phase?.step === "waiting_app");
@@ -367,7 +373,7 @@ function synthese(s, now) {
   const prochaine = actives.filter((a) => a.expires_at).sort((x, y) => x.expires_at - y.expires_at)[0];
   // aucune app active avec un profil valide (toutes en pause, ou pas encore installées) : pas de « à jour » vert
   if (!prochaine) return ["neutre", t("sum_idle_t"), t("sum_idle")];
-  const quand = Math.max(now, prochaine.renew_at ?? prochaine.expires_at - s.renew_before_hours * 3600);
+  const quand = Math.max(now, prochaine.renew_at ?? prochaine.expires_at - fenetreRenouv(prochaine, s) * 3600);
   return ["ok", t("sum_ok_t"), t("sum_next", { when: quand <= now + 60 ? t("now") : relatif(quand, now) })];
 }
 
@@ -452,7 +458,8 @@ function renderDevices(s, now) {
     const notes = [];
     if (mobile && d.dev_mode === 1) notes.push(["", t("devmode_row_on")]);
     if (mobile && d.dev_mode === 0) notes.push(["texte-err", t("devmode_row_off")]);
-    if (mobile && d.app_count >= 3) notes.push(["texte-err", t("dev_apps_limit", { n: d.app_count })]);
+    if (mobile && d.app_count > 3) notes.push(["texte-err", t("dev_apps_limit", { n: d.app_count })]);
+    else if (mobile && d.app_count === 3) notes.push(["", t("dev_apps_full", { n: d.app_count })]);
     if (vieux) notes.push(["texte-err", t("dev_old_os")]);
     return `<div class="row">
       <span class="row__icon row__icon--${COULEUR[ton]}">${mobile ? ICONS.phone : ICONS.tv}</span>
@@ -1172,7 +1179,10 @@ const WIZ_RENDU = {
       <ol class="consigne">${t("pair_steps")}</ol>
       ${legacy.length ? `<div class="banner banner--info"><p><strong>${esc(tn("legacy_t", legacy.length, { names: legacy.map((d) => d.name).join(", ") }))}</strong>${t("legacy")}</p></div>` : ""}
       ${ok.map((d) => fait(t("wiz_tv_done", { name: d.name }))).join("")}
-      <button class="btn ${ok.length ? "" : "btn--primary"}" data-open="dlg-pair">${ok.length ? t("pair_another") : t("pair_title")}</button>`;
+      <div class="actions-form">
+        <button class="btn ${ok.length ? "" : "btn--primary"}" data-open="dlg-pair" data-pair-kind="tv">${ok.length ? t("pair_another") : t("pair_title")}</button>
+        <button class="btn" data-open="dlg-pair" data-pair-kind="phone">${t("wiz_pair_phone")}</button>
+      </div>`;
   },
   app: () => {
     const apps = STATE?.apps || [];
@@ -1182,6 +1192,7 @@ const WIZ_RENDU = {
       <p class="assistant__texte">${t("wiz_app_more")}</p>`;
     return `${titreEtape("wiz_app_title", t("wiz_app_text"))}
       ${proposes ? presetCartes(proposes, "wiz-preset") : `<p class="statut"><span class="etat etat--cours">${t("loading")}</span></p>`}
+      ${proposes && !proposes.length && estMobile(tvs[0]?.family) ? `<p class="group__footer">${t("wiz_no_phone_preset")}</p>` : ""}
       <p class="group__header espace">${t("channel")}</p>
       <div class="segmented" role="radiogroup" aria-label="${esc(t("channel"))}">
         <label><input type="radio" name="wiz-canal" value="stable" ${PRESETS?.[0]?.default_channel === "beta" ? "" : "checked"}><span>${t("channel_stable")}</span></label>
