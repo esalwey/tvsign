@@ -475,8 +475,11 @@ def _pair_address(ip: str, port: int) -> str:
         addr = ipaddress.ip_address((ip or "").strip())
     except ValueError:
         raise HTTPException(400, "invalid_address") from None
+    v4 = addr.ipv4_mapped if addr.version == 6 else addr
     if (not 0 < port < 65536 or addr.is_loopback or addr.is_unspecified or addr.is_multicast
-            or addr.is_global):
+            # IPv4 : pas d'adresse publique. IPv6 : les adresses globales (GUA) sont celles d'un réseau local
+            # qui n'a pas d'IPv4 ; l'IP littérale suffit à écarter noms et options de ligne de commande.
+            or (v4 is not None and v4.is_global)):
         raise HTTPException(400, "invalid_address")
     return str(addr)
 
@@ -495,7 +498,7 @@ class UsbPair(BaseModel):
 async def device_pair_usb(body: UsbPair):
     """iPhone / iPad branché en USB sur la machine de tvsign (Windows, macOS, Linux avec usbmuxd)."""
     udid = (body.udid or "").strip() or None
-    if udid and not re.fullmatch(r"[0-9A-Za-z-]{8,64}", udid):
+    if udid and not devices.valid_udid(udid):
         raise HTTPException(400, "invalid_udid")
     return devices.start_usb_pairing(udid).public()
 
@@ -695,7 +698,7 @@ async def app_create(
             except ipa.PlatformRejected as e:
                 raise HTTPException(400, e.code or str(e)) from None
         try:
-            info = ipa.app_info(dest)
+            info = await asyncio.to_thread(ipa.app_info, dest)
         except (zipfile.BadZipFile, ValueError):
             raise HTTPException(400, "not_an_ipa") from None
         # l'IPA doit convenir à la famille de l'appareil visé (Apple TV si aucun n'est choisi)

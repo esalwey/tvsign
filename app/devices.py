@@ -247,41 +247,61 @@ def _save_paired(name: str, udid: str, host: str, model: str | None = None, fami
         name, udid, udid, udid, model, os_version, ip, host, family, time.time())
 
 
+# UDID : commence par un caractère alphanumérique (plumesign refuse une valeur qui commence par « - »)
+_UDID_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z-]{7,63}")
+_MODEL_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z,._ -]{0,31}")
+MAX_NAME = 64
+
+
+def valid_udid(udid: str | None) -> bool:
+    return bool(udid) and _UDID_RE.fullmatch(udid) is not None
+
+
+def _identity_line(lines: list[str]) -> dict:
+    """Ligne JSON d'identité que plumesign affiche après l'appairage. On la reconnaît à son contenu,
+    pas à l'ordre des clés (serde_json les trie par ordre alphabétique)."""
+    found: dict = {}
+    for l in lines:
+        l = l.strip()
+        if l.startswith("{") and "UniqueDeviceID" in l:
+            try:
+                data = json.loads(l)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict):
+                found = data
+    return found
+
+
+async def _usb_pairing_done(s: Session) -> None:
+    match = next((m for l in reversed(s.lines) if (m := _PAIRED.match(l.strip()))), None)
+    if s.state != "done" or not match:
+        if s.state == "done":
+            s.state = "failed"
+        db.log(f"Appairage USB échoué : {' | '.join(s.lines[-2:])}", "error")
+        return
+    found = _identity_line(s.lines)
+    paired_udid = match.group(2)
+    model = found.get("ProductType")
+    family = found.get("DeviceFamily") or families.family_of(model) or "ios"
+    name = found.get("DeviceName") or families.label(family)
+    device_id = _save_paired(name, paired_udid, PAIR_HOST, model, family, found.get("ProductVersion"),
+                             rename=False)
+    s.result.update(device_id=device_id, udid=paired_udid, family=family)
+    db.log(f"{families.label(family)} « {name} » appairé en USB")
+    try:
+        await refresh_info(device_id)
+    except Exception as e:  # noqa: BLE001 - l'appareil n'est peut-être pas encore joignable en Wi-Fi
+        s.result["info_error"] = str(e)
+        db.log(f"Infos de {name} non récupérées pour l'instant : {e}", "warn")
+
+
 def start_usb_pairing(udid: str | None = None) -> Session:
     """Appairage d'un iPhone / iPad branché en USB sur la machine qui fait tourner tvsign
     (`plumesign pair usb`). Une seule fois : ensuite tout se passe en Wi-Fi."""
     session = register(Session("pair", re.compile(r"^\0$")))      # aucune saisie attendue
-
-    async def done(s: Session) -> None:
-        match = next((m for l in reversed(s.lines) if (m := _PAIRED.match(l.strip()))), None)
-        if s.state != "done" or not match:
-            if s.state == "done":
-                s.state = "failed"
-            db.log(f"Appairage USB échoué : {' | '.join(s.lines[-2:])}", "error")
-            return
-        found = {}
-        for l in s.lines:
-            if l.startswith('{"UniqueDeviceID"'):
-                try:
-                    found = json.loads(l)
-                except json.JSONDecodeError:
-                    pass
-        paired_udid = match.group(2)
-        model = found.get("ProductType")
-        family = found.get("DeviceFamily") or families.family_of(model) or "ios"
-        name = found.get("DeviceName") or families.label(family)
-        device_id = _save_paired(name, paired_udid, PAIR_HOST, model, family, found.get("ProductVersion"),
-                                 rename=False)
-        s.result.update(device_id=device_id, udid=paired_udid, family=family)
-        db.log(f"{families.label(family)} « {name} » appairé en USB")
-        try:
-            await refresh_info(device_id)
-        except Exception as e:  # noqa: BLE001 - l'appareil n'est peut-être pas encore joignable en Wi-Fi
-            s.result["info_error"] = str(e)
-            db.log(f"Infos de {name} non récupérées pour l'instant : {e}", "warn")
-
     args = ["pair", "usb", "--host", PAIR_HOST] + (["-u", udid] if udid else [])
-    spawn(session.start(PLUMESIGN, *args, env=plume.env(), on_exit=done))
+    spawn(session.start(PLUMESIGN, *args, env=plume.env(), on_exit=_usb_pairing_done))
     return session
 
 
@@ -293,14 +313,20 @@ async def import_pairing(data: bytes, filename: str | None, udid: str | None, na
     udid = (udid or "").strip() or families.udid_from_name(filename)
     if not udid:
         raise ValueError("udid_required")
-    if not re.fullmatch(r"[0-9A-Za-z-]{8,64}", udid):
+    if not valid_udid(udid):
         raise ValueError("invalid_udid")
     if not data or len(data) > 64 * 1024:
         raise ValueError("invalid_pairing_file")
     model = (model or "").strip() or None
-    family = family if family in families.SUPPORTED else None
+    if model and not _MODEL_RE.fullmatch(model):
+        raise ValueError("invalid_model")
+    family = (family or "").strip() or None
+    if family and family not in families.SUPPORTED:
+        raise ValueError("invalid_family")
     family = family or families.family_of(model) or "ios"
     name = (name or "").strip() or families.label(family)
+    if len(name) > MAX_NAME or any(ord(c) < 32 or ord(c) == 127 for c in name):
+        raise ValueError("invalid_name")
     tmp = TMP_DIR / f"pairing-{int(time.time() * 1000)}.plist"
     tmp.write_bytes(data)
     try:

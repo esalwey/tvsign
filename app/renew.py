@@ -217,7 +217,8 @@ async def refresh_source(app: dict) -> bool:
         for i, cand in enumerate(candidates):
             try:
                 info = await asyncio.to_thread(ipa.download, cand["url"], dest, cand.get("sha256"), expect, **extra)
-                key = cand.get("key", key)
+                # `key` reste celle de la première IPA de la release (celle que new_release() et _unchanged()
+                # comparent), même si une suivante a été installée : sinon la même release serait retéléchargée en boucle
                 break
             except ipa.PlatformRejected:
                 if i == len(candidates) - 1:

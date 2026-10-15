@@ -294,7 +294,13 @@ class NoDowngrade(unittest.TestCase):
         self.assertTrue(asyncio.run(renew.refresh_source(a)))
         self.assertEqual([c[0] for c in calls], ["https://x/ios.ipa", "https://x/tv.ipa"])
         row = db.row("SELECT * FROM apps WHERE id = ?", a["id"])
-        self.assertEqual((row["source_key"], row["bad_tag"]), ("k-tv", None))
+        # la clé gardée est celle de la première IPA de la release (celle que l'on compare ensuite)
+        self.assertEqual((row["source_key"], row["bad_tag"]), ("k-ios", None))
+        calls.clear()
+        again = db.row("SELECT * FROM apps WHERE id = ?", a["id"])
+        self.assertFalse(asyncio.run(renew.new_release(again)))
+        self.assertFalse(asyncio.run(renew.refresh_source(again)))
+        self.assertEqual(calls, [])                            # pas de retéléchargement en boucle
 
     def test_all_assets_wrong_marks_the_tag_bad(self):
         def download(url, dest, sha256=None, expect_bundle=None, **kw):
