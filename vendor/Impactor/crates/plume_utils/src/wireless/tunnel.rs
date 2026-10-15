@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use idevice::IdeviceError;
+use idevice::remote_pairing::errors::RemotePairingError;
 use idevice::remote_pairing::{
     RemotePairingClient, RpPairingFile, RpPairingSocket, connect_tls_psk_tunnel_native,
 };
@@ -63,9 +64,10 @@ pub async fn locate(
         .iter()
         .find(|record| record.udid.eq_ignore_ascii_case(identifier))
         .map(|record| record.name.clone());
-    // A device with our device's name whose tag none of our keys produce: probably our device,
-    // which forgot this host. Only reported if the real one never shows up before the deadline.
-    let mut seen_forgotten = false;
+    // Un appareil du meme nom dont le tag ne correspond a aucune de nos cles : peut etre un autre
+    // appareil (le nom est librement modifiable, « Apple TV » par defaut). Simple indice dans le
+    // message, jamais une preuve que l'appairage est perdu.
+    let mut same_name_seen: Option<String> = None;
 
     let daemon = ServiceDaemon::new()?;
     let browse = daemon.browse(ServiceKind::RemotePairing.service_type())?;
@@ -121,15 +123,25 @@ pub async fn locate(
             }
             None => {
                 if let (Some(wanted), Some(name)) = (&wanted_name, &device.name) {
-                    seen_forgotten |= wanted.eq_ignore_ascii_case(name);
+                    if wanted.eq_ignore_ascii_case(name) {
+                        same_name_seen = Some(name.clone());
+                    }
                 }
             }
             _ => {}
         }
     }
 
-    if seen_forgotten && matches!(result, Err(Error::DeviceNotFound(_))) {
-        result = Err(Error::PairingNotAccepted);
+    if let Some(name) = same_name_seen {
+        if matches!(result, Err(Error::DeviceNotFound(_))) {
+            log::warn!(
+                "a device named {name:?} is on the network but is not paired with this host; \
+                 not treating the pairing as lost (it may be another device with the same name)"
+            );
+            result = Err(Error::DeviceNotFound(format!(
+                "{identifier} (a different device named {name:?} is visible but not paired with this host)"
+            )));
+        }
     }
 
     if let Err(e) = daemon.shutdown() {
@@ -181,18 +193,12 @@ async fn open_tunnel(
 
     step(client.attempt_pair_verify()).await??;
     if let Err(e) = step(client.validate_pairing()).await? {
-        return Err(match e {
-            IdeviceError::Socket(io) => Error::Unreachable(io),
-            e => {
-                log::debug!("pair-verify rejected: {e}");
-                Error::PairingNotAccepted
-            }
-        });
+        return Err(classify_verify_error(e));
     }
 
     let tunnel_port = step(client.create_tcp_listener()).await??;
-    let tunnel_stream = step(tokio::net::TcpStream::connect(SocketAddr::new(
-        address.ip(),
+    let tunnel_stream = step(tokio::net::TcpStream::connect(tunnel_address(
+        address,
         tunnel_port,
     )))
     .await?
@@ -228,6 +234,35 @@ async fn open_tunnel(
     Ok((adapter, handshake))
 }
 
+/// Adresse du tunnel : celle de l'appareil avec un autre port. On part de `address` elle-meme pour que
+/// l'identifiant de portee d'une adresse IPv6 link-local (fe80::...) ne soit pas perdu.
+fn tunnel_address(address: SocketAddr, port: u16) -> SocketAddr {
+    let mut tunnel = address;
+    tunnel.set_port(port);
+    tunnel
+}
+
+/// Seul un refus explicite de l'appareil prouve que l'appairage est perdu. Une reponse inattendue
+/// (appareil qui se reveille, TLV tronque...) est une panne passagere, a reessayer plus tard.
+fn classify_verify_error(error: IdeviceError) -> Error {
+    match error {
+        IdeviceError::Socket(io) => Error::Unreachable(io),
+        IdeviceError::RemotePairing(
+            RemotePairingError::PairVerifyFailed | RemotePairingError::PairingRejected(_),
+        ) => {
+            log::debug!("pair-verify rejected by the device");
+            Error::PairingNotAccepted
+        }
+        other => {
+            log::debug!("pair-verify failed without a clear rejection: {other}");
+            Error::Unreachable(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("pair-verify answer not understood: {other}"),
+            ))
+        }
+    }
+}
+
 async fn step<F: std::future::Future>(future: F) -> Result<F::Output, Error> {
     tokio::time::timeout(STEP_TIMEOUT, future)
         .await
@@ -237,4 +272,63 @@ async fn step<F: std::future::Future>(future: F) -> Result<F::Output, Error> {
                 "device stopped responding",
             ))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv6Addr, SocketAddrV6};
+
+    #[test]
+    fn tunnel_address_keeps_the_ipv6_scope_id() {
+        let ll = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 1, 2, 3, 4),
+            49152,
+            0,
+            7,
+        ));
+        let tunnel = tunnel_address(ll, 50000);
+        match tunnel {
+            SocketAddr::V6(v6) => {
+                assert_eq!(v6.scope_id(), 7);
+                assert_eq!(v6.port(), 50000);
+            }
+            _ => panic!("expected an IPv6 address"),
+        }
+    }
+
+    #[test]
+    fn tunnel_address_replaces_the_port_for_ipv4() {
+        let v4: SocketAddr = "192.168.1.20:49152".parse().unwrap();
+        assert_eq!(tunnel_address(v4, 1234).to_string(), "192.168.1.20:1234");
+    }
+
+    #[test]
+    fn only_an_explicit_rejection_means_pairing_lost() {
+        assert!(matches!(
+            classify_verify_error(RemotePairingError::PairVerifyFailed.into()),
+            Error::PairingNotAccepted
+        ));
+        assert!(matches!(
+            classify_verify_error(RemotePairingError::PairingRejected("no".into()).into()),
+            Error::PairingNotAccepted
+        ));
+    }
+
+    #[test]
+    fn unexpected_answers_are_retryable_not_pairing_lost() {
+        assert!(matches!(
+            classify_verify_error(IdeviceError::UnexpectedResponse("x".into())),
+            Error::Unreachable(_)
+        ));
+        assert!(matches!(
+            classify_verify_error(IdeviceError::NotEnoughBytes(32, 3)),
+            Error::Unreachable(_)
+        ));
+        let io = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+        assert!(matches!(
+            classify_verify_error(IdeviceError::Socket(io)),
+            Error::Unreachable(_)
+        ));
+    }
 }

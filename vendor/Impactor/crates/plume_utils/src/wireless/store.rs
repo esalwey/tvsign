@@ -57,7 +57,7 @@ impl PairingStore {
         let info_path = self.info_path(&device.udid)?;
 
         tokio::fs::create_dir_all(&self.dir).await?;
-        tokio::fs::write(&path, pairing_file.to_bytes()).await?;
+        write_atomic(&path, &pairing_file.to_bytes()).await?;
 
         let mut info = Dictionary::new();
         info.insert("udid".into(), Value::String(device.udid.clone()));
@@ -74,7 +74,7 @@ impl PairingStore {
 
         let mut buf = Vec::new();
         plist::to_writer_xml(&mut buf, &info)?;
-        tokio::fs::write(&info_path, buf).await?;
+        write_atomic(&info_path, &buf).await?;
 
         Ok(path)
     }
@@ -182,6 +182,34 @@ impl PairingStore {
     }
 }
 
+/// Ecrit dans un fichier voisin puis renomme : un kill ou une coupure de courant en pleine ecriture
+/// laisse l'ancien fichier intact (la cle d'appairage ne se regenere pas sans le PIN de la TV).
+/// Le fichier temporaire se termine par `.tmp`, jamais pris pour un appairage par `list()`.
+async fn write_atomic(path: &Path, data: &[u8]) -> Result<(), Error> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut tmp_name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+
+    let result = async {
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        file.write_all(data).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&tmp, path).await
+    }
+    .await;
+    if let Err(e) = result {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 async fn remove_if_present(path: &Path) -> Result<bool, Error> {
     match tokio::fs::remove_file(path).await {
         Ok(()) => Ok(true),
@@ -284,6 +312,44 @@ mod tests {
 
             tokio::fs::remove_dir_all(store.directory()).await.ok();
         });
+    }
+
+    #[test]
+    fn saving_twice_replaces_the_file_and_leaves_no_temp_file() {
+        let store = temp_store();
+        let device = sample_device();
+        let mut pairing_file = RpPairingFile::generate("plume");
+        pairing_file.alt_irk = Some(ALT_IRK.to_vec());
+
+        block_on(async {
+            store.save(&device, &pairing_file).await.unwrap();
+            store.save(&device, &pairing_file).await.unwrap();
+
+            let mut names: Vec<String> = Vec::new();
+            let mut entries = tokio::fs::read_dir(store.directory()).await.unwrap();
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                names.push(entry.file_name().to_string_lossy().to_string());
+            }
+            names.sort();
+            assert_eq!(
+                names,
+                vec![
+                    "00008110-001A2B3C00000000.info.plist".to_string(),
+                    "00008110-001A2B3C00000000.plist".to_string(),
+                ]
+            );
+            assert_eq!(store.list().await.unwrap().len(), 1);
+
+            tokio::fs::remove_dir_all(store.directory()).await.ok();
+        });
+    }
+
+    #[test]
+    fn a_leftover_temp_file_is_not_a_pairing() {
+        assert_eq!(
+            pairing_file_udid(Path::new("/x/00008110-001A.plist.tmp")),
+            None
+        );
     }
 
     #[test]
