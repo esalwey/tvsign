@@ -26,6 +26,11 @@ def _hours(value: float) -> None:
         raise ValueError("entre 12 et 150 heures")
 
 
+def _onoff(value: str) -> None:
+    if value.lower() not in ("on", "off", "1", "0", "true", "false", "yes", "no"):
+        raise ValueError("on ou off")
+
+
 def _language(value: str) -> None:
     if value not in ("auto", "en", "fr"):
         raise ValueError("auto, en ou fr")
@@ -37,6 +42,8 @@ PUBLIC: dict[str, Spec] = {
     "renew_before_hours": Spec(60.0, float, ["TVSIGN_RENEW_BEFORE_HOURS"], _hours),
     # vide = serveur par défaut de plumesign (https://ani.sidestore.app)
     "anisette_url": Spec("", str, ["TVSIGN_ANISETTE_URL", "PLUMESIGN_ANISETTE_URL", "ANISETTE_URL_V3"], _url),
+    # recherche quotidienne d'une nouvelle version de tvsign (GitHub) ; off : aucune requête
+    "update_check": Spec("on", str, ["TVSIGN_UPDATE_CHECK"], _onoff),
 }
 
 
@@ -154,3 +161,7 @@ def ntfy_url() -> str:
 
 def anisette_url() -> str:
     return get("anisette_url")
+
+
+def update_check() -> bool:
+    return str(get("update_check")).lower() not in ("off", "0", "false", "no")

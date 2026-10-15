@@ -91,6 +91,9 @@ SESSION_DAYS = int(_env("TVSIGN_SESSION_DAYS", "30"))
 
 # ---------- sources ----------
 GITHUB_TOKEN = _env("TVSIGN_GITHUB_TOKEN")
+# Release check of tvsign itself (once a day, opt-out in Settings / TVSIGN_UPDATE_CHECK=off).
+UPDATE_REPO = _env("TVSIGN_UPDATE_REPO", "esalwey/tvsign")
+EDITION = "windows" if WINDOWS else "docker"
 PRESETS_FILE = Path(_env("TVSIGN_PRESETS_FILE") or (ROOT / "app" / "presets.json"))
 # Copy an existing PlumeImpactor folder (Apple session, pairings) on first launch.
 IMPORT_PLUME = _flag("TVSIGN_IMPORT_PLUME", False)   # opt-in: an existing session could share an Apple ID with another tvsign
