@@ -50,8 +50,24 @@ image avoids all of this.
 ## 3. Windows desktop edition
 
 `windows/build.ps1` builds the PyInstaller app and the per-user Inno Setup installer. It expects
-`plumesign.exe`; point `TVSIGN_PLUMESIGN_EXE` at it, for example after
-`cargo build --release --locked -p plumesign` inside `vendor/Impactor`.
+`plumesign.exe` at `vendor/Impactor/target/release/` (build it with
+`cargo build --release --locked -p plumesign` inside `vendor/Impactor`); point `TVSIGN_PLUMESIGN_EXE`
+at another one if needed. Python dependencies come from `windows/requirements-lock.txt`
+(`pip install --require-hashes`); regenerate it with the `uv pip compile` command in its header after
+editing `requirements.txt` or `windows/requirements-windows.txt`.
+
+`plumesign.exe` imports `VCRUNTIME140.dll`, and the Windows loader looks for it beside the exe, not in
+PyInstaller's `_internal/`. `windows/tvsign.spec` copies the Visual C++ runtime DLLs the exe imports next
+to it; `python windows/tools/pe_deps.py check windows/dist/tvsign/plumesign.exe` verifies it. (Building
+plumesign with `-C target-feature=+crt-static` does not link with the current dependencies: LNK2005 between
+`libucrt` and `ucrt`.)
+
+`windows/tools/smoke.ps1 -Setup windows/dist/installer/tvsign-setup-<version>.exe` installs silently into a
+temporary folder, runs `plumesign.exe --version` with a bare `PATH`, starts `tvsign.exe`, checks
+`/api/livez`, validates the wake-up task with Task Scheduler, quits and uninstalls. Details and the user
+guide (English and French): [`windows/README-windows.md`](../windows/README-windows.md). The installers
+and executables are not code-signed yet (SmartScreen, Smart App Control: see that guide); SignPath
+Foundation or Azure Trusted Signing would be the way to sign them in `windows.yml`.
 
 ## 4. Python dependencies
 
@@ -64,18 +80,24 @@ uv pip compile requirements.txt --universal --python-version 3.13 --generate-has
 
 ## 5. Logic tests
 
-No Docker, plumesign or Apple TV needed (renewal decisions, notifications, API validation):
+No Docker, plumesign or Apple TV needed (renewal decisions, notifications, API validation, update check,
+Windows launcher decisions; the tests that need Windows are skipped elsewhere):
 
 ```sh
-pip install -r requirements.txt httpx
+pip install -r requirements.txt httpx pyflakes pefile
+python -m pyflakes app tests windows/launcher windows/tools
 python -m unittest discover -s tests
 ```
 
 ## 6. CI
 
+- `.github/workflows/tests.yml`: static check and unit tests on Linux and Windows. Called by `docker.yml`
+  and `windows.yml`, whose build jobs `need` it, so nothing is built or released from red tests.
 - `.github/workflows/docker.yml`: native amd64 and arm64 runners (no QEMU), push by digest to GHCR,
   manifest merge with semver / `latest` / `edge` tags, GitHub Actions cache per architecture,
   smoke test of each architecture and of the merged tag (pulled without credentials on `v*` tags,
   so a private GHCR package fails the release), `plumesign-linux-<arch>` artifacts.
 - `.github/workflows/windows.yml`: builds `plumesign.exe` and runs `windows/build.ps1` on
-  `windows-latest`, uploads the installer with SHA-256 sums.
+  `windows-latest`, checks the runtime DLLs beside plumesign.exe, smoke-tests the installer
+  (`windows/tools/smoke.ps1`: install, launch, `/api/livez`, quit, uninstall) before the checksums
+  and the release.

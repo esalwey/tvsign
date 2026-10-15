@@ -27,7 +27,8 @@ Two editions share the same code:
 
 - **Self-host (this page):** a Docker container for an always-on Linux box: NAS, Raspberry Pi,
   home server.
-- **Windows desktop:** a small window app with a tray icon, for a PC that stays on.
+- **Windows desktop:** a small window app with a tray icon, for a PC that stays on. Install,
+  SmartScreen / Smart App Control, firewall and sleep: see the [Windows guide](windows/README-windows.md).
 
 Run one tvsign per Apple ID. Two instances on the same free account revoke each other's
 certificates.
@@ -131,6 +132,12 @@ branch, for testers). The database is copied before any schema change. Avoid upd
 renewal: `stop_grace_period: 5m` and `TVSIGN_SHUTDOWN_DRAIN_SECONDS` (240) let an install in
 progress finish before the container stops. Watchtower or Diun work but are optional.
 
+**New version notice (both editions).** tvsign asks the GitHub releases API of `esalwey/tvsign` (one
+anonymous request at most every 6 hours; nothing about your installation is sent) and shows a notice in
+the web interface when a newer release exists. The Windows edition also shows a notification and a tray
+menu item. Turn it off in Settings › New versions or with `TVSIGN_UPDATE_CHECK=off`; `TVSIGN_UPDATE_REPO`
+points it at a fork.
+
 ### Security
 
 - **Never expose tvsign to the Internet.** No port forwarding, no public reverse proxy. For remote
@@ -189,7 +196,8 @@ Deux éditions, même code :
 - **Auto-hébergée (cette page)** : un conteneur Docker pour une machine Linux allumée en
   permanence : NAS, Raspberry Pi, serveur maison.
 - **Windows** : une petite application fenêtrée avec icône dans la zone de notification, pour un PC
-  qui reste allumé.
+  qui reste allumé. Installation, SmartScreen / Smart App Control, pare-feu et veille : voir le
+  [guide Windows](windows/README-windows.md).
 
 Un seul tvsign par Apple ID : deux instances sur le même compte gratuit révoquent mutuellement
 leurs certificats.
@@ -297,6 +305,12 @@ main, pour les testeurs). La base est copiée avant tout changement de schéma. 
 pendant un renouvellement : `stop_grace_period: 5m` et `TVSIGN_SHUTDOWN_DRAIN_SECONDS` (240) laissent
 finir une installation en cours avant l'arrêt du conteneur. Watchtower ou Diun fonctionnent mais
 restent facultatifs.
+
+**Avis de nouvelle version (les deux éditions).** tvsign interroge l'API des releases GitHub de
+`esalwey/tvsign` (une requête anonyme au plus toutes les 6 heures ; rien sur votre installation n'est
+envoyé) et affiche un avis dans l'interface web quand une version plus récente existe. L'édition Windows
+affiche aussi une notification et une entrée dans le menu de l'icône. Désactivable dans Réglages ›
+Nouvelles versions ou avec `TVSIGN_UPDATE_CHECK=off` ; `TVSIGN_UPDATE_REPO` vise un fork.
 
 ### Sécurité
 
