@@ -1,0 +1,971 @@
+diff --git a/vendor/Impactor/apps/plumesign/src/commands/pair.rs b/vendor/Impactor/apps/plumesign/src/commands/pair.rs
+index e010071..716d1a7 100644
+--- a/vendor/Impactor/apps/plumesign/src/commands/pair.rs
++++ b/vendor/Impactor/apps/plumesign/src/commands/pair.rs
+@@ -9,7 +9,8 @@ use idevice::IdeviceError;
+ use idevice::RsdService;
+ use idevice::installation_proxy::InstallationProxyClient;
+ use plume_utils::wireless::{
+-    PairingStore, RsdConnection, ServiceKind, discover, locate, locate_and_connect, pair,
++    Hint, MDNS_PORT, PairingStore, RsdConnection, ServiceKind, discover, discover_at, locate_and_connect_via,
++    locate_via, pair,
+ };
+ 
+ use crate::get_data_path;
+@@ -96,6 +97,20 @@ pub struct TargetArgs {
+         default_value_t = 10
+     )]
+     pub timeout: u64,
++    /// Ask this address directly (unicast mDNS) before browsing the network: finds a device whose
++    /// multicast announcements do not reach this host (VLAN, Docker bridge network, firewall)
++    #[arg(long = "hint-ip", value_name = "IP")]
++    pub hint_ip: Option<IpAddr>,
++    /// mDNS port to query on the hint address
++    #[arg(long = "hint-port", value_name = "PORT", default_value_t = MDNS_PORT, hide = true)]
++    pub hint_port: u16,
++}
++
++impl TargetArgs {
++    fn hint(&self) -> Option<Hint> {
++        self.hint_ip
++            .map(|ip| Hint::with_port(ip, self.hint_port))
++    }
+ }
+ 
+ #[derive(Debug, Args)]
+@@ -172,6 +187,13 @@ pub struct DiscoverArgs {
+     /// Print one JSON object per device instead of text
+     #[arg(long = "json")]
+     pub json: bool,
++    /// Query this address directly (unicast mDNS) instead of browsing the network: for a device
++    /// whose multicast announcements do not reach this host
++    #[arg(long = "ip", value_name = "IP")]
++    pub ip: Option<IpAddr>,
++    /// mDNS port to query on that address
++    #[arg(long = "mdns-port", value_name = "PORT", default_value_t = MDNS_PORT, hide = true)]
++    pub mdns_port: u16,
+ }
+ 
+ #[derive(Debug, Args)]
+@@ -250,7 +272,14 @@ async fn run_pair(store: &PairingStore, args: PairArgs) -> Result<()> {
+ 
+     // Report the identifier the device advertises once paired, proven by its
+     // auth tag, since that is what later commands are given.
+-    let identifier = match locate(store, &device.udid, Duration::from_secs(5)).await {
++    let identifier = match locate_via(
++        store,
++        &device.udid,
++        Some(Hint::new(ip)),
++        Duration::from_secs(5),
++    )
++    .await
++    {
+         Ok(located) => Some(located.service_identifier),
+         Err(e) => {
+             log::warn!("Could not see the paired device advertise itself yet: {e}");
+@@ -269,10 +298,11 @@ async fn run_pair(store: &PairingStore, args: PairArgs) -> Result<()> {
+ }
+ 
+ async fn connect(store: &PairingStore, host: &str, target: &TargetArgs) -> Result<RsdConnection> {
+-    let connection = locate_and_connect(
++    let connection = locate_and_connect_via(
+         store,
+         &target.identifier,
+         host,
++        target.hint(),
+         Duration::from_secs(target.timeout),
+     )
+     .await?;
+@@ -923,7 +953,11 @@ fn flush_stdout() {
+ }
+ 
+ async fn run_discover(store: &PairingStore, args: DiscoverArgs) -> Result<()> {
+-    let devices = discover(Duration::from_secs(args.timeout)).await?;
++    let timeout = Duration::from_secs(args.timeout);
++    let devices = match args.ip {
++        Some(ip) => discover_at(Hint::with_port(ip, args.mdns_port), timeout).await?,
++        None => discover(timeout).await?,
++    };
+ 
+     if devices.is_empty() {
+         log::warn!("No devices found. Check that the device is awake and on this network.");
+diff --git a/vendor/Impactor/crates/plume_utils/src/wireless/discovery.rs b/vendor/Impactor/crates/plume_utils/src/wireless/discovery.rs
+index 9e5944f..57c31d9 100644
+--- a/vendor/Impactor/crates/plume_utils/src/wireless/discovery.rs
++++ b/vendor/Impactor/crates/plume_utils/src/wireless/discovery.rs
+@@ -145,7 +145,7 @@ fn txt(service: &ResolvedService, key: &str) -> Option<String> {
+         .map(str::to_string)
+ }
+ 
+-fn trim_local(hostname: &str) -> String {
++pub(crate) fn trim_local(hostname: &str) -> String {
+     hostname
+         .trim_end_matches('.')
+         .trim_end_matches(".local")
+diff --git a/vendor/Impactor/crates/plume_utils/src/wireless/mod.rs b/vendor/Impactor/crates/plume_utils/src/wireless/mod.rs
+index e6691b4..db36428 100644
+--- a/vendor/Impactor/crates/plume_utils/src/wireless/mod.rs
++++ b/vendor/Impactor/crates/plume_utils/src/wireless/mod.rs
+@@ -2,6 +2,7 @@ mod discovery;
+ mod pairing;
+ mod store;
+ mod tunnel;
++mod unicast;
+ 
+ pub use discovery::{
+     DiscoveredDevice, MANUAL_PAIRING_SERVICE, REMOTE_PAIRING_SERVICE, ServiceKind, discover,
+@@ -9,4 +10,8 @@ pub use discovery::{
+ pub use idevice::remote_pairing::RpPairingFile;
+ pub use pairing::{PairedDevice, pair, verify};
+ pub use store::{PairingRecord, PairingStore};
+-pub use tunnel::{LocatedDevice, RsdConnection, connect_rsd, locate, locate_and_connect};
++pub use tunnel::{
++    LocatedDevice, RsdConnection, connect_rsd, locate, locate_and_connect, locate_and_connect_via,
++    locate_via,
++};
++pub use unicast::{DIRECT_TIMEOUT, Hint, MDNS_PORT, discover_at};
+diff --git a/vendor/Impactor/crates/plume_utils/src/wireless/tunnel.rs b/vendor/Impactor/crates/plume_utils/src/wireless/tunnel.rs
+index 3a62649..f119f0e 100644
+--- a/vendor/Impactor/crates/plume_utils/src/wireless/tunnel.rs
++++ b/vendor/Impactor/crates/plume_utils/src/wireless/tunnel.rs
+@@ -18,6 +18,7 @@ use mdns_sd::{ServiceDaemon, ServiceEvent};
+ 
+ use super::discovery::{DiscoveredDevice, ServiceKind};
+ use super::store::{PairingRecord, PairingStore};
++use super::unicast::{DIRECT_TIMEOUT, Hint, query};
+ use crate::Error;
+ 
+ /// How long a single network step may take before the device counts as unreachable.
+@@ -39,6 +40,68 @@ pub struct RsdConnection {
+     pub handshake: RsdHandshake,
+ }
+ 
++/// What we are looking for, and what a located candidate is judged against.
++struct Wanted {
++    identifier: String,
++    udid: Option<String>,
++    name: Option<String>,
++}
++
++enum Verdict {
++    /// One of our paired devices, and the one asked for.
++    Found(LocatedDevice),
++    /// The device asked for, but none of our keys produce its tag: it was reset or forgot this host.
++    Refused,
++    /// Not the device we want.
++    Skip,
++}
++
++/// Judges a `_remotepairing._tcp` announcement against our pairings. `seen_forgotten` is set for
++/// a device with our device's name whose tag none of our keys produce: probably our device, which
++/// forgot this host. It is only reported if the real one never shows up before the deadline.
++async fn judge(
++    store: &PairingStore,
++    wanted: &Wanted,
++    device: &DiscoveredDevice,
++    seen_forgotten: &mut bool,
++) -> Result<Verdict, Error> {
++    let (Some(service_identifier), Some(auth_tag)) = (&device.identifier, &device.auth_tag) else {
++        return Ok(Verdict::Skip);
++    };
++
++    let mentioned = service_identifier.eq_ignore_ascii_case(&wanted.identifier);
++
++    Ok(match store.find(service_identifier, auth_tag).await? {
++        Some(record)
++            if mentioned
++                || wanted
++                    .udid
++                    .as_deref()
++                    .is_some_and(|udid| udid.eq_ignore_ascii_case(&record.udid)) =>
++        {
++            log::debug!(
++                "{} is {} at {}",
++                service_identifier,
++                record.udid,
++                device.address
++            );
++            Verdict::Found(LocatedDevice {
++                record,
++                service_identifier: service_identifier.clone(),
++                address: device.address,
++            })
++        }
++        None if mentioned => Verdict::Refused,
++        None => {
++            if let (Some(wanted_name), Some(name)) = (&wanted.name, &device.name) {
++                *seen_forgotten |= wanted_name.eq_ignore_ascii_case(name);
++            }
++            Verdict::Skip
++        }
++        _ => Verdict::Skip,
++    })
++}
++
+ /// Finds a paired device by stored UDID or by its mDNS `identifier`.
+ ///
+ /// Only `_remotepairing._tcp` is browsed; the manual pairing service, which
+@@ -49,24 +112,50 @@ pub async fn locate(
+     store: &PairingStore,
+     identifier: &str,
+     timeout: Duration,
++) -> Result<LocatedDevice, Error> {
++    locate_via(store, identifier, None, timeout).await
++}
++
++/// [`locate`], first asking `hint` directly (a unicast mDNS query) when given. That finds a device
++/// whose multicast announcements do not reach us (VLAN, Docker bridge network, filtering access
++/// point, firewall); when the direct query finds nothing usable the multicast browse still runs.
++pub async fn locate_via(
++    store: &PairingStore,
++    identifier: &str,
++    hint: Option<Hint>,
++    timeout: Duration,
+ ) -> Result<LocatedDevice, Error> {
+     let records = store.list().await?;
+     if records.is_empty() {
+         return Err(Error::PairingNotFound(identifier.to_string()));
+     }
+ 
+-    let wanted_udid = records
+-        .iter()
+-        .find(|record| record.udid.eq_ignore_ascii_case(identifier))
+-        .map(|record| record.udid.clone());
+-    let wanted_name = records
++    let known = records
+         .iter()
+-        .find(|record| record.udid.eq_ignore_ascii_case(identifier))
+-        .map(|record| record.name.clone());
+-    // A device with our device's name whose tag none of our keys produce: probably our device,
+-    // which forgot this host. Only reported if the real one never shows up before the deadline.
++        .find(|record| record.udid.eq_ignore_ascii_case(identifier));
++    let wanted = Wanted {
++        identifier: identifier.to_string(),
++        udid: known.map(|record| record.udid.clone()),
++        name: known.map(|record| record.name.clone()),
++    };
+     let mut seen_forgotten = false;
+ 
++    if let Some(hint) = hint {
++        match query(hint, ServiceKind::RemotePairing, DIRECT_TIMEOUT).await {
++            Ok(devices) => {
++                for device in &devices {
++                    match judge(store, &wanted, device, &mut seen_forgotten).await? {
++                        Verdict::Found(located) => return Ok(located),
++                        Verdict::Refused => return Err(Error::PairingNotAccepted),
++                        Verdict::Skip => {}
++                    }
++                }
++                log::debug!("{} did not announce the device directly", hint.addr);
++            }
++            Err(e) => log::debug!("direct query to {} failed: {e}", hint.addr),
++        }
++    }
++
+     let daemon = ServiceDaemon::new()?;
+     let browse = daemon.browse(ServiceKind::RemotePairing.service_type())?;
+     let deadline = tokio::time::Instant::now() + timeout;
+@@ -86,45 +175,17 @@ pub async fn locate(
+         else {
+             continue;
+         };
+-        let (Some(service_identifier), Some(auth_tag)) = (&device.identifier, &device.auth_tag)
+-        else {
+-            continue;
+-        };
+ 
+-        let mentioned = service_identifier.eq_ignore_ascii_case(identifier);
+-
+-        match store.find(service_identifier, auth_tag).await? {
+-            Some(record)
+-                if mentioned
+-                    || wanted_udid
+-                        .as_deref()
+-                        .is_some_and(|udid| udid.eq_ignore_ascii_case(&record.udid)) =>
+-            {
+-                log::debug!(
+-                    "{} is {} at {}",
+-                    service_identifier,
+-                    record.udid,
+-                    device.address
+-                );
+-                result = Ok(LocatedDevice {
+-                    record,
+-                    service_identifier: service_identifier.clone(),
+-                    address: device.address,
+-                });
++        match judge(store, &wanted, &device, &mut seen_forgotten).await? {
++            Verdict::Found(located) => {
++                result = Ok(located);
+                 break;
+             }
+-            // The device we were asked for, but none of our keys produce its
+-            // tag: it was reset or forgot this host.
+-            None if mentioned => {
++            Verdict::Refused => {
+                 result = Err(Error::PairingNotAccepted);
+                 break;
+             }
+-            None => {
+-                if let (Some(wanted), Some(name)) = (&wanted_name, &device.name) {
+-                    seen_forgotten |= wanted.eq_ignore_ascii_case(name);
+-                }
+-            }
+-            _ => {}
++            Verdict::Skip => {}
+         }
+     }
+ 
+@@ -165,7 +226,18 @@ pub async fn locate_and_connect(
+     host: &str,
+     timeout: Duration,
+ ) -> Result<RsdConnection, Error> {
+-    let device = locate(store, identifier, timeout).await?;
++    locate_and_connect_via(store, identifier, host, None, timeout).await
++}
++
++/// [`locate_via`] then [`connect_rsd`].
++pub async fn locate_and_connect_via(
++    store: &PairingStore,
++    identifier: &str,
++    host: &str,
++    hint: Option<Hint>,
++    timeout: Duration,
++) -> Result<RsdConnection, Error> {
++    let device = locate_via(store, identifier, hint, timeout).await?;
+     connect_rsd(store, device, host).await
+ }
+ 
+@@ -238,3 +310,104 @@ async fn step<F: std::future::Future>(future: F) -> Result<F::Output, Error> {
+             ))
+         })
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::net::IpAddr;
++
++    use idevice::remote_pairing::RpPairingFile;
++    use tokio::net::UdpSocket;
++
++    use super::super::pairing::PairedDevice;
++    use super::super::unicast::tests::response_with;
++    use super::*;
++
++    // Shared with idevice's own validate_auth_tag test (see store.rs).
++    const ALT_IRK: [u8; 16] = [
++        0x32, 0x0a, 0x7a, 0x64, 0x63, 0xf3, 0x5c, 0xcd, 0xa4, 0xbb, 0xd6, 0xeb, 0xe3, 0xab, 0xec,
++        0x8b,
++    ];
++    const IDENTIFIER: &str = "2BE6E510-0325-4365-923E-B14C6F57DB3A";
++    const AUTH_TAG: &str = "kXjlTr2l";
++    const UDID: &str = "00008110-001A2B3C00000000";
++
++    async fn store_with_pairing() -> PairingStore {
++        let dir = std::env::temp_dir().join(format!("plume-locate-test-{}", uuid::Uuid::new_v4()));
++        let store = PairingStore::new(dir);
++        let mut file = RpPairingFile::generate("plume");
++        file.alt_irk = Some(ALT_IRK.to_vec());
++        let device = PairedDevice {
++            udid: UDID.to_string(),
++            name: "Salon".to_string(),
++            model: "AppleTV11,1".to_string(),
++            account_id: "plume".to_string(),
++        };
++        store.save(&device, &file).await.unwrap();
++        store
++    }
++
++    /// A device that only answers direct queries is located through the hint, without multicast.
++    #[tokio::test]
++    async fn locate_via_finds_a_device_that_answers_directly() {
++        let store = store_with_pairing().await;
++        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let addr = server.local_addr().unwrap();
++        tokio::spawn(async move {
++            let mut buf = [0u8; 512];
++            let (_, peer) = server.recv_from(&mut buf).await.unwrap();
++            let reply = response_with(true, IDENTIFIER, AUTH_TAG);
++            server.send_to(&reply, peer).await.unwrap();
++        });
++
++        let located = locate_via(
++            &store,
++            UDID,
++            Some(Hint::with_port(addr.ip(), addr.port())),
++            Duration::from_secs(1),
++        )
++        .await
++        .unwrap();
++        assert_eq!(located.record.udid, UDID);
++        assert_eq!(located.service_identifier, IDENTIFIER);
++        assert_eq!(located.address.ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
++        assert_eq!(located.address.port(), 49152);
++        tokio::fs::remove_dir_all(store.directory()).await.ok();
++    }
++
++    /// An answer whose tag none of our keys produce is never taken for our device; with our
++    /// device's name it is reported as "forgot this host" if the real one never shows up.
++    #[tokio::test]
++    async fn a_foreign_tag_is_never_taken_for_our_device() {
++        let store = store_with_pairing().await;
++        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let addr = server.local_addr().unwrap();
++        tokio::spawn(async move {
++            let mut buf = [0u8; 512];
++            let (_, peer) = server.recv_from(&mut buf).await.unwrap();
++            let reply = response_with(true, IDENTIFIER, "AAAAAAAA");
++            server.send_to(&reply, peer).await.unwrap();
++        });
++        let verdict = {
++            let records = store.list().await.unwrap();
++            let wanted = Wanted {
++                identifier: UDID.to_string(),
++                udid: Some(records[0].udid.clone()),
++                name: Some(records[0].name.clone()),
++            };
++            let devices = query(
++                Hint::with_port(addr.ip(), addr.port()),
++                ServiceKind::RemotePairing,
++                Duration::from_secs(1),
++            )
++            .await
++            .unwrap();
++            let mut seen_forgotten = false;
++            let verdict = judge(&store, &wanted, &devices[0], &mut seen_forgotten)
++                .await
++                .unwrap();
++            (matches!(verdict, Verdict::Skip), seen_forgotten)
++        };
++        assert_eq!(verdict, (true, true));
++        tokio::fs::remove_dir_all(store.directory()).await.ok();
++    }
++}
+diff --git a/vendor/Impactor/crates/plume_utils/src/wireless/unicast.rs b/vendor/Impactor/crates/plume_utils/src/wireless/unicast.rs
+new file mode 100644
+index 0000000..b1b12e4
+--- /dev/null
++++ b/vendor/Impactor/crates/plume_utils/src/wireless/unicast.rs
+@@ -0,0 +1,522 @@
++//! Direct ("unicast") mDNS queries to one known address.
++//!
++//! Multicast discovery (`discovery::discover`, `tunnel::locate`) needs the mDNS group
++//! 224.0.0.251 to reach us: it does not on an IoT VLAN, from a Docker bridge network, behind
++//! a multicast-filtering access point or through a strict firewall profile. mDNS responders
++//! answer a plain DNS query sent straight to UDP port 5353 (RFC 6762 section 5.5, "legacy
++//! unicast"), which routes like any other UDP packet. This module asks one address for its
++//! `_remotepairing._tcp` / `_remotepairing-manual-pairing._tcp` service and builds the same
++//! [`DiscoveredDevice`] the multicast browse would have produced.
++
++use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
++use std::time::Duration;
++
++use tokio::net::UdpSocket;
++
++use super::discovery::{DiscoveredDevice, ServiceKind, trim_local};
++use crate::Error;
++
++/// The standard mDNS port.
++pub const MDNS_PORT: u16 = 5353;
++
++/// How long a direct query waits for the answer.
++pub const DIRECT_TIMEOUT: Duration = Duration::from_secs(2);
++
++const TYPE_A: u16 = 1;
++const TYPE_PTR: u16 = 12;
++const TYPE_TXT: u16 = 16;
++const TYPE_AAAA: u16 = 28;
++const TYPE_SRV: u16 = 33;
++const CLASS_IN: u16 = 1;
++
++/// Where to send the direct queries: the device's address and its mDNS port.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Hint {
++    pub addr: SocketAddr,
++}
++
++impl Hint {
++    /// The standard mDNS port on `ip`.
++    pub fn new(ip: IpAddr) -> Self {
++        Self::with_port(ip, MDNS_PORT)
++    }
++
++    pub fn with_port(ip: IpAddr, port: u16) -> Self {
++        Self {
++            addr: SocketAddr::new(ip, port),
++        }
++    }
++}
++
++// ---------- DNS wire format ----------
++
++fn encode_name(name: &str, out: &mut Vec<u8>) {
++    for label in name.trim_end_matches('.').split('.').filter(|l| !l.is_empty()) {
++        let bytes = label.as_bytes();
++        let len = bytes.len().min(63);
++        out.push(len as u8);
++        out.extend_from_slice(&bytes[..len]);
++    }
++    out.push(0);
++}
++
++/// A standard query (recursion not desired) for `questions`, as `(name, type)` pairs.
++fn encode_query(id: u16, questions: &[(&str, u16)]) -> Vec<u8> {
++    let mut out = Vec::with_capacity(64);
++    out.extend_from_slice(&id.to_be_bytes());
++    out.extend_from_slice(&0u16.to_be_bytes()); // flags: query
++    out.extend_from_slice(&(questions.len() as u16).to_be_bytes());
++    out.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // an, ns, ar
++    for (name, kind) in questions {
++        encode_name(name, &mut out);
++        out.extend_from_slice(&kind.to_be_bytes());
++        out.extend_from_slice(&CLASS_IN.to_be_bytes());
++    }
++    out
++}
++
++#[derive(Debug, Clone, PartialEq)]
++enum Rdata {
++    Ptr(String),
++    Srv { port: u16, target: String },
++    Txt(Vec<(String, String)>),
++    A(Ipv4Addr),
++    Aaaa(Ipv6Addr),
++}
++
++#[derive(Debug, Clone, PartialEq)]
++struct Record {
++    name: String,
++    data: Rdata,
++}
++
++/// Reads a possibly compressed name starting at `pos`; returns it and the position just past it
++/// in the original stream.
++fn read_name(buf: &[u8], mut pos: usize) -> Option<(String, usize)> {
++    let mut name = String::new();
++    let mut end = None;
++    let mut jumps = 0;
++    loop {
++        let len = *buf.get(pos)? as usize;
++        if len == 0 {
++            pos += 1;
++            break;
++        }
++        if len & 0xC0 == 0xC0 {
++            let low = *buf.get(pos + 1)? as usize;
++            end.get_or_insert(pos + 2);
++            pos = ((len & 0x3F) << 8) | low;
++            jumps += 1;
++            if jumps > 16 {
++                return None; // pointer loop
++            }
++            continue;
++        }
++        if len & 0xC0 != 0 {
++            return None;
++        }
++        let label = buf.get(pos + 1..pos + 1 + len)?;
++        name.push_str(&String::from_utf8_lossy(label));
++        name.push('.');
++        pos += 1 + len;
++    }
++    Some((name, end.unwrap_or(pos)))
++}
++
++fn read_u16(buf: &[u8], pos: usize) -> Option<u16> {
++    Some(u16::from_be_bytes([*buf.get(pos)?, *buf.get(pos + 1)?]))
++}
++
++fn parse_txt(data: &[u8]) -> Vec<(String, String)> {
++    let mut out = Vec::new();
++    let mut pos = 0;
++    while pos < data.len() {
++        let len = data[pos] as usize;
++        let Some(entry) = data.get(pos + 1..pos + 1 + len) else {
++            break;
++        };
++        pos += 1 + len;
++        let text = String::from_utf8_lossy(entry);
++        match text.split_once('=') {
++            Some((key, value)) => out.push((key.to_string(), value.to_string())),
++            None if !text.is_empty() => out.push((text.to_string(), String::new())),
++            None => {}
++        }
++    }
++    out
++}
++
++/// The records of a response (answers, authority and additional sections); `None` when the
++/// packet is not a well-formed response.
++fn parse_response(buf: &[u8]) -> Option<(u16, Vec<Record>)> {
++    let id = read_u16(buf, 0)?;
++    let flags = read_u16(buf, 2)?;
++    if flags & 0x8000 == 0 {
++        return None; // a query, not a response
++    }
++    let questions = read_u16(buf, 4)? as usize;
++    let records = read_u16(buf, 6)? as usize
++        + read_u16(buf, 8)? as usize
++        + read_u16(buf, 10)? as usize;
++
++    let mut pos = 12;
++    for _ in 0..questions {
++        let (_, next) = read_name(buf, pos)?;
++        pos = next + 4;
++    }
++
++    let mut out = Vec::new();
++    for _ in 0..records {
++        let (name, next) = read_name(buf, pos)?;
++        let kind = read_u16(buf, next)?;
++        let rdlen = read_u16(buf, next + 8)? as usize;
++        let start = next + 10;
++        let data = buf.get(start..start + rdlen)?;
++        pos = start + rdlen;
++
++        let parsed = match kind {
++            TYPE_PTR => read_name(buf, start).map(|(target, _)| Rdata::Ptr(target)),
++            TYPE_SRV if rdlen >= 6 => read_name(buf, start + 6).map(|(target, _)| Rdata::Srv {
++                port: u16::from_be_bytes([data[4], data[5]]),
++                target,
++            }),
++            TYPE_TXT => Some(Rdata::Txt(parse_txt(data))),
++            TYPE_A if rdlen == 4 => Some(Rdata::A(Ipv4Addr::new(data[0], data[1], data[2], data[3]))),
++            TYPE_AAAA if rdlen == 16 => {
++                let mut octets = [0u8; 16];
++                octets.copy_from_slice(data);
++                Some(Rdata::Aaaa(Ipv6Addr::from(octets)))
++            }
++            _ => None,
++        };
++        if let Some(data) = parsed {
++            out.push(Record { name, data });
++        }
++    }
++    Some((id, out))
++}
++
++// ---------- assembling a device from records ----------
++
++fn same_name(a: &str, b: &str) -> bool {
++    a.trim_end_matches('.').eq_ignore_ascii_case(b.trim_end_matches('.'))
++}
++
++/// Service instances named by a PTR record for `service`, whose SRV and TXT are not all known yet.
++struct Assembly {
++    devices: Vec<DiscoveredDevice>,
++    /// Instances announced but still missing their SRV or TXT record.
++    incomplete: Vec<String>,
++}
++
++fn assemble(records: &[Record], kind: ServiceKind, service: &str, ip: IpAddr) -> Assembly {
++    let mut devices = Vec::new();
++    let mut incomplete = Vec::new();
++    let mut seen: Vec<String> = Vec::new();
++
++    for instance in records.iter().filter_map(|r| match &r.data {
++        Rdata::Ptr(target) if same_name(&r.name, service) => Some(target.clone()),
++        _ => None,
++    }) {
++        // The same record can arrive twice (repeated or split answers).
++        if seen.iter().any(|known| same_name(known, &instance)) {
++            continue;
++        }
++        seen.push(instance.clone());
++        let srv = records.iter().find_map(|r| match &r.data {
++            Rdata::Srv { port, target } if same_name(&r.name, &instance) => Some((*port, target.clone())),
++            _ => None,
++        });
++        let txt = records.iter().find_map(|r| match &r.data {
++            Rdata::Txt(entries) if same_name(&r.name, &instance) => Some(entries),
++            _ => None,
++        });
++        let (Some((port, hostname)), Some(txt)) = (srv, txt) else {
++            incomplete.push(instance);
++            continue;
++        };
++        let get = |key: &str| {
++            txt.iter()
++                .find(|(k, _)| k.eq_ignore_ascii_case(key))
++                .map(|(_, v)| v.clone())
++                .filter(|v| !v.is_empty())
++        };
++        devices.push(DiscoveredDevice {
++            kind,
++            service_name: instance.clone(),
++            hostname: trim_local(&hostname),
++            name: get("name"),
++            identifier: get("identifier"),
++            auth_tag: get("authTag"),
++            // The address that just answered is, by construction, one that reaches the device.
++            address: SocketAddr::new(ip, port),
++        });
++    }
++    Assembly { devices, incomplete }
++}
++
++// ---------- the exchange ----------
++
++/// Asks `hint` for the `kind` service and returns what it announces (usually one device).
++///
++/// Sends a PTR query, then, if the answer lacks the SRV or TXT record of an instance, a second
++/// query for them. Nothing but packets from the queried address is looked at.
++pub async fn query(hint: Hint, kind: ServiceKind, timeout: Duration) -> Result<Vec<DiscoveredDevice>, Error> {
++    let bind: SocketAddr = if hint.addr.is_ipv4() {
++        (Ipv4Addr::UNSPECIFIED, 0).into()
++    } else {
++        (Ipv6Addr::UNSPECIFIED, 0).into()
++    };
++    let socket = UdpSocket::bind(bind).await?;
++    socket.connect(hint.addr).await?; // also filters incoming packets to the queried address
++
++    let service = kind.service_type();
++    let deadline = tokio::time::Instant::now() + timeout;
++    let mut records: Vec<Record> = Vec::new();
++    let mut asked_details = false;
++    let mut buf = vec![0u8; 9000];
++
++    socket.send(&encode_query(1, &[(service, TYPE_PTR)])).await?;
++
++    loop {
++        let received = tokio::select! {
++            _ = tokio::time::sleep_until(deadline) => break,
++            received = socket.recv(&mut buf) => received,
++        };
++        let len = match received {
++            Ok(len) => len,
++            // An ICMP "port unreachable" from a host that does not listen surfaces here.
++            Err(e) => {
++                log::debug!("direct mDNS query to {}: {e}", hint.addr);
++                break;
++            }
++        };
++        let Some((_, mut found)) = parse_response(&buf[..len]) else {
++            continue;
++        };
++        records.append(&mut found);
++
++        let assembly = assemble(&records, kind, service, hint.addr.ip());
++        if assembly.incomplete.is_empty() && !assembly.devices.is_empty() {
++            return Ok(assembly.devices);
++        }
++        if !asked_details && !assembly.incomplete.is_empty() {
++            asked_details = true;
++            let instance = assembly.incomplete[0].clone();
++            let query = encode_query(2, &[(&instance, TYPE_SRV), (&instance, TYPE_TXT)]);
++            socket.send(&query).await?;
++        }
++    }
++
++    Ok(assemble(&records, kind, service, hint.addr.ip()).devices)
++}
++
++/// Direct counterpart of `discover`: both pairing services of the device at `hint`.
++pub async fn discover_at(hint: Hint, timeout: Duration) -> Result<Vec<DiscoveredDevice>, Error> {
++    let (manual, paired) = tokio::join!(
++        query(hint, ServiceKind::ManualPairing, timeout),
++        query(hint, ServiceKind::RemotePairing, timeout),
++    );
++    let mut devices = Vec::new();
++    let mut first_error = None;
++    for result in [manual, paired] {
++        match result {
++            Ok(mut found) => devices.append(&mut found),
++            Err(e) => first_error = first_error.or(Some(e)),
++        }
++    }
++    match (devices.is_empty(), first_error) {
++        (true, Some(e)) => Err(e),
++        _ => Ok(devices),
++    }
++}
++
++#[cfg(test)]
++pub(crate) mod tests {
++    use super::*;
++
++    fn name(out: &mut Vec<u8>, n: &str) {
++        encode_name(n, out);
++    }
++
++    /// A response like the one an Apple TV sends: PTR in the answers, SRV/TXT/A as additionals.
++    fn response(with_details: bool) -> Vec<u8> {
++        response_with(with_details, "abc", "tag")
++    }
++
++    pub(crate) fn response_with(with_details: bool, identifier: &str, auth_tag: &str) -> Vec<u8> {
++        let service = "_remotepairing._tcp.local.";
++        let instance = "AA-BB._remotepairing._tcp.local.";
++        let mut out = Vec::new();
++        out.extend_from_slice(&1u16.to_be_bytes());
++        out.extend_from_slice(&0x8400u16.to_be_bytes());
++        out.extend_from_slice(&0u16.to_be_bytes()); // questions
++        out.extend_from_slice(&1u16.to_be_bytes()); // answers
++        out.extend_from_slice(&0u16.to_be_bytes());
++        out.extend_from_slice(&(if with_details { 3u16 } else { 0 }).to_be_bytes());
++
++        // PTR _remotepairing._tcp.local. -> instance
++        name(&mut out, service);
++        out.extend_from_slice(&[0, 12, 0, 1, 0, 0, 0, 10]);
++        let mut rd = Vec::new();
++        name(&mut rd, instance);
++        out.extend_from_slice(&(rd.len() as u16).to_be_bytes());
++        out.extend_from_slice(&rd);
++
++        if with_details {
++            // SRV instance -> port 49152 on living-room.local.
++            name(&mut out, instance);
++            out.extend_from_slice(&[0x00, 33, 0x80, 1, 0, 0, 0, 10]);
++            let mut rd = vec![0, 0, 0, 0, 0xC0, 0x00];
++            name(&mut rd, "living-room.local.");
++            out.extend_from_slice(&(rd.len() as u16).to_be_bytes());
++            out.extend_from_slice(&rd);
++
++            // TXT name=Salon, identifier=abc, authTag=tag
++            name(&mut out, instance);
++            out.extend_from_slice(&[0x00, 16, 0x80, 1, 0, 0, 0, 10]);
++            let mut rd = Vec::new();
++            let entries = [
++                "name=Salon".to_string(),
++                format!("identifier={identifier}"),
++                format!("authTag={auth_tag}"),
++            ];
++            for entry in entries {
++                rd.push(entry.len() as u8);
++                rd.extend_from_slice(entry.as_bytes());
++            }
++            out.extend_from_slice(&(rd.len() as u16).to_be_bytes());
++            out.extend_from_slice(&rd);
++
++            // A living-room.local. -> 192.168.1.20
++            name(&mut out, "living-room.local.");
++            out.extend_from_slice(&[0x00, 1, 0x80, 1, 0, 0, 0, 10, 0, 4, 192, 168, 1, 20]);
++        }
++        out
++    }
++
++    #[test]
++    fn query_has_one_question() {
++        let q = encode_query(7, &[("_remotepairing._tcp.local.", TYPE_PTR)]);
++        assert_eq!(&q[..2], &[0, 7]);
++        assert_eq!(read_u16(&q, 4), Some(1));
++        let (qname, next) = read_name(&q, 12).unwrap();
++        assert_eq!(qname, "_remotepairing._tcp.local.");
++        assert_eq!(read_u16(&q, next), Some(TYPE_PTR));
++    }
++
++    #[test]
++    fn a_query_is_not_taken_for_a_response() {
++        assert!(parse_response(&encode_query(1, &[("x.local.", TYPE_PTR)])).is_none());
++    }
++
++    #[test]
++    fn garbage_is_ignored() {
++        assert!(parse_response(&[0x80]).is_none());
++        let mut truncated = response(true);
++        truncated.truncate(40);
++        assert!(parse_response(&truncated).is_none());
++    }
++
++    #[test]
++    fn name_pointer_loops_are_rejected() {
++        let mut buf = vec![0u8; 12];
++        buf.extend_from_slice(&[0xC0, 12]); // points at itself
++        assert!(read_name(&buf, 12).is_none());
++    }
++
++    #[test]
++    fn full_response_builds_a_device() {
++        let (_, records) = parse_response(&response(true)).unwrap();
++        let ip: IpAddr = "192.168.1.20".parse().unwrap();
++        let assembly = assemble(&records, ServiceKind::RemotePairing, "_remotepairing._tcp.local.", ip);
++        assert!(assembly.incomplete.is_empty());
++        let device = &assembly.devices[0];
++        assert_eq!(device.name.as_deref(), Some("Salon"));
++        assert_eq!(device.identifier.as_deref(), Some("abc"));
++        assert_eq!(device.auth_tag.as_deref(), Some("tag"));
++        assert_eq!(device.hostname, "living-room");
++        assert_eq!(device.address, SocketAddr::new(ip, 49152));
++    }
++
++    #[test]
++    fn ptr_alone_is_incomplete() {
++        let (_, records) = parse_response(&response(false)).unwrap();
++        let ip: IpAddr = "192.168.1.20".parse().unwrap();
++        let assembly = assemble(&records, ServiceKind::RemotePairing, "_remotepairing._tcp.local.", ip);
++        assert!(assembly.devices.is_empty());
++        assert_eq!(assembly.incomplete.len(), 1);
++    }
++
++    #[test]
++    fn other_services_are_not_matched() {
++        let (_, records) = parse_response(&response(true)).unwrap();
++        let ip: IpAddr = "192.168.1.20".parse().unwrap();
++        let assembly = assemble(
++            &records,
++            ServiceKind::ManualPairing,
++            "_remotepairing-manual-pairing._tcp.local.",
++            ip,
++        );
++        assert!(assembly.devices.is_empty() && assembly.incomplete.is_empty());
++    }
++
++    /// A fake responder on loopback: answers the PTR query with the full response.
++    #[tokio::test]
++    async fn query_talks_to_a_responder() {
++        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let addr = server.local_addr().unwrap();
++        tokio::spawn(async move {
++            let mut buf = [0u8; 512];
++            let (_, peer) = server.recv_from(&mut buf).await.unwrap();
++            server.send_to(&response(true), peer).await.unwrap();
++        });
++        let found = query(
++            Hint::with_port(addr.ip(), addr.port()),
++            ServiceKind::RemotePairing,
++            Duration::from_secs(2),
++        )
++        .await
++        .unwrap();
++        assert_eq!(found.len(), 1);
++        assert_eq!(found[0].identifier.as_deref(), Some("abc"));
++        assert_eq!(found[0].address.port(), 49152);
++    }
++
++    /// Details missing from the first answer are asked for with a second query.
++    #[tokio::test]
++    async fn query_asks_for_missing_details() {
++        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let addr = server.local_addr().unwrap();
++        tokio::spawn(async move {
++            let mut buf = [0u8; 512];
++            let (_, peer) = server.recv_from(&mut buf).await.unwrap();
++            server.send_to(&response(false), peer).await.unwrap();
++            let (_, peer) = server.recv_from(&mut buf).await.unwrap();
++            server.send_to(&response(true), peer).await.unwrap();
++        });
++        let found = query(
++            Hint::with_port(addr.ip(), addr.port()),
++            ServiceKind::RemotePairing,
++            Duration::from_secs(2),
++        )
++        .await
++        .unwrap();
++        assert_eq!(found.len(), 1);
++    }
++
++    #[tokio::test]
++    async fn silence_times_out_empty() {
++        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let addr = server.local_addr().unwrap();
++        let found = query(
++            Hint::with_port(addr.ip(), addr.port()),
++            ServiceKind::RemotePairing,
++            Duration::from_millis(300),
++        )
++        .await
++        .unwrap();
++        assert!(found.is_empty());
++        drop(server);
++    }
++}

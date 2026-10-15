@@ -9,6 +9,10 @@
 # The whole Cargo workspace is kept (every member manifest must exist for `cargo build --locked`),
 # minus packaging assets, CI files and screenshots. The source commit is written to
 # vendor/Impactor/VENDORED.txt. Commit the result; vendor/Impactor/target stays ignored.
+#
+# Local patches: every vendor/patches/*.patch is applied on top of the export (in name order)
+# and listed in VENDORED.txt. They carry the tvsign changes not yet in the fork (unicast
+# discovery: --hint-ip / --ip). Once a patch is merged into the fork branch, delete it.
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -31,13 +35,23 @@ find "$DEST" -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} +
 # shellcheck disable=SC2086
 git -C "$SRC" -c core.autocrlf=false -c core.eol=lf archive --format=tar "$COMMIT" -- $PATHS | tar -x -C "$DEST"
 
+# Local tvsign patches (paths inside the patches are relative to the repository root).
+PATCHES=""
+for p in "$ROOT"/vendor/patches/*.patch; do
+    [ -f "$p" ] || continue
+    git -C "$ROOT" apply --ignore-whitespace "$p" || { echo "error: patch $p does not apply to $COMMIT; rebase it" >&2; exit 1; }
+    PATCHES="$PATCHES $(basename "$p")"
+done
+
 cat > "$DEST/VENDORED.txt" <<EOF
 Vendored from the Impactor fork (plumesign with wireless tvOS pairing/install).
 commit: $COMMIT
 branch: $BRANCH
 date:   $(date -u +%Y-%m-%dT%H:%M:%SZ)
 paths:  $PATHS
-Regenerate with scripts/vendor-impactor.sh (or .ps1). Do not edit files here by hand.
+local patches:${PATCHES:- none} (vendor/patches/, applied by the script after the export)
+Regenerate with scripts/vendor-impactor.sh (or .ps1). Do not edit files here by hand:
+change the fork (branch tvsign) or add/update a patch in vendor/patches/, then re-vendor.
 EOF
 
 echo "vendored Impactor $COMMIT ($BRANCH) into vendor/Impactor"

@@ -8,6 +8,10 @@
   minus packaging assets, CI files and screenshots. The source commit is written to
   vendor\Impactor\VENDORED.txt. Commit the result; vendor\Impactor\target stays ignored.
 
+  Local patches: every vendor\patches\*.patch is applied on top of the export (in name order)
+  and listed in VENDORED.txt. They carry the tvsign changes not yet in the fork (unicast
+  discovery: --hint-ip / --ip). Once a patch is merged into the fork branch, delete it.
+
 .EXAMPLE
   scripts\vendor-impactor.ps1
   scripts\vendor-impactor.ps1 -ImpactorDir D:\src\Impactor -Ref tvsign
@@ -46,6 +50,15 @@ try {
     Remove-Item -Force -ErrorAction SilentlyContinue $tar
 }
 
+# Local tvsign patches (paths inside the patches are relative to the repository root).
+$applied = @()
+foreach ($p in (Get-ChildItem -Path (Join-Path $root 'vendor\patches') -Filter '*.patch' -ErrorAction SilentlyContinue | Sort-Object Name)) {
+    git -C $root apply --ignore-whitespace $p.FullName
+    if ($LASTEXITCODE -ne 0) { throw "patch $($p.Name) does not apply to $commit; rebase it" }
+    $applied += $p.Name
+}
+$patchLine = if ($applied) { $applied -join ' ' } else { 'none' }
+
 $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 @"
 Vendored from the Impactor fork (plumesign with wireless tvOS pairing/install).
@@ -53,7 +66,9 @@ commit: $commit
 branch: $branch
 date:   $stamp
 paths:  $($paths -join ' ')
-Regenerate with scripts/vendor-impactor.sh (or .ps1). Do not edit files here by hand.
+local patches: $patchLine (vendor/patches/, applied by the script after the export)
+Regenerate with scripts/vendor-impactor.sh (or .ps1). Do not edit files here by hand:
+change the fork (branch tvsign) or add/update a patch in vendor/patches/, then re-vendor.
 "@ -replace "`r`n", "`n" | Set-Content -NoNewline -Encoding ascii (Join-Path $dest 'VENDORED.txt')
 
 Write-Host "vendored Impactor $commit ($branch) into vendor\Impactor"
