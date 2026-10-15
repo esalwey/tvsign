@@ -25,17 +25,40 @@ impl AnisetteData {
     }
 
     pub fn needs_refresh(&self) -> bool {
-        let elapsed = self.generated_at.elapsed().unwrap();
+        // Horloge qui recule : on garde les donnees, jamais de panique.
+        let elapsed = self.generated_at.elapsed().unwrap_or_default();
         elapsed.as_secs() > 60
     }
 
     pub fn is_valid(&self) -> bool {
-        let elapsed = self.generated_at.elapsed().unwrap();
+        let elapsed = self.generated_at.elapsed().unwrap_or_default();
         elapsed.as_secs() < 90
     }
 
     pub async fn refresh(&self) -> Result<Self, crate::Error> {
         Self::new(self.config.clone()).await
+    }
+
+    /// Renouvelle les donnees anisette en place : 3 essais espaces, puis on garde les anciennes
+    /// (Apple refusera peut-etre la requete, mais plumesign ne s'arrete plus sur une erreur passagere).
+    pub async fn refresh_in_place(&mut self) {
+        let mut delay = std::time::Duration::from_secs(1);
+        for attempt in 1..=3 {
+            match self.refresh().await {
+                Ok(fresh) => {
+                    *self = fresh;
+                    return;
+                }
+                Err(e) => {
+                    log::warn!("anisette refresh failed (attempt {attempt}/3): {e}");
+                    if attempt < 3 {
+                        tokio::time::sleep(delay).await;
+                        delay *= 2;
+                    }
+                }
+            }
+        }
+        log::warn!("anisette refresh abandoned, keeping the previous data");
     }
 
     pub fn generate_headers(
@@ -45,7 +68,8 @@ impl AnisetteData {
         app_info: bool,
     ) -> HashMap<String, String> {
         if !self.is_valid() {
-            panic!("Invalid data!")
+            // Donnees un peu perimees (anisette injoignable) : on tente quand meme, Apple tranchera.
+            log::warn!("anisette data is older than 90 s");
         }
 
         let mut headers = self.base_headers.clone();
@@ -56,10 +80,13 @@ impl AnisetteData {
                 Some(v) => {
                     let temp = v.as_str();
 
-                    temp.replace(
-                        temp.split('<').nth(3).unwrap().split('>').nth(0).unwrap(),
-                        "com.apple.AuthKit/1 (com.apple.akd/1.0)",
-                    )
+                    match temp.split('<').nth(3).and_then(|s| s.split('>').next()) {
+                        Some(part) => {
+                            temp.replace(part, "com.apple.AuthKit/1 (com.apple.akd/1.0)")
+                        }
+                        // Format inattendu : on garde l'en-tete tel quel.
+                        None => temp.to_string(),
+                    }
                 }
                 None => {
                     return headers;

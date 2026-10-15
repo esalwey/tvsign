@@ -1,6 +1,6 @@
 // Implementing the SideStore Anisette v3 protocol
 
-use std::{collections::HashMap, fs, io::Cursor, path::PathBuf};
+use std::{collections::HashMap, fs, io::Cursor, path::PathBuf, time::Duration};
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -57,7 +57,8 @@ where
 {
     let s: Data = Deserialize::deserialize(d)?;
     let s: Vec<u8> = s.into();
-    Ok(s.try_into().unwrap())
+    s.try_into()
+        .map_err(|_| serde::de::Error::custom("keychain identifier must be 16 bytes"))
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -71,8 +72,10 @@ fn base64_encode(data: &[u8]) -> String {
     general_purpose::STANDARD.encode(data)
 }
 
-fn base64_decode(data: &str) -> Vec<u8> {
-    general_purpose::STANDARD.decode(data.trim()).unwrap()
+fn base64_decode(data: &str) -> Result<Vec<u8>, AnisetteError> {
+    general_purpose::STANDARD
+        .decode(data.trim())
+        .map_err(|e| misc(format!("Invalid base64 from anisette server: {e}")))
 }
 
 #[derive(Deserialize)]
@@ -176,15 +179,64 @@ impl AnisetteData {
     }
 }
 
+/// Delais reseau : sans eux, une connexion muette bloque plumesign jusqu'au kill de tvsign.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Duree maximale de tout le provisioning anisette (websocket compris).
+const PROVISION_TIMEOUT: Duration = Duration::from_secs(60);
+/// Racine Apple, pour les appels gsa.apple.com du provisioning.
+const APPLE_ROOT: &[u8] = include_bytes!("./apple_root.der");
+
+/// Vrai si l'utilisateur accepte explicitement un serveur anisette au certificat auto-signe.
+fn anisette_insecure() -> bool {
+    std::env::var("PLUMESIGN_ANISETTE_INSECURE")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// Client du serveur anisette : certificats verifies, sauf opt-in explicite
+/// (PLUMESIGN_ANISETTE_INSECURE=1) pour un serveur maison en https auto-signe.
 fn make_reqwest() -> Result<Client, AnisetteError> {
+    let mut builder = ClientBuilder::new()
+        .http1_title_case_headers()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT);
+    if anisette_insecure() {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    Ok(builder.build()?)
+}
+
+/// Client des appels vers Apple (lookup, start/finish provisioning) : racine Apple ajoutee.
+fn make_apple_reqwest() -> Result<Client, AnisetteError> {
     Ok(ClientBuilder::new()
         .http1_title_case_headers()
-        .danger_accept_invalid_certs(true) // TODO: pin the apple certificate
+        .add_root_certificate(reqwest::Certificate::from_der(APPLE_ROOT)?)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
         .build()?)
+}
+
+/// URL du websocket de provisioning : https -> wss, http -> ws (serveur maison en clair).
+fn provisioning_ws_url(base: &str) -> String {
+    let base = base.trim().trim_end_matches('/');
+    let ws = if let Some(rest) = base.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        base.to_string()
+    };
+    format!("{ws}/v3/provisioning_session")
+}
+
+fn misc(message: impl Into<String>) -> AnisetteError {
+    AnisetteError::Anyhow(anyhow::anyhow!(message.into()))
 }
 
 impl AnisetteClient {
     pub async fn new(url: String) -> Result<AnisetteClient, AnisetteError> {
+        let url = url.trim().trim_end_matches('/').to_string();
         let path = format!("{}/v3/client_info", url);
         let http_client = make_reqwest()?;
         let client_info = http_client
@@ -261,7 +313,7 @@ impl AnisetteClient {
                 if message.contains("-45061") {
                     Err(AnisetteError::AnisetteNotProvisioned)
                 } else {
-                    panic!("Unknown error {}", message)
+                    Err(misc(format!("Anisette server error: {message}")))
                 }
             }
             AnisetteHeaders::Headers {
@@ -280,8 +332,18 @@ impl AnisetteClient {
     }
 
     pub async fn provision(&self, state: &mut AnisetteState) -> Result<(), AnisetteError> {
+        match tokio::time::timeout(PROVISION_TIMEOUT, self.provision_inner(state)).await {
+            Ok(result) => result,
+            Err(_) => Err(misc(format!(
+                "Anisette provisioning timed out after {}s",
+                PROVISION_TIMEOUT.as_secs()
+            ))),
+        }
+    }
+
+    async fn provision_inner(&self, state: &mut AnisetteState) -> Result<(), AnisetteError> {
         debug!("Provisioning Anisette");
-        let http_client = make_reqwest()?;
+        let http_client = make_apple_reqwest()?;
         let resp = self
             .build_apple_request(
                 &state,
@@ -294,29 +356,24 @@ impl AnisetteClient {
         let protocol_val = plist::Value::from_reader(Cursor::new(text.as_str()))?;
         let urls = protocol_val
             .as_dictionary()
-            .unwrap()
-            .get("urls")
-            .unwrap()
-            .as_dictionary()
-            .unwrap();
+            .and_then(|d| d.get("urls"))
+            .and_then(|v| v.as_dictionary())
+            .ok_or_else(|| misc("Apple lookup answer has no urls"))?;
 
         let start_provisioning_url = urls
             .get("midStartProvisioning")
-            .unwrap()
-            .as_string()
-            .unwrap();
+            .and_then(|v| v.as_string())
+            .ok_or_else(|| misc("Apple lookup answer has no midStartProvisioning"))?;
         let end_provisioning_url = urls
             .get("midFinishProvisioning")
-            .unwrap()
-            .as_string()
-            .unwrap();
+            .and_then(|v| v.as_string())
+            .ok_or_else(|| misc("Apple lookup answer has no midFinishProvisioning"))?;
         debug!(
             "Got provisioning urls: {} and {}",
             start_provisioning_url, end_provisioning_url
         );
 
-        let provision_ws_url =
-            format!("{}/v3/provisioning_session", self.url).replace("https://", "wss://");
+        let provision_ws_url = provisioning_ws_url(&self.url);
         let (mut connection, _) = connect_async(&provision_ws_url).await?;
 
         #[derive(Deserialize)]
@@ -335,11 +392,16 @@ impl AnisetteClient {
         }
 
         loop {
-            let Some(Ok(data)) = connection.next().await else {
-                continue;
+            // Connexion coupee ou en erreur : on s'arrete (sinon la boucle tourne a vide a 100 % CPU).
+            let data = match connection.next().await {
+                Some(Ok(data)) => data,
+                Some(Err(e)) => return Err(e.into()),
+                None => return Err(misc("Anisette provisioning socket closed unexpectedly")),
             };
             if data.is_text() {
-                let txt = data.to_text().unwrap();
+                let txt = data
+                    .to_text()
+                    .map_err(|e| misc(format!("Anisette socket sent invalid text: {e}")))?;
                 let msg: ProvisionInput = serde_json::from_str(txt)?;
                 match msg {
                     ProvisionInput::GiveIdentifier => {
@@ -355,7 +417,7 @@ impl AnisetteClient {
                             .await?;
                     }
                     ProvisionInput::GiveStartProvisioningData => {
-                        let http_client = make_reqwest()?;
+                        let http_client = make_apple_reqwest()?;
                         let body_data = ProvisionBodyData {
                             header: Dictionary::new(),
                             request: Dictionary::new(),
@@ -370,15 +432,11 @@ impl AnisetteClient {
                         let protocol_val = plist::Value::from_reader(Cursor::new(text.as_str()))?;
                         let spim = protocol_val
                             .as_dictionary()
-                            .unwrap()
-                            .get("Response")
-                            .unwrap()
-                            .as_dictionary()
-                            .unwrap()
-                            .get("spim")
-                            .unwrap()
-                            .as_string()
-                            .unwrap();
+                            .and_then(|d| d.get("Response"))
+                            .and_then(|v| v.as_dictionary())
+                            .and_then(|d| d.get("spim"))
+                            .and_then(|v| v.as_string())
+                            .ok_or_else(|| misc("Apple answer has no spim"))?;
 
                         debug!("GiveStartProvisioningData");
                         #[derive(Serialize)]
@@ -393,7 +451,7 @@ impl AnisetteClient {
                             .await?;
                     }
                     ProvisionInput::GiveEndProvisioningData { cpim } => {
-                        let http_client = make_reqwest()?;
+                        let http_client = make_apple_reqwest()?;
                         let body_data = ProvisionBodyData {
                             header: Dictionary::new(),
                             request: Dictionary::from_iter([("cpim", cpim)].into_iter()),
@@ -408,11 +466,15 @@ impl AnisetteClient {
                         let protocol_val = plist::Value::from_reader(Cursor::new(text.as_str()))?;
                         let response = protocol_val
                             .as_dictionary()
-                            .unwrap()
-                            .get("Response")
-                            .unwrap()
-                            .as_dictionary()
-                            .unwrap();
+                            .and_then(|d| d.get("Response"))
+                            .and_then(|v| v.as_dictionary())
+                            .ok_or_else(|| misc("Apple answer has no Response"))?;
+                        let (Some(ptm), Some(tk)) = (
+                            response.get("ptm").and_then(|v| v.as_string()),
+                            response.get("tk").and_then(|v| v.as_string()),
+                        ) else {
+                            return Err(misc("Apple answer has no ptm/tk"));
+                        };
 
                         debug!("GiveEndProvisioningData");
 
@@ -421,10 +483,7 @@ impl AnisetteClient {
                             ptm: &'t str,
                             tk: &'t str,
                         }
-                        let end_provisioning = EndProvisioning {
-                            ptm: response.get("ptm").unwrap().as_string().unwrap(),
-                            tk: response.get("tk").unwrap().as_string().unwrap(),
-                        };
+                        let end_provisioning = EndProvisioning { ptm, tk };
                         connection
                             .send(Message::Text(
                                 serde_json::to_string(&end_provisioning)?.into(),
@@ -433,7 +492,7 @@ impl AnisetteClient {
                     }
                     ProvisionInput::ProvisioningSuccess { adi_pb } => {
                         debug!("ProvisioningSuccess");
-                        state.adi_pb = Some(base64_decode(&adi_pb));
+                        state.adi_pb = Some(base64_decode(&adi_pb)?);
                         connection.close(None).await?;
                         break;
                     }
@@ -512,6 +571,31 @@ impl AnisetteHeadersProvider for RemoteAnisetteProviderV3 {
             }
         };
         Ok(data.get_headers(self.serial.clone()))
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::provisioning_ws_url;
+
+    #[test]
+    fn https_becomes_wss() {
+        assert_eq!(
+            provisioning_ws_url("https://ani.sidestore.app"),
+            "wss://ani.sidestore.app/v3/provisioning_session"
+        );
+    }
+
+    #[test]
+    fn http_becomes_ws() {
+        assert_eq!(
+            provisioning_ws_url("http://192.168.1.10:6969"),
+            "ws://192.168.1.10:6969/v3/provisioning_session"
+        );
+        assert_eq!(
+            provisioning_ws_url("http://anisette:6969/"),
+            "ws://anisette:6969/v3/provisioning_session"
+        );
     }
 }
 

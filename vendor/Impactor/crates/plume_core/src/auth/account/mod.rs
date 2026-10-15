@@ -34,10 +34,17 @@ pub fn check_error(res: &plist::Dictionary) -> Result<(), Error> {
         _ => &res,
     };
 
-    if res.get("ec").unwrap().as_signed_integer().unwrap() != 0 {
+    let ec = res
+        .get("ec")
+        .and_then(|v| v.as_signed_integer())
+        .ok_or(Error::Parse)?;
+    if ec != 0 {
         return Err(Error::AuthSrpWithMessage(
-            res.get("ec").unwrap().as_signed_integer().unwrap().into(),
-            res.get("em").unwrap().as_string().unwrap().to_owned(),
+            ec,
+            res.get("em")
+                .and_then(|v| v.as_string())
+                .unwrap_or_default()
+                .to_owned(),
         ));
     }
 

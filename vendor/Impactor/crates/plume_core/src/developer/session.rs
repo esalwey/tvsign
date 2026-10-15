@@ -210,7 +210,7 @@ impl DeveloperSession {
     pub async fn get_anisette(&self) -> AnisetteData {
         let mut locked = self.anisette.lock().await;
         if locked.needs_refresh() {
-            *locked = locked.refresh().await.unwrap();
+            locked.refresh_in_place().await;
         }
         locked.clone()
     }
