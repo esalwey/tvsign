@@ -387,6 +387,9 @@ def _github_error(e: urllib.error.HTTPError) -> SourceUnavailable | None:
         except (ValueError, OSError):
             pass
         return SourceUnavailable(f"limite de requêtes GitHub atteinte{when}{hint}", "gh_rate_limit")
+    if e.code == 401 and GITHUB_TOKEN:
+        return SourceUnavailable("jeton GitHub refusé : vérifie ou renouvelle TVSIGN_GITHUB_TOKEN "
+                                 "(expiré, révoqué ou sans accès à ce dépôt)", "gh_bad_token")
     if e.code in (401, 404):
         return SourceUnavailable("dépôt GitHub introuvable ou privé : vérifie owner/projet (dépôt renommé ?)"
                                  + ("" if GITHUB_TOKEN else ", ou fournis TVSIGN_GITHUB_TOKEN pour un dépôt privé"),

@@ -115,6 +115,7 @@ MIGRATIONS = [
     ("apps", "prev_version", "TEXT"),
     ("apps", "prev_sha256", "TEXT"),
     ("apps", "fail_count", "INTEGER NOT NULL DEFAULT 0"),    # échecs consécutifs : recul exponentiel des essais
+    ("apps", "fail_kind", "TEXT"),           # nature du dernier échec (le compteur repart de 1 quand elle change)
 ]
 
 

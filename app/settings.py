@@ -77,6 +77,8 @@ def _convert(spec: Spec, raw):
         value = str(raw if raw is not None else "").strip()
     if spec.check:
         spec.check(value)
+    if spec.check is _onoff:
+        value = "off" if value.lower() in ("off", "0", "false", "no") else "on"    # l'interface ne connaît que on / off
     return value
 
 

@@ -659,10 +659,13 @@ def app_or_404(app_id: int) -> dict:
 async def app_patch(app_id: int, body: AppPatch):
     a = app_or_404(app_id)
     fields = body.model_dump(exclude_unset=True)
+    pin_in_request = "pinned_tag" in fields
     if fields.get("enabled") is None:
         fields.pop("enabled", None)          # null n'a pas de sens : ignoré
     else:
         fields["enabled"] = int(fields["enabled"])
+        if not fields["enabled"]:
+            renew._release_ok(a)             # en pause : sa recherche de version n'a plus lieu d'être signalée
     if "account_email" in fields:
         fields["account_email"] = fields["account_email"] or plume.default_account()
     if "source" in fields:
@@ -696,7 +699,19 @@ async def app_patch(app_id: int, body: AppPatch):
         fields["source_key"] = None
         fields["bad_tag"] = None
         fields["bad_key"] = None
-        fields.update(update_tag=None, update_notes=None, update_block=None, update_error=None)
+        fields.update(update_tag=None, update_notes=None, update_block=None, update_error=None,
+                      next_attempt_at=None, fail_count=0)
+        renew._release_ok(a)               # l'ancienne source n'est plus cherchée : son échec ne compte plus
+        if "source" in fields and fields["source"] != a["source"]:
+            # autre dépôt ou autre lien : la version épinglée (tag de l'ancien dépôt) et la version précédente
+            # gardée (IPA de l'ancienne source) n'ont plus de sens
+            if not pin_in_request:
+                fields["pinned_tag"] = None
+            fields.update(prev_tag=None, prev_key=None, prev_version=None, prev_sha256=None)
+            try:
+                (renew.app_dir(app_id) / "original.prev.ipa").unlink(missing_ok=True)
+            except OSError:
+                pass
     dest_changed = "device_id" in fields or "account_email" in fields
     if dest_changed:
         # autre appareil/compte : la signature déjà prête ne convient plus
@@ -744,7 +759,10 @@ async def app_rollback(app_id: int):
         raise HTTPException(409, "app_busy")
     if not renew.has_previous(app_id):
         raise HTTPException(409, "no_previous")
-    renew._swap_files(app_id)
+    try:
+        renew._swap_files(app_id)
+    except OSError:
+        raise HTTPException(409, "files_locked") from None      # fichier verrouillé (antivirus…) : rien n'a changé
     d = renew.app_dir(app_id)
     (d / "original.prev.ipa").unlink(missing_ok=True)            # la version quittée : retéléchargeable depuis la source
     (d / "signed.ipa").unlink(missing_ok=True)
@@ -794,14 +812,22 @@ async def app_replace_ipa(app_id: int, file: UploadFile = File(...)):
         d = renew.app_dir(app_id)
         dest, prev, hold = d / "original.ipa", d / "original.prev.ipa", d / "original.hold"
         keep = dest.exists() and not renew.pending_update(a) and a["source_sha256"] != sha
+
+        def put_in_place() -> None:
+            # copie éventuelle d'une grosse IPA et remplacements : hors de la boucle d'événements
+            try:
+                if keep:
+                    ipa.keep_copy(dest, hold)
+                replace_retry(tmp, dest)
+                if keep:
+                    replace_retry(hold, prev)
+            finally:
+                hold.unlink(missing_ok=True)
+
         try:
-            if keep:
-                ipa.keep_copy(dest, hold)
-            replace_retry(tmp, dest)
-            if keep:
-                replace_retry(hold, prev)
-        finally:
-            hold.unlink(missing_ok=True)
+            await asyncio.to_thread(put_in_place)
+        except OSError:
+            raise HTTPException(409, "files_locked") from None
         (d / "signed.ipa").unlink(missing_ok=True)
         fields = dict(name=info["name"], version=info["version"], bundle_id=info["bundle_id"], source_sha256=sha,
                       bad_tag=None, bad_key=None, update_error=None, next_attempt_at=None, fail_count=0)
@@ -829,6 +855,7 @@ def app_delete(app_id: int):
     db.execute("DELETE FROM events WHERE app_id = ?", app_id)   # sinon l'identifiant réutilisé hérite de ce journal
     shutil.rmtree(renew.app_dir(app_id), ignore_errors=True)
     renew.PHASE.pop(app_id, None)
+    renew._release_ok({"id": app_id})        # sinon la bannière « recherche impossible » resterait jusqu'au redémarrage
     if a:
         db.log(f"App supprimée : {a['name']}")
     return {"ok": True}

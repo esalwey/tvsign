@@ -3,6 +3,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 import re
 import time
 import urllib.parse
@@ -170,13 +171,47 @@ def has_previous(app_id: int) -> bool:
 
 
 def _swap_files(app_id: int) -> None:
-    """Échange original.ipa et original.prev.ipa."""
+    """Échange original.ipa et original.prev.ipa. Transactionnel : si une étape échoue (antivirus qui
+    verrouille un fichier sous Windows), ce qui a été déplacé est remis en place avant de relever l'erreur,
+    pour ne jamais laisser l'app sans original.ipa."""
     d = app_dir(app_id)
-    tmp = d / "original.swap"
+    orig, prev, tmp = d / "original.ipa", d / "original.prev.ipa", d / "original.swap"
     tmp.unlink(missing_ok=True)
-    util.replace_retry(d / "original.ipa", tmp)
-    util.replace_retry(d / "original.prev.ipa", d / "original.ipa")
-    util.replace_retry(tmp, d / "original.prev.ipa")
+    util.replace_retry(orig, tmp)
+    try:
+        util.replace_retry(prev, orig)
+    except OSError:
+        _put_back(tmp, orig)
+        raise
+    try:
+        util.replace_retry(tmp, prev)
+    except OSError:
+        # original.ipa porte maintenant l'ancienne précédente : on défait les deux déplacements
+        _put_back(orig, prev)
+        _put_back(tmp, orig)
+        raise
+
+
+def _put_back(src, dst) -> None:
+    try:
+        util.replace_retry(src, dst)
+    except OSError:
+        pass        # au pire, recover_swaps() le rétablira au prochain démarrage
+
+
+def recover_swaps() -> None:
+    """Un échange interrompu (arrêt brutal, verrou persistant) a pu laisser original.swap sans original.ipa :
+    c'est l'IPA d'origine, on la remet en place."""
+    if not IPA_DIR.exists():
+        return
+    for swap in IPA_DIR.glob("*/original.swap"):
+        orig = swap.with_name("original.ipa")
+        try:
+            if not orig.exists():
+                os.replace(swap, orig)
+                db.log(f"IPA d'origine rétablie après un échange interrompu ({swap.parent.name})", "warn")
+        except OSError:
+            pass
 
 
 def _device_os(app: dict) -> str | None:
@@ -272,9 +307,11 @@ async def refresh_source(app: dict, force: bool = False) -> bool:
                 if key and app.get("source_key") is None:
                     db.update("apps", app["id"], source_key=key)   # première lecture de la clé (ancienne base)
                 if app["source_type"] == "url" and key is None and app.get("source_sha256") \
-                        and app.get("auto_update", 1) and tag not in (app.get("bad_tag"),) \
-                        and (force or time.time() - _LINK_CHECKED.get(app["id"], 0) > 6 * 3600):
+                        and tag not in (app.get("bad_tag"),) \
+                        and (force or (app.get("auto_update", 1)
+                                       and time.time() - _LINK_CHECKED.get(app["id"], 0) > 6 * 3600)):
                     # serveur sans ETag, date ni taille : seul un nouveau téléchargement dit si le fichier a changé
+                    # (périodiquement si la mise à jour auto est active, sinon seulement sur demande)
                     unchanged_sha = app["source_sha256"]
                 else:
                     if app["source_type"] == "github":
@@ -300,14 +337,14 @@ async def refresh_source(app: dict, force: bool = False) -> bool:
         # attend déjà, la copie existante (la dernière installée) reste en place
         keep = dest.exists() and not pending_update(app)
         if keep:
-            ipa.keep_copy(dest, hold, copy=not unchanged_sha)
+            await asyncio.to_thread(ipa.keep_copy, dest, hold, not unchanged_sha)   # copie possible : pas sur la boucle
         info = await asyncio.to_thread(ipa.download, url, dest, sha256, expect, **extra)
         if unchanged_sha:
             _LINK_CHECKED[app["id"]] = time.time()
         if info is None:
             return False                          # même empreinte : le fichier du lien n'a pas changé
         if keep and hold.exists():
-            util.replace_retry(hold, prev)
+            await asyncio.to_thread(util.replace_retry, hold, prev)
             db.update("apps", app["id"], prev_tag=app.get("source_tag"), prev_key=app.get("source_key"),
                       prev_version=app.get("version"), prev_sha256=app.get("source_sha256"))
     except ipa.OsTooOld as e:
@@ -377,8 +414,17 @@ def _release_error(app: dict, e: Exception) -> None:
 
 
 def _release_ok(app: dict) -> None:
+    """La recherche de version ne pose plus problème pour cette app (réussie, app supprimée, en pause ou
+    source changée) : on l'oublie, et la bannière disparaît quand plus aucune app n'échoue."""
     if _RELEASE_ERR.pop(app["id"], None) is not None:
         HEALTH["release_check_error"] = next(iter(_RELEASE_ERR.values()), None)
+
+
+def _prune_release_errors(apps: list[dict]) -> None:
+    """Oublie les échecs de recherche des apps qui n'ont plus à être cherchées (supprimées, en pause, plus GitHub)."""
+    alive = {a["id"] for a in apps if a["enabled"] and a["source_type"] == "github"}
+    for app_id in [i for i in _RELEASE_ERR if i not in alive]:
+        _release_ok({"id": app_id})
 
 
 async def new_release(app: dict) -> bool:
@@ -387,6 +433,7 @@ async def new_release(app: dict) -> bool:
     Sinon, une version disponible mais non installée est mémorisée pour l'interface. Les liens ne sont
     relus qu'au renouvellement (refresh_source)."""
     if app["source_type"] != "github":
+        _release_ok(app)
         return False
     try:
         found = await asyncio.to_thread(_latest, app)
@@ -501,6 +548,13 @@ def _retry_at(app: dict, now: float, transient: bool = False, kind: str | None =
     return now + delay
 
 
+def _next_fails(app: dict, fail_kind: str) -> int:
+    """Nombre d'échecs consécutifs de même nature, celui qui vient d'avoir lieu compris. Une autre nature
+    d'échec (TV en veille puis erreur Apple…) repart de 1 : elle ne doit pas hériter du plafond de l'autre."""
+    same = app.get("fail_kind") == fail_kind
+    return (app.get("fail_count") or 0) + 1 if same else 1
+
+
 def _reusable_signature(app: dict, original, signed, now: float) -> float | None:
     """Expiration d'une IPA signée récemment mais jamais installée (TV en veille au dernier essai),
     pour ne pas re-signer chez Apple à chaque nouvel essai. None si inutilisable."""
@@ -578,11 +632,18 @@ async def _fall_back(app_id: int, first: Exception, deliver, signed) -> float:
     db.log(f"{name} : la version {new_label} n'a pas pu être installée ({first}), nouvel essai avec la version "
            f"précédente {cur['prev_tag'] or cur['prev_version'] or ''}".rstrip(), "warn", app_id=app_id)
     signed.unlink(missing_ok=True)
-    _swap_files(app_id)
+    try:
+        _swap_files(app_id)
+    except OSError as se:
+        db.log(f"{name} : version précédente inaccessible ({se}), l'erreur d'origine est conservée", "warn", app_id=app_id)
+        raise first from None
     try:
         expires = await deliver()
     except BaseException as e:
-        _swap_files(app_id)
+        try:
+            _swap_files(app_id)
+        except OSError as se:
+            db.log(f"{name} : impossible de remettre la nouvelle version en place ({se})", "error", app_id=app_id)
         signed.unlink(missing_ok=True)
         if isinstance(e, Exception):
             raise first from None
@@ -727,21 +788,28 @@ async def _renew(app_id: int, trigger: str) -> None:
             # arrêt normal (redémarrage, mise à jour) : pas une erreur, on reprendra au démarrage
             db.update("apps", app_id, status="pending", last_error=None, next_attempt_at=None)
         else:
+            fails = _next_fails(app, "other")
             db.update("apps", app_id, status="error", last_error="renouvellement trop long, abandonné",
-                      next_attempt_at=_retry_at(app, time.time()), fail_count=(app.get("fail_count") or 0) + 1)
+                      next_attempt_at=_retry_at(app, time.time(), fails=fails), fail_count=fails, fail_kind="other")
         raise
     except Exception as e:  # noqa: BLE001 - l'erreur est remontée dans l'interface
         now = time.time()
         kind = error_kind(e)
-        fails = (app.get("fail_count") or 0) + 1
-        retry = _retry_at(app, now, kind=kind, fails=fails)
         exp = app["expires_at"]
-        if trigger in UPDATE_TRIGGERS and was_ok and exp and exp - now > settings.renew_before_hours() * 3600:
+        optional = bool(trigger in UPDATE_TRIGGERS and was_ok and exp and exp - now > settings.renew_before_hours() * 3600)
+        # les essais d'une mise à jour facultative ont leur propre recul : ils ne font pas monter celui du
+        # renouvellement obligatoire (ni l'inverse), le compteur repart de 1 quand la nature de l'échec change
+        fail_kind = ("update:" if optional else "") + kind
+        fails = _next_fails(app, fail_kind)
+        retry = _retry_at(app, now, kind=kind, fails=fails)
+        if optional:
             # Mise à jour facultative impossible alors que l'app installée est valable pour longtemps :
             # elle reste « ok » (pas de rouge, pas d'alerte). La mise à jour est retentée plus tard, avec recul ;
             # le message est montré sur la carte.
+            # sans jamais repousser le renouvellement obligatoire : pas plus tard que l'ouverture de sa fenêtre
+            retry = min(retry, max(now + 60, exp - settings.renew_before_hours() * 3600))
             db.update("apps", app_id, status="ok", last_error=None, update_error=str(e)[:500],
-                      next_attempt_at=retry, fail_count=fails)
+                      next_attempt_at=retry, fail_count=fails, fail_kind=fail_kind)
             waiting = kind in ("unreachable", "transient", "local")
             db.log(f"{app['name']} : mise à jour {'en attente' if waiting else 'impossible'}, {e}",
                    "warn", app_id=app_id)
@@ -749,7 +817,8 @@ async def _renew(app_id: int, trigger: str) -> None:
                 await notify(f"{app['name']} : la mise à jour n'a pas pu être installée ({e}), "
                              "la version actuelle reste valable")
             return
-        db.update("apps", app_id, status="error", last_error=str(e), next_attempt_at=retry, fail_count=fails)
+        db.update("apps", app_id, status="error", last_error=str(e), next_attempt_at=retry, fail_count=fails,
+                  fail_kind=fail_kind)
         db.log(f"{app['name']} : échec, {e}", "error", app_id=app_id)
         # une TV en veille loin de l'expiration est banale : pas de notification avant le niveau 24h
         await alert(db.row("SELECT * FROM apps WHERE id = ?", app_id) or app, str(e), now,
@@ -833,6 +902,7 @@ async def _check_expired(now: float) -> None:
 def startup() -> None:
     """Au démarrage : rien ne peut être « en cours », et on corrige les dates déjà enregistrées."""
     db.execute("UPDATE apps SET status = 'pending' WHERE status = 'running'")
+    recover_swaps()
     # ancien report « app ouverte » : supprimé, ne plus l'afficher
     db.execute("UPDATE apps SET deferred_reason = NULL, deferred_since = NULL WHERE deferred_reason IS NOT NULL")
     # Base d'avant le suivi de la version installée : l'IPA présente est celle qui a été installée
@@ -894,7 +964,9 @@ async def loop() -> None:
             check_releases = RELEASE_CHECK_MINUTES > 0 and now - last_release_check > RELEASE_CHECK_MINUTES * 60
             if check_releases:
                 last_release_check = HEALTH["last_release_check_at"] = now
-            for app in db.rows("SELECT * FROM apps"):
+            apps = db.rows("SELECT * FROM apps")
+            _prune_release_errors(apps)
+            for app in apps:
                 if STOPPING:
                     break
                 # une app précédente a pu durer longtemps : relire la ligne (pause, renouvellement manuel…)
