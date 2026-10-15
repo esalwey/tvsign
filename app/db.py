@@ -59,6 +59,10 @@ CREATE TABLE IF NOT EXISTS events (
     app_id  INTEGER,
     message TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS revoked_sessions (
+    sid   TEXT PRIMARY KEY,                -- identifiant de session (cookie) déconnecté
+    until REAL NOT NULL                    -- au-delà, le cookie a de toute façon expiré
+);
 """
 
 
@@ -101,6 +105,12 @@ MIGRATIONS = [
     ("apps", "deferred_since", "REAL"),      # idem
     ("apps", "source_key", "TEXT"),          # identité du contenu téléchargé (empreinte, ETag…) : tag fixe, IPA remplacée
     ("apps", "bad_key", "TEXT"),             # identité de la release refusée (avec bad_tag)
+    ("apps", "fail_count", "INTEGER NOT NULL DEFAULT 0"),   # échecs d'affilée (délai croissant entre essais)
+    ("apps", "needs_action", "TEXT"),        # session | pairing | limit | config : inutile de réessayer avant une action
+    ("apps", "installed_version", "TEXT"),   # version réellement installée sur la TV (version = dernière téléchargée)
+    ("apps", "installed_tag", "TEXT"),
+    ("events", "repeat", "INTEGER NOT NULL DEFAULT 1"),     # même événement répété (échecs d'affilée)
+    ("events", "first_ts", "REAL"),          # première occurrence d'un événement répété
 ]
 
 
@@ -159,14 +169,45 @@ def update(table: str, key: int, **fields) -> None:
     execute(f"UPDATE {table} SET {cols} WHERE id = ?", *fields.values(), key)
 
 
-def log(message: str, level: str = "info", app_id: int | None = None) -> None:
-    last = row("SELECT id, level, message FROM events WHERE app_id IS ? ORDER BY id DESC LIMIT 1", app_id)
-    if last and level != "info" and last["level"] == level and last["message"] == message:
-        # même avertissement/erreur qu'à l'essai précédent (échec répété) : on rafraîchit l'heure au lieu
-        # de noyer le journal, qui garde 1000 lignes en tout
-        execute("UPDATE events SET ts = ? WHERE id = ?", time.time(), last["id"])
-    else:
-        execute("INSERT INTO events (ts, level, app_id, message) VALUES (?, ?, ?, ?)",
-                time.time(), level, app_id, message)
-    execute("DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT 1000)")
-    print(f"[{level}] {message}", flush=True)
+# Conservation du journal : global (sans app) et par app séparément, pour qu'une app qui échoue en
+# boucle n'efface ni les événements des autres ni les siens plus anciens ; plafond général en plus.
+KEEP_PER_APP = 250
+KEEP_TOTAL = 1200
+
+
+def log(message: str, level: str = "info", app_id: int | None = None, journal: bool = True) -> None:
+    """Écrit au journal (et sur la sortie du service). journal=False : sortie seulement, pour le détail
+    d'un nouvel essai qui encombrerait le journal sans rien apprendre."""
+    if journal:
+        _record(message, level, app_id)
+    try:
+        print(f"[{level}] {message}", flush=True)
+    except (UnicodeError, OSError):
+        # sortie redirigée en cp1252 (Windows) ou fermée : le journal en base est déjà écrit, et un
+        # message qu'on ne peut pas afficher ne doit jamais faire échouer l'opération qu'il décrit
+        try:
+            print(f"[{level}] " + message.encode("ascii", "replace").decode("ascii"), flush=True)
+        except (UnicodeError, OSError):
+            pass
+
+
+def _record(message: str, level: str, app_id: int | None) -> None:
+    now = time.time()
+    if level != "info":
+        # même avertissement/erreur que le dernier problème de cette app (échec répété) : on compte la
+        # répétition au lieu d'ajouter une ligne ; la première occurrence reste visible (first_ts)
+        last = row("SELECT id, ts, level, message, repeat, first_ts FROM events "
+                   "WHERE app_id IS ? AND level != 'info' ORDER BY id DESC LIMIT 1", app_id)
+        if last and last["level"] == level and last["message"] == message:
+            # seulement si rien de neuf n'a été écrit depuis (succès, autre erreur, début d'un nouvel
+            # épisode) : sinon c'est un nouvel épisode. Les nouveaux essais d'un même échec n'écrivent
+            # que l'erreur (journal=False pour le reste).
+            newer = row("SELECT COUNT(*) AS n FROM events WHERE app_id IS ? AND id > ?", app_id, last["id"])
+            if not newer["n"]:
+                execute("UPDATE events SET ts = ?, repeat = repeat + 1, first_ts = COALESCE(first_ts, ts) "
+                        "WHERE id = ?", now, last["id"])
+                return
+    execute("INSERT INTO events (ts, level, app_id, message) VALUES (?, ?, ?, ?)", now, level, app_id, message)
+    execute("DELETE FROM events WHERE app_id IS ? AND id NOT IN "
+            "(SELECT id FROM events WHERE app_id IS ? ORDER BY id DESC LIMIT ?)", app_id, app_id, KEEP_PER_APP)
+    execute("DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT ?)", KEEP_TOTAL)
