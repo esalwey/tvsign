@@ -19,7 +19,11 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  tests:
+    uses: ./.github/workflows/tests.yml
+
   installer:
+    needs: tests
     runs-on: windows-latest
     timeout-minutes: 90
     defaults:
@@ -60,6 +64,7 @@ jobs:
           cache-dependency-path: |
             requirements.txt
             windows/requirements-windows.txt
+            windows/requirements-lock.txt
 
       - name: Inno Setup
         run: |
@@ -77,6 +82,17 @@ jobs:
 
       - name: Build installer (windows/build.ps1, version from windows/version.txt)
         run: ./windows/build.ps1
+
+      # plumesign.exe imports VCRUNTIME140.dll, which the loader looks for beside plumesign.exe (not in
+      # _internal\): the build copies it there, this proves it, and runs plumesign.exe from a copy of its folder
+      # with a bare PATH so that only the DLLs shipped beside it can satisfy it.
+      - name: Check the runtime DLLs shipped beside plumesign.exe
+        run: |
+          windows/.venv-build/Scripts/python.exe windows/tools/pe_deps.py check windows/dist/tvsign/plumesign.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke test of the installer (install, plumesign, launch, /api/livez, quit, uninstall)
+        run: ./windows/tools/smoke.ps1 -Setup (Get-ChildItem windows/dist/installer -Filter 'tvsign-setup-*.exe').FullName
 
       - name: Checksums
         run: |
@@ -98,8 +114,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "${{ github.ref_name }}"
-          $flags = @('--title', "tvsign $($tag.Substring(1))", '--generate-notes',
-                     '--notes', "Docker (NAS / Raspberry Pi): ``ghcr.io/${{ github.repository_owner }}/tvsign:$($tag.Substring(1))``")
+          $notes = "Docker (NAS / Raspberry Pi): ``ghcr.io/${{ github.repository_owner }}/tvsign:$($tag.Substring(1))``" +
+                   "`n`nWindows: the installer is not code-signed yet. Windows SmartScreen asks for confirmation, and Smart App Control (Windows 11) may block it: see windows/README-windows.md. Check the download against SHA256SUMS.txt."
+          $flags = @('--title', "tvsign $($tag.Substring(1))", '--generate-notes', '--notes', $notes)
           $flags += $(if ($tag.Contains('-')) { '--prerelease' } else { '--latest' })
           gh release create $tag @((Get-ChildItem windows/dist/installer -File).FullName) @flags
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
