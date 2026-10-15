@@ -93,7 +93,7 @@ tvsign's helper, **plumesign**, finds the Apple TV by listening on the local net
 
 Also check that your home network is set to the **Private** profile, not **Public** (*Settings › Network & internet › Wi-Fi or Ethernet › Network profile type*). On a Public profile, Windows blocks device discovery.
 
-The tvsign **Diagnostics** page shows how many Apple TVs are visible on the network. Uninstalling tvsign removes the rule (Windows asks for a confirmation).
+The tvsign **Diagnostics** page shows how many Apple TVs are visible on the network. Uninstalling tvsign removes the rule (Windows asks for a confirmation), except for a **silent** uninstall (`/VERYSILENT`), which leaves it: remove it yourself in an administrator PowerShell with `netsh advfirewall firewall delete rule name="tvsign plumesign"`. Reinstalling in another folder updates the rule's program path.
 
 ### 5. The PC must be on for renewals
 
@@ -269,7 +269,7 @@ L'outil **plumesign**, fourni avec tvsign, trouve l'Apple TV en **écoutant le r
 
 Vérifiez aussi que votre réseau domestique est en profil **Privé** et non **Public** (*Paramètres › Réseau et Internet › Wi-Fi ou Ethernet › Type de profil réseau*). En profil Public, Windows bloque la recherche des appareils.
 
-La page **Diagnostic** de tvsign indique combien d'Apple TV sont visibles sur le réseau. Désinstaller tvsign supprime la règle (Windows demande une confirmation).
+La page **Diagnostic** de tvsign indique combien d'Apple TV sont visibles sur le réseau. Désinstaller tvsign supprime la règle (Windows demande une confirmation), sauf lors d'une désinstallation **silencieuse** (`/VERYSILENT`) qui la laisse : supprimez-la vous-même dans un PowerShell administrateur avec `netsh advfirewall firewall delete rule name="tvsign plumesign"`. Réinstaller dans un autre dossier met à jour le chemin du programme de la règle.
 
 ### 5. Le PC doit être allumé pour les renouvellements
 

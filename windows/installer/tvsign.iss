@@ -66,6 +66,8 @@ fr.Cancel=Annuler
 en.Cancel=Cancel
 fr.Firewall=Autoriser plumesign dans le Pare-feu Windows (réseaux privés), pour trouver l'Apple TV. Windows demandera une confirmation administrateur maintenant, plutôt qu'une invite surprise au premier appairage
 en.Firewall=Allow plumesign through Windows Firewall (private networks) so it can find the Apple TV. Windows will ask for administrator confirmation now, instead of a surprise prompt at the first pairing
+fr.QuitWait=Fermeture de tvsign : s'il est en plein renouvellement, il le termine d'abord (jusqu'à 5 minutes).
+en.QuitWait=Closing tvsign: if it is in the middle of a renewal, it finishes it first (up to 5 minutes).
 fr.FirewallFailed=La règle de pare-feu n'a pas été créée (confirmation refusée ?). Ce n'est pas bloquant : Windows proposera l'autorisation au premier appairage de l'Apple TV, ou voir le guide Windows de tvsign (section pare-feu).
 en.FirewallFailed=The firewall rule was not created (confirmation declined?). This is not blocking: Windows will offer the permission at the first Apple TV pairing, or see the tvsign Windows guide (firewall section).
 fr.WebView2Missing=Microsoft Edge WebView2 est introuvable sur ce PC. tvsign en a besoin pour afficher sa fenêtre (sans lui, l'interface s'ouvre dans le navigateur depuis l'icône près de l'horloge).%n%nOuvrir la page de téléchargement de WebView2 ?
@@ -135,10 +137,15 @@ var
   Code: Integer;
   Params: String;
 begin
-  if FirewallRuleExists() then Exit;
-  { inbound, plumesign.exe only, private and domain networks: mDNS answers of the Apple TV }
-  Params := 'advfirewall firewall add rule name="' + FirewallRule + '" dir=in action=allow program="' +
-    ExpandConstant('{app}\plumesign.exe') + '" profile=private,domain enable=yes';
+  { inbound, plumesign.exe only, private and domain networks: mDNS answers of the Apple TV. A rule left by an install
+    in another folder would keep pointing at the old plumesign.exe: update its program path instead of skipping it
+    (a single elevated command either way) }
+  if FirewallRuleExists() then
+    Params := 'advfirewall firewall set rule name="' + FirewallRule + '" new program="' +
+      ExpandConstant('{app}\plumesign.exe') + '" profile=private,domain enable=yes'
+  else
+    Params := 'advfirewall firewall add rule name="' + FirewallRule + '" dir=in action=allow program="' +
+      ExpandConstant('{app}\plumesign.exe') + '" profile=private,domain enable=yes';
   if ShellExec('runas', ExpandConstant('{sys}\netsh.exe'), Params, '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0) then
     Log('Firewall rule created')
   else
@@ -223,7 +230,9 @@ begin
       ShellExec('open', WebView2Url, '', '', SW_SHOWNORMAL, ewNoWait, Code);
 end;
 
-{ Ask a running tvsign to exit cleanly (waits up to 20 s; stops plumesign too). }
+{ Ask a running tvsign to exit cleanly (stops plumesign too). Instant when idle; during a renewal --quit waits for it
+  to finish, up to about 5 minutes (the wizard says so, see PrepareToInstall). Also used by the uninstaller, so no
+  wizard control here. }
 procedure QuitRunningApp();
 var
   Code: Integer;
@@ -236,6 +245,12 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
+  if FileExists(ExpandConstant('{app}\{#AppExe}')) and not WizardSilent() then
+  begin
+    { --quit waits for a renewal in progress: say so instead of looking hung }
+    WizardForm.PreparingLabel.Caption := CustomMessage('QuitWait');
+    WizardForm.PreparingLabel.Update;
+  end;
   QuitRunningApp();
 end;
 
