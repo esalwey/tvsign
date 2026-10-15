@@ -49,6 +49,7 @@ def export(include_uploads: bool = False) -> Path:
     snap = TMP_DIR / f"db-{stamp}.sqlite"
     db.snapshot(snap)
     try:
+        _strip_local(snap)
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
             z.writestr("manifest.json", json.dumps({
                 "format": FORMAT, "version": FORMAT_VERSION, "created": time.time(),
@@ -69,6 +70,39 @@ def export(include_uploads: bool = False) -> Path:
     return out
 
 
+def _strip_local(snap: Path) -> None:
+    """Retire de la copie exportée ce qui n'appartient qu'à cette instance : hash du mot de passe
+    administrateur, version des sessions, sessions révoquées. Une restauration ne les reprend de toute
+    façon pas (AUTH_LOCAL) ; une archive envoyée par courriel ou sauvegardée dans le cloud ne doit pas
+    permettre de chercher le mot de passe hors ligne."""
+    conn = sqlite3.connect(snap)
+    try:
+        conn.execute("DELETE FROM settings WHERE key IN ('admin_password', 'session_version', 'setup_done')")
+        conn.execute("DELETE FROM revoked_sessions")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _manifest(z: zipfile.ZipFile) -> dict:
+    """manifest.json validé : un dictionnaire de format et de version reconnus, sinon ValueError."""
+    try:
+        manifest = json.loads(z.read("manifest.json"))
+    except KeyError:
+        raise ValueError("ce fichier n'est pas une sauvegarde tvsign (manifest.json absent)") from None
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise ValueError("ce fichier n'est pas une sauvegarde tvsign (manifest.json illisible)") from None
+    if not isinstance(manifest, dict) or manifest.get("format") != FORMAT:
+        raise ValueError("ce fichier n'est pas une sauvegarde tvsign")
+    try:
+        version = int(manifest.get("version", 0))
+    except (TypeError, ValueError):
+        raise ValueError("sauvegarde tvsign illisible (version du format invalide)") from None
+    if version > FORMAT_VERSION:
+        raise ValueError("sauvegarde faite par une version plus récente de tvsign")
+    return manifest
+
+
 def _safe(name: str) -> PurePosixPath:
     p = PurePosixPath(name)
     if p.is_absolute() or ".." in p.parts or "\\" in name or ":" in name:
@@ -87,14 +121,7 @@ def restore(archive: Path) -> dict:
         names = z.namelist()
         for n in names:
             _safe(n)
-        try:
-            manifest = json.loads(z.read("manifest.json"))
-        except KeyError:
-            raise ValueError("ce fichier n'est pas une sauvegarde tvsign (manifest.json absent)") from None
-        if manifest.get("format") != FORMAT:
-            raise ValueError("ce fichier n'est pas une sauvegarde tvsign")
-        if int(manifest.get("version", 0)) > FORMAT_VERSION:
-            raise ValueError("sauvegarde faite par une version plus récente de tvsign")
+        manifest = _manifest(z)
         if "tvsign.db" not in names:
             raise ValueError("base de données absente de la sauvegarde")
 
@@ -106,9 +133,12 @@ def restore(archive: Path) -> dict:
             new_db.write_bytes(z.read("tvsign.db"))
             conn = sqlite3.connect(new_db)
             try:
-                if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-                    raise ValueError("base de données de la sauvegarde corrompue")
-                tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                try:
+                    if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                        raise ValueError("base de données de la sauvegarde corrompue")
+                    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                except sqlite3.DatabaseError:
+                    raise ValueError("base de données de la sauvegarde illisible") from None
                 if not {"apps", "devices"} <= tables:
                     raise ValueError("base de données inattendue dans la sauvegarde")
             finally:

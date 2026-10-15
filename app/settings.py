@@ -6,6 +6,7 @@ which are never exposed through /api/settings.
 """
 import os
 import re
+import time
 
 from . import db
 
@@ -15,28 +16,50 @@ class Spec:
         self.default, self.kind, self.envs, self.check = default, kind, envs, check
 
 
+# Les erreurs de validation sont des CODES stables (traduits par l'interface, clés err_*), pas du texte :
+# « url_expected », « range:12:150 », « number_expected », « language_expected », « hour_expected »…
 def _url(value: str) -> None:
     if value and not re.match(r"^https?://[^\s/]+", value):
-        raise ValueError("adresse http(s):// attendue")
+        raise ValueError("url_expected")
+
+
+def _urls(value: str) -> None:
+    """Une ou plusieurs adresses http(s):// (séparées par des espaces, virgules ou retours à la ligne)."""
+    for one in split_urls(value):
+        _url(one)
+
+
+def split_urls(value: str) -> list[str]:
+    return [u for u in re.split(r"[\s,;]+", value or "") if u]
 
 
 def _hours(value: float) -> None:
     # profil gratuit = 7 jours (168 h) ; garder au moins 12 h de marge et un renouvellement possible
     if not 12 <= value <= 150:
-        raise ValueError("entre 12 et 150 heures")
+        raise ValueError("range:12:150")
 
 
 def _language(value: str) -> None:
     if value not in ("auto", "en", "fr"):
-        raise ValueError("auto, en ou fr")
+        raise ValueError("language_expected")
+
+
+def _hour(value: str) -> None:
+    if value and not (value.isdigit() and 0 <= int(value) <= 23):
+        raise ValueError("hour_expected")
 
 
 PUBLIC: dict[str, Spec] = {
     "language": Spec("auto", str, ["TVSIGN_LANGUAGE"], _language),
     "ntfy_url": Spec("", str, ["TVSIGN_NTFY_URL"], _url),
     "renew_before_hours": Spec(60.0, float, ["TVSIGN_RENEW_BEFORE_HOURS"], _hours),
-    # vide = serveur par défaut de plumesign (https://ani.sidestore.app)
-    "anisette_url": Spec("", str, ["TVSIGN_ANISETTE_URL", "PLUMESIGN_ANISETTE_URL", "ANISETTE_URL_V3"], _url),
+    # vide = serveur par défaut de plumesign (https://ani.sidestore.app). Plusieurs adresses : la première
+    # d'abord, la suivante prend le relais si le serveur anisette tombe (voir plume._plume).
+    "anisette_url": Spec("", str, ["TVSIGN_ANISETTE_URL", "PLUMESIGN_ANISETTE_URL", "ANISETTE_URL_V3"], _urls),
+    # Plage horaire (heure locale) des renouvellements NON urgents ; vide = à toute heure.
+    # Ignorée quand il reste moins de 24 h, et pour un renouvellement lancé à la main.
+    "renew_window_start": Spec("", str, ["TVSIGN_RENEW_WINDOW_START"], _hour),
+    "renew_window_end": Spec("", str, ["TVSIGN_RENEW_WINDOW_END"], _hour),
 }
 
 
@@ -65,7 +88,7 @@ def _convert(spec: Spec, raw):
         try:
             value = float(raw)
         except (TypeError, ValueError):
-            raise ValueError("nombre attendu") from None
+            raise ValueError("number_expected") from None
     else:
         value = str(raw if raw is not None else "").strip()
     if spec.check:
@@ -125,10 +148,10 @@ def update(values: dict) -> dict:
     for key, raw in values.items():
         spec = PUBLIC.get(key)
         if not spec:
-            errors[key] = "réglage inconnu"
+            errors[key] = "unknown_setting"
             continue
         if _env(spec):
-            errors[key] = f"défini par {_env(spec)[0]}"
+            errors[key] = f"set_by_env:{_env(spec)[0]}"
             continue
         if raw is None or raw == "":
             todo[key] = None
@@ -153,4 +176,31 @@ def ntfy_url() -> str:
 
 
 def anisette_url() -> str:
-    return get("anisette_url")
+    """Première adresse anisette (vide : serveur par défaut de plumesign)."""
+    urls = anisette_urls()
+    return urls[0] if urls else ""
+
+
+def anisette_urls() -> list[str]:
+    return split_urls(get("anisette_url"))
+
+
+def renew_window() -> tuple[int, int] | None:
+    """(début, fin) en heures locales, ou None si aucune plage n'est définie."""
+    start, end = get("renew_window_start"), get("renew_window_end")
+    if start == "" or end == "":
+        return None
+    return int(start), int(end)
+
+
+def in_renew_window(now: float, window: tuple[int, int] | None = None, tz_hour: int | None = None) -> bool:
+    """Vrai si l'heure locale est dans la plage (qui peut passer minuit, ex. 23 -> 6). Début = fin :
+    toute la journée."""
+    window = window if window is not None else renew_window()
+    if not window:
+        return True
+    start, end = window
+    hour = tz_hour if tz_hour is not None else time.localtime(now).tm_hour
+    if start == end:
+        return True
+    return start <= hour < end if start < end else hour >= start or hour < end
