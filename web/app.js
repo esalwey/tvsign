@@ -12,6 +12,7 @@ let FLASH = null;          // message éphémère (retour d'action)
 let DECALAGE = 0;          // horloge serveur - horloge locale (s)
 let ECHECS = 0, DEPUIS = null;   // polls /api/state ratés d'affilée
 let VUE = null;            // auth | onboarding | main | settings | diagnostics
+let MAJ = null;            // /api/update : nouvelle version de tvsign disponible ?
 const BUSY = new Map();    // "attr=val" -> libellé pendant une action longue
 
 const ICONS = {
@@ -366,6 +367,11 @@ function renderAlertes() {
     if (s.auth_disabled) {
       html.push(`<div class="banner banner--info"><p><strong>${t("auth_off_t")}</strong>${t("auth_off")}</p></div>`);
     }
+    if (MAJ && MAJ.enabled && MAJ.newer && store.get("tvsign.maj") !== MAJ.latest) {
+      const lien = MAJ.url ? `<a class="btn btn--primary" href="${esc(MAJ.url)}" target="_blank" rel="noopener noreferrer">${t("update_view")}</a>` : "";
+      html.push(`<div class="banner banner--info"><p><strong>${esc(t("update_t", { version: String(MAJ.latest).replace(/^v/, "") }))}</strong>${esc(t(MAJ.edition === "windows" ? "update_win" : "update_docker", { current: MAJ.current }))}</p>
+        ${lien}<button class="btn" data-dismiss-update="${esc(MAJ.latest)}">${t("update_dismiss")}</button></div>`);
+    }
     for (const a of s.accounts.filter((x) => x.ok === 0)) {
       html.push(`<div class="banner"><p><strong>${esc(t("acc_disconnected_t", { email: a.email }))}</strong>${t("acc_disconnected")}</p>
         <button class="btn btn--primary" data-relogin="${esc(a.email)}">${t("reconnect")}</button></div>`);
@@ -570,6 +576,7 @@ document.addEventListener("click", async (ev) => {
   const b = ev.target.closest("button");
   if (!b || b.closest("dialog") || !b.closest("#vue-main, #vue-onboarding")) return;
   const d = b.dataset;
+  if (d.dismissUpdate) { store.set("tvsign.maj", d.dismissUpdate); return render(); }
   if (d.open) return openDialog(d.open);
   if (d.relogin) {
     openDialog("dlg-login");
@@ -1086,7 +1093,7 @@ const WIZ_RENDU = {
     return `${titreEtape("wiz_done_title", t("wiz_done_text"))}
       <ul class="points">
         <li>${ICONS.cloche}<span>${t("wiz_done_p1")}</span></li>
-        <li>${ICONS.boucle}<span>${apps.length ? t("wiz_done_p2", { h: Math.round(STATE?.renew_before_hours || 60) }) : t("wiz_done_p2_empty")}</span></li>
+        <li>${ICONS.boucle}<span>${apps.length ? t(AUTH?.edition === "windows" ? "wiz_done_p2_win" : "wiz_done_p2", { h: Math.round(STATE?.renew_before_hours || 60) }) : t("wiz_done_p2_empty")}</span></li>
       </ul>`;
   },
 };
@@ -1339,7 +1346,14 @@ async function demarrer() {
   await refresh();
   route();
   planifier();
+  verifierMaj();
 }
+// nouvelle version de tvsign : le serveur interroge GitHub au plus toutes les 6 h, la page redemande toutes les 3 h
+async function verifierMaj() {
+  try { MAJ = await api("/api/update", { quiet: true }); } catch { MAJ = null; }
+  if (VUE === "main") render();
+}
+setInterval(() => { if (!document.hidden && AUTH?.authenticated) verifierMaj(); }, 3 * 3600 * 1000);
 function route() {
   if (!AUTH || !AUTH.authenticated) return;
   if (!AUTH.onboarded) { afficher("onboarding"); presets(); renderWizard(); return; }

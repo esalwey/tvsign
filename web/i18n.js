@@ -496,6 +496,17 @@ const I18N = {
   c_team_a: ["Ce compte Apple n'a pas d'équipe de développeur : connecte-toi sur developer.apple.com et accepte le contrat, puis réessaie. Avec plusieurs équipes, tvsign utilise la première.", "This Apple account has no developer team: sign in at developer.apple.com and accept the agreement, then retry. With several teams, tvsign uses the first one."],
   c_source_t: ["Problème avec la source de l'app", "Problem with the app's source"],
   c_source_a: ["Vérifie le dépôt GitHub ou le lien dans les Réglages de l'app.", "Check the GitHub repository or the link in the app's Settings."],
+  // ---------- nouvelle version de tvsign, édition Windows ----------
+  update_t: ["tvsign {version} est disponible", "tvsign {version} is available"],
+  update_win: ["Vous avez la {current}. Téléchargez l'installeur : il met tvsign à jour sur place, vos apps et réglages sont conservés.", "You have {current}. Download the installer: it upgrades tvsign in place, your apps and settings are kept."],
+  update_docker: ["Vous avez la {current}. Mise à jour : docker compose pull && docker compose up -d", "You have {current}. Update with: docker compose pull && docker compose up -d"],
+  update_view: ["Voir la version", "View release"],
+  update_dismiss: ["Ignorer", "Dismiss"],
+  update_check: ["Nouvelles versions", "New versions"],
+  update_check_on: ["Prévenir quand une version sort", "Tell me when a version is out"],
+  update_check_off: ["Ne pas vérifier", "Do not check"],
+  update_check_note: ["tvsign interroge GitHub (api.github.com) toutes les 6 h pour savoir si une version plus récente existe. Aucune donnée vous concernant n'est envoyée.", "tvsign asks GitHub (api.github.com) every 6 h whether a newer version exists. No data about you is sent."],
+  wiz_done_p2_win: ["Laisse ce PC allumé et réveillé (pas de mise en veille) et l'Apple TV allumée ou en veille : le renouvellement se fait {h} h avant l'expiration.", "Keep this PC on and awake (no sleep) and the Apple TV on or asleep: renewal happens {h} h before expiry."],
 };
 
 let LANG = "en";

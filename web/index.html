@@ -126,8 +126,14 @@
             </select></label>
           <label class="field"><span data-i18n="renew_before">Renew before expiry</span>
             <span class="field__unite"><input name="renew_before_hours" type="number" min="12" max="150" step="1" inputmode="numeric"><span aria-hidden="true">h</span></span></label>
+          <label class="field"><span data-i18n="update_check">New versions</span>
+            <select name="update_check">
+              <option value="on" data-i18n="update_check_on">Tell me when a version is out</option>
+              <option value="off" data-i18n="update_check_off">Do not check</option>
+            </select></label>
         </div>
         <p class="group__footer" data-i18n="renew_before_note">A free Apple ID profile lasts 7 days (168 h). The default, 60 h, leaves two and a half days of margin if the Apple TV or this computer is off.</p>
+        <p class="group__footer" data-i18n="update_check_note">tvsign asks GitHub (api.github.com) every 6 h whether a newer version exists. No data about you is sent.</p>
       </section>
 
       <section class="group">
