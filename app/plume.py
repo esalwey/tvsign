@@ -323,15 +323,19 @@ async def select(email: str) -> None:
 _DUPLICATE = re.compile(r"already exists|existe déjà|déjà enregistr", re.I)
 
 
-async def ensure_device(email: str, udid: str, name: str) -> None:
+async def ensure_device(email: str, udid: str, name: str, platform: str | None = None) -> None:
+    """Enregistre l'appareil chez Apple. platform (ios, tvos) : seulement quand il faut le préciser
+    (iPhone / iPad) ; sans lui, l'appel est celui d'origine."""
+    plat = ["--platform", platform] if platform else []
     # Pas de cache : sur un compte gratuit l'enregistrement expire au bout de 7 jours
     # (erreur 8220 « no devices » ensuite), et le réenregistrer le prolonge.
     async with _locked(), _as(email):
-        res = await run(PLUMESIGN, "account", "register-device", "-u", udid, "-n", name, env=env(), timeout=90)
+        res = await run(PLUMESIGN, "account", "register-device", "-u", udid, "-n", name, *plat,
+                        env=env(), timeout=90)
         listed = None
         if not res.ok and not _DUPLICATE.search(res.output):
             # Réponse ambiguë : on vérifie dans la liste des appareils plutôt que de deviner.
-            listed = await run(PLUMESIGN, "account", "devices", env=env(), timeout=90)
+            listed = await run(PLUMESIGN, "account", "devices", *plat, env=env(), timeout=90)
     if not res.ok and not _DUPLICATE.search(res.output):
         if not (listed and listed.ok and udid.lower() in listed.output.lower()):
             raise _failure(email, f"enregistrement de l'appareil sur {email}", res)

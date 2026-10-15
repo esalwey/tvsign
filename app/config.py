@@ -100,6 +100,9 @@ IMPORT_PLUME = _flag("TVSIGN_IMPORT_PLUME", False)   # opt-in: an existing sessi
 CHECK_INTERVAL = int(_env("TVSIGN_CHECK_INTERVAL", "600"))
 # Delay before retrying a failed app (Apple TV asleep, ...), in minutes.
 RETRY_MINUTES = int(_env("TVSIGN_RETRY_MINUTES", "45"))
+# How often a phone or tablet that is due for renewal is looked for on the network, in minutes
+# (0 = never): it renews as soon as it shows up instead of waiting for the next retry.
+PRESENCE_MINUTES = float(_env("TVSIGN_PRESENCE_MINUTES", "3"))
 # Apple session check, in hours.
 ACCOUNT_CHECK_HOURS = float(_env("TVSIGN_ACCOUNT_CHECK_HOURS", "6"))
 # GitHub release check between renewals, in minutes (0 = never).

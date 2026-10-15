@@ -15,8 +15,12 @@ class Spec:
         self.default, self.kind, self.envs, self.check = default, kind, envs, check
 
 
+_URL = re.compile(r"^https?://[^\s/]+(/\S*)?$")
+
+
 def _url(value: str) -> None:
-    if value and not re.match(r"^https?://[^\s/]+", value):
+    # tout le texte est contrôlé, pas seulement le début : « http://a b » est refusée
+    if value and not _URL.match(value):
         raise ValueError("adresse http(s):// attendue")
 
 
@@ -35,6 +39,8 @@ PUBLIC: dict[str, Spec] = {
     "language": Spec("auto", str, ["TVSIGN_LANGUAGE"], _language),
     "ntfy_url": Spec("", str, ["TVSIGN_NTFY_URL"], _url),
     "renew_before_hours": Spec(60.0, float, ["TVSIGN_RENEW_BEFORE_HOURS"], _hours),
+    # iPhone / iPad : souvent hors du réseau ou en veille, on commence plus tôt (jamais moins que le réglage ci-dessus)
+    "renew_before_hours_mobile": Spec(96.0, float, ["TVSIGN_RENEW_BEFORE_HOURS_MOBILE"], _hours),
     # vide = serveur par défaut de plumesign (https://ani.sidestore.app)
     "anisette_url": Spec("", str, ["TVSIGN_ANISETTE_URL", "PLUMESIGN_ANISETTE_URL", "ANISETTE_URL_V3"], _url),
 }
@@ -146,6 +152,20 @@ def update(values: dict) -> dict:
 
 def renew_before_hours() -> float:
     return float(get("renew_before_hours"))
+
+
+def renew_before_hours_for(device: dict | None) -> float:
+    """Délai de renouvellement d'un appareil : le sien s'il en a un, sinon celui de sa famille
+    (iPhone / iPad : au moins `renew_before_hours_mobile`), sinon le réglage général."""
+    base = renew_before_hours()
+    if not device:
+        return base
+    own = device.get("renew_before_hours")
+    if own:
+        return float(own)
+    if device.get("family") in ("ios", "ipados", "visionos"):
+        return max(base, float(get("renew_before_hours_mobile")))
+    return base
 
 
 def ntfy_url() -> str:

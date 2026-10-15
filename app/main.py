@@ -1,5 +1,6 @@
 """tvsign : signe et maintient installées des apps tvOS sur des Apple TV, avec un compte Apple gratuit."""
 import asyncio
+import ipaddress
 import re
 import shutil
 import time
@@ -16,7 +17,7 @@ from pydantic import BaseModel
 from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import auth, backup, db, devices, diag, ipa, plume, proc, renew, settings
+from . import auth, backup, db, devices, diag, families, ipa, plume, proc, renew, settings
 from .config import MAX_UPLOAD_MB, ROOT, SHUTDOWN_DRAIN_SECONDS, TMP_DIR, VERSION
 from .proc import SESSIONS
 
@@ -312,8 +313,10 @@ def onboarding_complete():
 def state():
     now = time.time()
     before = settings.renew_before_hours()
-    apps = db.rows("SELECT a.*, d.name AS device_name FROM apps a LEFT JOIN devices d ON d.id = a.device_id "
-                   "ORDER BY a.name")
+    apps = db.rows("SELECT a.*, d.name AS device_name, d.family AS device_family FROM apps a "
+                   "LEFT JOIN devices d ON d.id = a.device_id ORDER BY a.name")
+    devs = db.rows("SELECT * FROM devices ORDER BY name")
+    by_id = {d["id"]: d for d in devs}
     default = plume.default_account()
     for a in apps:
         a["running"] = a["id"] in renew._RUNNING
@@ -321,9 +324,19 @@ def state():
         a["phase"] = renew.PHASE.get(a["id"]) if a["running"] else None
         exp = a["expires_at"]
         a["expired"] = bool(exp) and exp <= now
+        # délai propre à l'appareil (iPhone / iPad : plus tôt qu'une Apple TV)
+        a["renew_before_hours"] = settings.renew_before_hours_for(by_id.get(a["device_id"]))
         # moment où la boucle lancera le renouvellement automatique (None : dès que possible)
-        a["renew_at"] = exp - before * 3600 if exp else None
+        a["renew_at"] = exp - a["renew_before_hours"] * 3600 if exp else None
         a["effective_account"] = a["account_email"] or default
+    for d in devs:
+        d["renew_before_effective"] = settings.renew_before_hours_for(d)
+        d["app_count"] = sum(1 for a in apps if a["device_id"] == d["id"] and a["enabled"])
+    accounts = plume.accounts()
+    for acc in accounts:
+        mine = [a for a in apps if a["enabled"] and (a["account_email"] or default) == acc["email"]]
+        acc["apps"] = len(mine)
+        acc["app_ids"] = sum(renew.app_ids_used(a) for a in mine)      # estimation, voir renew.app_ids_used
     health = renew.health(now)
     return {
         "now": now,
@@ -333,9 +346,10 @@ def state():
         "auth_disabled": not auth.enabled(),
         "health": health,
         "apps": apps,
-        "devices": db.rows("SELECT * FROM devices ORDER BY name"),
-        "accounts": plume.accounts(),
+        "devices": devs,
+        "accounts": accounts,
         "events": db.rows("SELECT * FROM events ORDER BY id DESC LIMIT 80"),
+        "capabilities": {"usb_pairing": devices.usb_pairing_available()},
     }
 
 
@@ -454,11 +468,57 @@ class Pair(BaseModel):
     name: str
 
 
+def _pair_address(ip: str, port: int) -> str:
+    """Adresse d'appairage : une IP littérale d'un réseau local, jamais un nom ni une option de ligne de
+    commande (« --version »), ni l'ordinateur lui-même, ni une adresse publique."""
+    try:
+        addr = ipaddress.ip_address((ip or "").strip())
+    except ValueError:
+        raise HTTPException(400, "invalid_address") from None
+    if (not 0 < port < 65536 or addr.is_loopback or addr.is_unspecified or addr.is_multicast
+            or addr.is_global):
+        raise HTTPException(400, "invalid_address")
+    return str(addr)
+
+
 @app.post("/api/devices/pair")
 async def device_pair(body: Pair):
-    if not re.fullmatch(r"[0-9A-Fa-f:.%\w-]+", body.ip) or not 0 < body.port < 65536:
-        raise HTTPException(400, "adresse invalide")
-    return devices.start_pairing(body.identifier, body.ip, body.port, body.name.strip() or "Apple TV").public()
+    ip = _pair_address(body.ip, body.port)
+    return devices.start_pairing(body.identifier, ip, body.port, body.name.strip() or "Apple TV").public()
+
+
+class UsbPair(BaseModel):
+    udid: Optional[str] = None
+
+
+@app.post("/api/devices/pair-usb")
+async def device_pair_usb(body: UsbPair):
+    """iPhone / iPad branché en USB sur la machine de tvsign (Windows, macOS, Linux avec usbmuxd)."""
+    udid = (body.udid or "").strip() or None
+    if udid and not re.fullmatch(r"[0-9A-Za-z-]{8,64}", udid):
+        raise HTTPException(400, "invalid_udid")
+    return devices.start_usb_pairing(udid).public()
+
+
+@app.post("/api/devices/import-pairing")
+async def device_import_pairing(
+    file: UploadFile = File(...),
+    udid: Optional[str] = Form(None),
+    name: Optional[str] = Form(None),
+    model: Optional[str] = Form(None),
+    family: Optional[str] = Form(None),
+):
+    """Fichier d'appairage fait ailleurs (plumesign pair usb sur un autre ordinateur, Impactor) :
+    la voie des installations sans USB (Docker)."""
+    data = await file.read(64 * 1024 + 1)
+    try:
+        return await devices.import_pairing(data, file.filename, udid, name, model, family)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
+    except devices.OldPlumesign as e:
+        raise HTTPException(502, str(e)) from None
+    except RuntimeError as e:
+        raise HTTPException(502, str(e)) from None
 
 
 def device_or_404(device_id: int) -> dict:
@@ -485,14 +545,43 @@ async def device_apps(device_id: int):
         raise HTTPException(502, str(e))
 
 
+@app.post("/api/devices/{device_id}/devmode")
+async def device_devmode(device_id: int):
+    """Mode développeur d'un iPhone / iPad (sans lui, les apps signées ne se lancent pas)."""
+    d = device_or_404(device_id)
+    if not devices.is_mobile(d):
+        raise HTTPException(400, "not_mobile")
+    try:
+        on = await devices.check_devmode(d)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, str(e))
+    return {"dev_mode": on}
+
+
 class DevicePatch(BaseModel):
-    name: str
+    name: Optional[str] = None
+    renew_before_hours: Optional[float] = None    # délai propre à l'appareil ; null : celui du réglage
+    family: Optional[str] = None                   # tvos | ios | ipados : corrige une famille mal reconnue
 
 
 @app.patch("/api/devices/{device_id}")
 def device_patch(device_id: int, body: DevicePatch):
-    device_or_404(device_id)
-    db.update("devices", device_id, name=body.name.strip() or "Apple TV")
+    d = device_or_404(device_id)
+    fields = body.model_dump(exclude_unset=True)
+    if "name" in fields:
+        fields["name"] = (fields["name"] or "").strip() or families.label(d["family"])
+    if "renew_before_hours" in fields and fields["renew_before_hours"] is not None:
+        try:
+            settings._hours(fields["renew_before_hours"])
+        except ValueError:
+            raise HTTPException(400, "invalid_hours") from None
+    if "family" in fields:
+        if fields["family"] not in families.SUPPORTED:
+            raise HTTPException(400, "invalid_family")
+        # les apps déjà attachées doivent convenir à la nouvelle famille
+        for a in db.rows("SELECT * FROM apps WHERE device_id = ?", device_id):
+            _check_app_device(a, {**d, "family": fields["family"]})
+    db.update("devices", device_id, **fields)
     return {"ok": True}
 
 
@@ -509,6 +598,18 @@ async def device_delete(device_id: int):
 
 
 # ---------- apps ----------
+
+def _check_app_device(a: dict, device: dict) -> None:
+    """Refuse (400) de mettre une app sur un appareil dont la famille ne lui convient pas."""
+    if not a.get("platform"):
+        return
+    info = {"platform": a["platform"], "ui_family": a.get("ui_family") or ""}
+    info["ui_family"] = families.parse_ui_family([x for x in info["ui_family"].split(",") if x])
+    try:
+        families.check_platform(info, device.get("family") or "tvos", None, device.get("model"))
+    except families.PlatformMismatch as e:
+        raise HTTPException(400, e.code) from None
+
 
 @app.get("/api/presets")
 def presets():
@@ -564,8 +665,11 @@ async def app_create(
     if source_type != "upload":
         source = await _check_source(source_type, source)
     channel = "beta" if channel == "beta" else "stable"
-    if device_id is not None and not db.row("SELECT id FROM devices WHERE id = ?", device_id):
+    device = db.row("SELECT * FROM devices WHERE id = ?", device_id) if device_id is not None else None
+    if device_id is not None and not device:
         raise HTTPException(400, "unknown_device")
+    if account_email and account_email not in {a["email"] for a in plume.accounts()}:
+        raise HTTPException(400, "unknown_account")
 
     # compte figé dès la création : en changer créerait une 2e copie (autre équipe = autre bundle ID)
     account = account_email or plume.default_account()
@@ -586,13 +690,20 @@ async def app_create(
                         raise HTTPException(413, f"too_large:{MAX_UPLOAD_MB}")
                     f.write(chunk)
         else:
-            await renew.refresh_source(db.row("SELECT * FROM apps WHERE id = ?", app_id))
+            try:
+                await renew.refresh_source(db.row("SELECT * FROM apps WHERE id = ?", app_id))
+            except ipa.PlatformRejected as e:
+                raise HTTPException(400, e.code or str(e)) from None
         try:
             info = ipa.app_info(dest)
         except (zipfile.BadZipFile, ValueError):
             raise HTTPException(400, "not_an_ipa") from None
-        if info["platform"] != "appletvos":
-            raise HTTPException(400, f"not_tvos:{info['platform'] or 'unknown'}")
+        # l'IPA doit convenir à la famille de l'appareil visé (Apple TV si aucun n'est choisi)
+        try:
+            families.check_platform(info, (device or {}).get("family") or "tvos",
+                                    (device or {}).get("os_version"), (device or {}).get("model"))
+        except families.PlatformMismatch as e:
+            raise HTTPException(400, e.code) from None
         # même app, même compte : une 2e fiche signerait deux fois et les copies s'écraseraient sur la TV
         if info["bundle_id"] and db.row(
                 "SELECT id FROM apps WHERE id != ? AND bundle_id = ? AND COALESCE(account_email, '') = ?",
@@ -605,8 +716,12 @@ async def app_create(
         _abort_add(app_id)
         raise HTTPException(400, str(e))
 
-    db.update("apps", app_id, name=info["name"], bundle_id=info["bundle_id"], version=info["version"], enabled=1)
+    db.update("apps", app_id, name=info["name"], bundle_id=info["bundle_id"], version=info["version"], enabled=1,
+              **renew.ipa_columns(info))
     db.log(f"App ajoutée : {info['name']} {info['version']} ({info['bundle_id']})", app_id=app_id)
+    if info.get("warnings"):
+        db.log(f"{info['name']} : limites du compte gratuit possibles ({', '.join(info['warnings'])})", "warn",
+               app_id=app_id)
     renew.spawn(app_id, "ajout")
     return db.row("SELECT * FROM apps WHERE id = ?", app_id)
 
@@ -637,6 +752,11 @@ async def app_patch(app_id: int, body: AppPatch):
         fields["enabled"] = int(fields["enabled"])
     if "account_email" in fields:
         fields["account_email"] = fields["account_email"] or plume.default_account()
+        if fields["account_email"] and fields["account_email"] not in {x["email"] for x in plume.accounts()}:
+            raise HTTPException(400, "unknown_account")
+    if a["source_type"] == "upload" and any(k in fields for k in ("source", "source_filter", "channel")):
+        # une IPA importée n'a pas de source à suivre : rien à changer, et pas de réinstallation pour rien
+        raise HTTPException(400, "upload_has_no_source")
     if "source" in fields:
         fields["source"] = await _check_source(a["source_type"], fields["source"])
         if a["preset"] and fields["source"] != a["source"]:
@@ -645,11 +765,14 @@ async def app_patch(app_id: int, body: AppPatch):
     if "channel" in fields:
         fields["channel"] = "beta" if fields["channel"] == "beta" else "stable"
     if "device_id" in fields and fields["device_id"] is not None:
-        if not db.row("SELECT id FROM devices WHERE id = ?", fields["device_id"]):
+        target = db.row("SELECT * FROM devices WHERE id = ?", fields["device_id"])
+        if not target:
             raise HTTPException(400, "unknown_device")
+        _check_app_device(a, target)
     source_changed = any(k in fields for k in ("source", "source_filter", "channel"))
     if source_changed:
         fields["source_tag"] = None        # nouvelle source : la prochaine release sera installée
+        fields["source_published_at"] = None
         fields["source_key"] = None
         fields["bad_tag"] = None
         fields["bad_key"] = None
@@ -715,8 +838,10 @@ class NotifyTest(BaseModel):
 @app.post("/api/settings/test-notification")
 async def settings_test_notification(body: NotifyTest):
     url = (body.url or "").strip() or None
-    if url and not re.match(r"^https?://", url):
-        raise HTTPException(400, "adresse http(s):// attendue")
+    try:
+        settings._url(url or "")
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
     try:
         await renew.notify_test(url)
     except Exception as e:  # noqa: BLE001

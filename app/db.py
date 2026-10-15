@@ -101,6 +101,15 @@ MIGRATIONS = [
     ("apps", "deferred_since", "REAL"),      # idem
     ("apps", "source_key", "TEXT"),          # identité du contenu téléchargé (empreinte, ETag…) : tag fixe, IPA remplacée
     ("apps", "bad_key", "TEXT"),             # identité de la release refusée (avec bad_tag)
+    # iPhone / iPad : famille de l'appareil (tvos | ios | ipados | visionos), tvos pour l'existant
+    ("devices", "family", "TEXT NOT NULL DEFAULT 'tvos'"),
+    ("devices", "dev_mode", "INTEGER"),      # mode développeur : 1 activé, 0 désactivé, NULL inconnu
+    ("devices", "dev_mode_at", "REAL"),
+    ("devices", "renew_before_hours", "REAL"),   # délai de renouvellement propre à l'appareil (sinon réglage)
+    ("apps", "platform", "TEXT"),            # DTPlatformName de l'IPA (appletvos, iphoneos…)
+    ("apps", "ui_family", "TEXT"),           # UIDeviceFamily de l'IPA, ex. « 1,2 »
+    ("apps", "warnings", "TEXT"),            # limites du compte gratuit détectées dans l'IPA (codes séparés par des virgules)
+    ("apps", "source_published_at", "TEXT"), # date de publication de la release installée (jamais de retour en arrière)
 ]
 
 
@@ -133,8 +142,12 @@ def init() -> None:
             # copie de sécurité avant de modifier le schéma (retour arrière possible)
             snapshot(DB_PATH.with_name(f"tvsign.db.pre-migrate-{int(time.time())}"))
         conn.executescript(SCHEMA)
-        for table, col, kind in _pending(conn):
+        todo = _pending(conn)
+        for table, col, kind in todo:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {kind}")
+        if ("apps", "platform", "TEXT") in todo:
+            # avant l'arrivée des iPhone/iPad, toute app suivie était une app tvOS
+            conn.execute("UPDATE apps SET platform = 'appletvos' WHERE platform IS NULL")
 
 
 def rows(sql: str, *args) -> list[dict]:
