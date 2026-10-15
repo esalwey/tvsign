@@ -70,6 +70,8 @@ impl Account {
         // Cached so the caller can be offered an SMS fallback even when a trusted
         // device handled the push. Fetched lazily the first time 2FA is needed.
         let mut trusted_phone_numbers: Vec<TrustedPhoneNumber> = Vec::new();
+        // Mauvais codes 2FA deja refuses : on redemande le code au lieu d'abandonner la connexion.
+        let mut bad_codes = 0u8;
 
         loop {
             match response {
@@ -90,7 +92,23 @@ impl Account {
                         Error::AuthSrpWithMessage(0, format!("Failed to get 2FA code: {}", e))
                     })? {
                         TwoFactorAction::SubmitCode(code) => {
-                            response = _self.verify_2fa(code).await?
+                            let code = normalize_2fa_code(&code);
+                            let outcome = if code.is_empty() {
+                                Err(Error::Bad2faCode)
+                            } else {
+                                _self.verify_2fa(code).await
+                            };
+                            match outcome {
+                                Ok(next) => response = next,
+                                Err(e) if is_bad_code(&e) && bad_codes < MAX_BAD_CODES => {
+                                    bad_codes += 1;
+                                    log::warn!(
+                                        "Incorrect verification code ({bad_codes}/{MAX_BAD_CODES}), try again."
+                                    );
+                                    response = LoginState::Needs2FAVerification;
+                                }
+                                Err(e) => return Err(e),
+                            }
                         }
                         TwoFactorAction::SendSms(id) => {
                             response = _self.send_sms_2fa_to_devices(id).await?
@@ -118,7 +136,23 @@ impl Account {
                         )
                     })? {
                         TwoFactorAction::SubmitCode(code) => {
-                            response = _self.verify_sms_2fa(code, body).await?
+                            let code = normalize_2fa_code(&code);
+                            let outcome = if code.is_empty() {
+                                Err(Error::Bad2faCode)
+                            } else {
+                                _self.verify_sms_2fa(code, body.clone()).await
+                            };
+                            match outcome {
+                                Ok(next) => response = next,
+                                Err(e) if is_bad_code(&e) && bad_codes < MAX_BAD_CODES => {
+                                    bad_codes += 1;
+                                    log::warn!(
+                                        "Incorrect verification code ({bad_codes}/{MAX_BAD_CODES}), try again."
+                                    );
+                                    response = LoginState::NeedsSMS2FAVerification(body);
+                                }
+                                Err(e) => return Err(e),
+                            }
                         }
                         TwoFactorAction::SendSms(id) => {
                             response = _self.send_sms_2fa_to_devices(id).await?
@@ -288,8 +322,55 @@ impl Account {
     pub async fn get_anisette(&self) -> AnisetteData {
         let mut locked = self.anisette.lock().await;
         if locked.needs_refresh() {
-            *locked = locked.refresh().await.unwrap();
+            locked.refresh_in_place().await;
         }
         locked.clone()
+    }
+}
+
+/// Nombre de codes 2FA refuses toleres avant d'abandonner la connexion.
+const MAX_BAD_CODES: u8 = 3;
+
+/// « 123 456 », « 123-456 » : seuls les chiffres comptent.
+pub(crate) fn normalize_2fa_code(code: &str) -> String {
+    code.chars().filter(|c| c.is_ascii_digit()).collect()
+}
+
+/// Code refuse par Apple (SMS : HTTP non 2xx ; appareil : ec -21669 / « incorrect »).
+pub(crate) fn is_bad_code(error: &Error) -> bool {
+    match error {
+        Error::Bad2faCode => true,
+        Error::AuthSrpWithMessage(ec, message) => {
+            *ec == -21669 || message.to_ascii_lowercase().contains("incorrect")
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn code_keeps_only_digits() {
+        assert_eq!(normalize_2fa_code(" 123 456
+"), "123456");
+        assert_eq!(normalize_2fa_code("123-456"), "123456");
+        assert_eq!(normalize_2fa_code("abc"), "");
+    }
+
+    #[test]
+    fn bad_code_detection() {
+        assert!(is_bad_code(&Error::Bad2faCode));
+        assert!(is_bad_code(&Error::AuthSrpWithMessage(
+            -21669,
+            "x".into()
+        )));
+        assert!(is_bad_code(&Error::AuthSrpWithMessage(
+            1,
+            "Incorrect verification code".into()
+        )));
+        assert!(!is_bad_code(&Error::AuthSrpWithMessage(-20101, "other".into())));
+        assert!(!is_bad_code(&Error::Parse));
     }
 }

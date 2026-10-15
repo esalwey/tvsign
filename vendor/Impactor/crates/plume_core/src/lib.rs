@@ -6,7 +6,9 @@ pub use apple_codesign::{AppleCodesignError, SettingsScope, SigningSettings, Uni
 
 pub use omnisette::AnisetteConfiguration;
 
-pub use utils::{CertificateIdentity, MachO, MachOExt, MobileProvision};
+pub use utils::{
+    CertificateIdentity, CertificatePolicy, MachO, MachOExt, MobileProvision, RevokeMode,
+};
 
 use thiserror::Error as ThisError;
 #[derive(Debug, ThisError)]
@@ -19,6 +21,10 @@ pub enum Error {
     CertificatePemMissing,
     #[error("Certificate error: {0}")]
     Certificate(String),
+    #[error(
+        "NO_TEAM: this Apple ID has no developer team (sign in at developer.apple.com and accept the agreement, then retry)"
+    )]
+    NoTeam,
     #[error("Developer API error {result_code} (HTTP {http_code:?}): {message} [URL: {url}]")]
     DeveloperApi {
         url: String,
@@ -74,6 +80,9 @@ pub fn client() -> Result<reqwest::Client, Error> {
     const APPLE_ROOT: &[u8] = include_bytes!("./apple_root.der");
     let client = reqwest::ClientBuilder::new()
         .add_root_certificate(reqwest::Certificate::from_der(APPLE_ROOT)?)
+        // Sans delai, une connexion muette bloque plumesign jusqu'au kill de tvsign.
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(60))
         // uncomment when debugging w/ charles proxy
         // .danger_accept_invalid_certs(true)
         .http1_title_case_headers()
