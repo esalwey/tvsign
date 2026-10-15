@@ -101,6 +101,9 @@ MIGRATIONS = [
     ("apps", "deferred_since", "REAL"),      # idem
     ("apps", "source_key", "TEXT"),          # identité du contenu téléchargé (empreinte, ETag…) : tag fixe, IPA remplacée
     ("apps", "bad_key", "TEXT"),             # identité de la release refusée (avec bad_tag)
+    ("apps", "verified_at", "REAL"),         # dernière fois où l'app a été vue installée sur l'Apple TV
+    ("apps", "installed_bundle", "TEXT"),    # bundle ID installé (celui de la signature, pas de l'IPA d'origine)
+    ("devices", "host_hint", "TEXT"),        # adresse IP ou nom d'hôte saisi à la main (mDNS bloqué)
 ]
 
 

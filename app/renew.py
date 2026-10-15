@@ -359,7 +359,9 @@ async def _renew(app_id: int, trigger: str) -> None:
         # quittées, une app « avec processus » n'est donc pas forcément à l'écran. Seul installd
         # sait si l'app est réellement utilisée : il met alors l'installation en attente (étape 3).
         _phase(app_id, "checking")
-        if not device["udid"]:
+        if not device["udid"] or not device["os_version"]:
+            # identité de la TV pas encore confirmée par la TV elle-même (infos manquées juste après
+            # l'appairage) : l'UDID enregistré chez Apple doit être le sien, pas celui de l'appairage
             await devices.refresh_info(device["id"])
             device = db.row("SELECT * FROM devices WHERE id = ?", device["id"])
         else:
@@ -413,9 +415,13 @@ async def _renew(app_id: int, trigger: str) -> None:
 
         _phase(app_id, "uploading")
         await devices.install(device, [signed], on_event=on_event, wait_cap=wait_cap, app_name=app["name"])
+        # « valide » seulement si la TV a bien l'app (jamais un succès présumé d'après le seul code de sortie)
+        bundle = devices.signed_bundle(app_dir(app_id), app)
+        verified_at = await devices.confirm_installed(device, bundle)
 
         fields = dict(status="ok", signed_at=time.time(), expires_at=expires, next_attempt_at=None,
-                      last_error=None, notified_level=None, cert_serial=_serials(signed))
+                      last_error=None, notified_level=None, cert_serial=_serials(signed),
+                      verified_at=verified_at, installed_bundle=bundle)
         cur = db.row("SELECT account_email FROM apps WHERE id = ?", app_id)
         if cur and not cur["account_email"]:
             # fige le compte : un autre compte = autre équipe = autre bundle ID (2e copie).
@@ -439,7 +445,8 @@ async def _renew(app_id: int, trigger: str) -> None:
     except Exception as e:  # noqa: BLE001 - l'erreur est remontée dans l'interface
         now = time.time()
         unreachable = isinstance(e, devices.Unreachable)
-        transient = isinstance(e, (plume.Transient, devices.AppInUse)) or unreachable
+        # AppInUse : un nouvel essai tout de suite renverrait l'IPA pour 30 min d'attente de plus
+        transient = isinstance(e, plume.Transient) or unreachable
         if unreachable and trigger == "nouvelle version" and app["status"] == "ok":
             # TV en veille : l'app installée reste valable, la mise à jour attend simplement la TV
             db.update("apps", app_id, status="ok", last_error=None, next_attempt_at=_retry_at(app, now, True))
@@ -565,6 +572,19 @@ async def _guarded(what: str, coro) -> None:
         db.log(f"{what} : {e}", "error")
 
 
+async def _loop_app(app_id: int, check_releases: bool) -> None:
+    """Un passage de la boucle pour une app (renouvellement dû, ou nouvelle version à installer)."""
+    # une app précédente a pu durer longtemps : relire la ligne (pause, renouvellement manuel…)
+    app = db.row("SELECT * FROM apps WHERE id = ?", app_id)
+    if not app or STOPPING:
+        return
+    now = HEALTH["last_loop_at"] = time.time()   # la boucle vit tant qu'elle avance d'app en app
+    if due(app, now):
+        await _guarded(f"renouvellement de {app['name']}", renew(app["id"], "auto"))
+    elif check_releases and idle(app, now) and await new_release(app):
+        await _guarded(f"renouvellement de {app['name']}", renew(app["id"], "nouvelle version"))
+
+
 async def loop() -> None:
     last_account_check = last_release_check = 0.0
     while True:
@@ -580,19 +600,22 @@ async def loop() -> None:
             check_releases = RELEASE_CHECK_MINUTES > 0 and now - last_release_check > RELEASE_CHECK_MINUTES * 60
             if check_releases:
                 last_release_check = HEALTH["last_release_check_at"] = now
-            for app in db.rows("SELECT * FROM apps"):
-                if STOPPING:
-                    break
-                # une app précédente a pu durer longtemps : relire la ligne (pause, renouvellement manuel…)
-                app = db.row("SELECT * FROM apps WHERE id = ?", app["id"])
-                if not app:
-                    continue
-                now = HEALTH["last_loop_at"] = time.time()   # la boucle vit tant qu'elle avance d'app en app
-                if due(app, now):
-                    await _guarded(f"renouvellement de {app['name']}", renew(app["id"], "auto"))
-                elif check_releases and idle(app, now) and await new_release(app):
-                    await _guarded(f"renouvellement de {app['name']}", renew(app["id"], "nouvelle version"))
+            await _guarded("appairages des Apple TV", devices.check_store())
+            # une file par Apple TV, en parallèle : une installation qui attend sur une TV (app ouverte,
+            # jusqu'à 30 min) ne retarde plus les renouvellements des autres
+            queues: dict = {}
+            for app in db.rows("SELECT id, device_id FROM apps ORDER BY id"):
+                queues.setdefault(app["device_id"], []).append(app["id"])
+
+            async def run_queue(ids: list[int]) -> None:
+                for app_id in ids:
+                    if STOPPING:
+                        break
+                    await _loop_app(app_id, check_releases)
+
+            await asyncio.gather(*(run_queue(ids) for ids in queues.values()))
             await _check_expired(time.time())
+            await _guarded("vérification des apps installées", devices.audit_installed())
         except Exception as e:  # noqa: BLE001 - la boucle ne doit jamais s'arrêter
             HEALTH["loop_error"] = str(e)
             db.log(f"boucle de renouvellement : {e}", "error")

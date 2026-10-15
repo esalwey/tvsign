@@ -122,6 +122,11 @@ SHUTDOWN_DRAIN_SECONDS = int(_env("TVSIGN_SHUTDOWN_DRAIN_SECONDS", "240"))
 DEVICE_TIMEOUT = int(_env("TVSIGN_DEVICE_TIMEOUT", "10"))
 # Name presented to the Apple TV when pairing (kept per device afterwards).
 PAIR_HOST = _env("TVSIGN_PAIR_HOST", "tvsign")
+# Contrôle périodique que les apps sont bien présentes sur l'Apple TV, en heures (0 = jamais).
+INSTALL_CHECK_HOURS = float(_env("TVSIGN_INSTALL_CHECK_HOURS", "6"))
+# Joindre l'Apple TV par une requête mDNS dirigée vers sa dernière adresse connue (ou saisie à la main)
+# avant la recherche multicast : indispensable quand le multicast est filtré (VLAN, Docker en pont).
+UNICAST_HINT = _flag("TVSIGN_UNICAST_HINT", True)
 
 for d in (DATA_DIR, IPA_DIR, PLUME_HOME, TMP_DIR):
     d.mkdir(parents=True, exist_ok=True)

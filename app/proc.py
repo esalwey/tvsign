@@ -101,13 +101,25 @@ class Session:
     _task: asyncio.Task | None = None
 
     async def start(self, *args, env: dict | None = None, on_exit=None) -> None:
-        self._proc = await _exec(
-            *args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=env,
-        )
+        try:
+            self._proc = await _exec(
+                *args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+            )
+        except Exception as e:  # noqa: BLE001 - binaire absent, bloqué par l'antivirus, non exécutable…
+            # sans ça, l'exception se perdait dans une tâche de fond : la session restait « en cours »
+            # (spinner sans fin, import de sauvegarde refusé) jusqu'au balayage de 15 min
+            self.lines.append(str(e))
+            self.state = "failed"
+            if on_exit:
+                try:
+                    await on_exit(self)
+                except Exception as e2:  # noqa: BLE001
+                    self.lines.append(f"erreur après la fin : {e2}")
+            return
         self._task = asyncio.create_task(self._pump(on_exit))
 
     async def _pump(self, on_exit) -> None:
@@ -184,8 +196,15 @@ def busy() -> bool:
 _TASKS: set[asyncio.Task] = set()
 
 
+def _finished(task: asyncio.Task) -> None:
+    _TASKS.discard(task)
+    # une exception jamais récupérée disparaissait en silence : on la met au moins au journal
+    if not task.cancelled() and (exc := task.exception()) is not None:
+        print(f"[error] tâche de fond interrompue : {exc!r}", flush=True)
+
+
 def spawn(coro) -> asyncio.Task:
     task = asyncio.create_task(coro)
     _TASKS.add(task)
-    task.add_done_callback(_TASKS.discard)
+    task.add_done_callback(_finished)
     return task

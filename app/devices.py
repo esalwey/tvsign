@@ -9,13 +9,17 @@ par le contrôle de son authTag contre l'appairage stocké ; plumesign ne se rab
 nouvel appairage (aucun PIN n'apparaît sur une TV qui n'est pas la nôtre).
 """
 import asyncio
+import ipaddress
 import json
 import re
+import socket
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-from . import db, plume
-from .config import DEVICE_TIMEOUT, INSTALL_TIMEOUT, PAIR_HOST, PLUMESIGN
+from . import db, ipa, plume
+from .config import (DEVICE_TIMEOUT, INSTALL_CHECK_HOURS, INSTALL_TIMEOUT, PAIR_HOST, PLUMESIGN,
+                     UNICAST_HINT)
 from .proc import Result, Session, register, run, spawn
 
 # Nom d'hôte de plumesign par défaut : appairages faits hors de tvsign (plumesign en CLI).
@@ -45,12 +49,80 @@ class OldPlumesign(RuntimeError):
     """plumesign ne connaît pas cette commande ou cette option."""
 
 
+class Busy(RuntimeError):
+    """Une installation tient la connexion à cette Apple TV (un appel de l'interface n'attend pas)."""
+
+
+class NotInstalled(RuntimeError):
+    """L'installation s'est terminée mais l'app n'apparaît pas dans la liste des apps de la TV."""
+
+
 # Une connexion à la fois par appareil.
 _LOCKS: dict[int, asyncio.Lock] = {}
 
 
 def lock(device_id: int) -> asyncio.Lock:
     return _LOCKS.setdefault(device_id, asyncio.Lock())
+
+
+@asynccontextmanager
+async def _held(device_id: int, wait: bool = True):
+    """Verrou de l'appareil. wait=False (boutons de l'interface) : échoue tout de suite si une
+    installation le tient, au lieu de rester suspendu jusqu'à la fin d'une attente de 30 min."""
+    lk = lock(device_id)
+    if not wait and lk.locked():
+        raise Busy("une installation est en cours sur cette Apple TV : réessaie quand elle est terminée")
+    async with lk:
+        yield
+
+
+# ---------- adresse saisie à la main (mDNS bloqué) ----------
+
+_HOSTNAME = re.compile(r"^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$")
+
+
+def clean_host(value: str | None) -> str | None:
+    """Adresse IP ou nom d'hôte saisi par l'utilisateur ; None si vide. ValueError si invalide."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        ip = ipaddress.ip_address(value.split("%")[0])
+    except ValueError:
+        if not _HOSTNAME.match(value):
+            raise ValueError("adresse invalide") from None
+        return value
+    if ip.is_unspecified or ip.is_loopback or ip.is_multicast:
+        raise ValueError("adresse invalide")
+    return value
+
+
+async def resolve_host(value: str | None) -> str | None:
+    """IP à partir d'une adresse saisie (IP telle quelle, nom résolu par le DNS) ; None si impossible."""
+    if not value:
+        return None
+    try:
+        ipaddress.ip_address(value.split("%")[0])
+        return value
+    except ValueError:
+        pass
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(value, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return None
+    ips = sorted({i[4][0] for i in infos}, key=lambda a: (":" in a, a))   # IPv4 d'abord
+    return ips[0] if ips else None
+
+
+async def hint_ip(device: dict) -> str | None:
+    """Adresse où interroger la TV directement : celle saisie à la main, sinon la dernière connue."""
+    if not UNICAST_HINT:
+        return None
+    ip = (await resolve_host(device.get("host_hint"))) or device.get("last_ip")
+    try:
+        return str(ipaddress.ip_address(ip.split("%")[0])) if ip else None     # plumesign n'accepte qu'une IP, sans zone
+    except ValueError:
+        return None
 
 
 # ---------- store d'appairage plumesign ----------
@@ -73,6 +145,31 @@ async def stored_pairings() -> list[dict]:
     return out
 
 
+STORE_MISSING = "appairage absent du store plumesign"
+
+
+def _reconcile(device: dict, by_udid: dict) -> None:
+    """Compare l'appairage d'une TV au store plumesign : absent = perdu (à réappairer), de nouveau
+    présent (sauvegarde restaurée, fichier remis) = le drapeau posé par ce contrôle est retiré."""
+    present = device["pairing_udid"].lower() in by_udid
+    if not present and not device["pairing_lost"]:
+        db.update("devices", device["id"], pairing_lost=1, last_error=STORE_MISSING, last_error_at=time.time())
+    elif present and device["pairing_lost"] and device["last_error"] == STORE_MISSING:
+        db.update("devices", device["id"], pairing_lost=0, last_error=None)
+
+
+async def check_store() -> None:
+    """Détecte un appairage disparu du store en cours de route (lecture locale, aucun accès réseau),
+    sans attendre qu'un renouvellement tombe dessus."""
+    try:
+        records = await stored_pairings()
+    except Exception:  # noqa: BLE001 - plumesign absent : le diagnostic le dira
+        return
+    by_udid = {r["udid"].lower(): r for r in records}
+    for d in db.rows("SELECT * FROM devices WHERE pairing_udid IS NOT NULL AND legacy_pairing = 0"):
+        _reconcile(d, by_udid)
+
+
 async def sync_store() -> None:
     """Au démarrage : rattache les appairages plumesign aux Apple TV connues, et signale celles
     dont l'appairage date de l'ancienne version (pymobiledevice3), à refaire une fois."""
@@ -84,9 +181,7 @@ async def sync_store() -> None:
     by_udid = {r["udid"].lower(): r for r in records}
     for d in db.rows("SELECT * FROM devices"):
         if d["pairing_udid"]:
-            if d["pairing_udid"].lower() not in by_udid and not d["pairing_lost"]:
-                db.update("devices", d["id"], pairing_lost=1,
-                          last_error="appairage absent du store plumesign", last_error_at=time.time())
+            _reconcile(d, by_udid)
             continue
         rec = by_udid.get((d["udid"] or "").lower())
         if rec:
@@ -116,17 +211,28 @@ async def forget(device: dict) -> None:
     if device.get("pairing_udid"):
         e = plume.env()
         e["RUST_LOG"] = "warn"
-        res = await run(PLUMESIGN, "pair", "forget", "-u", device["pairing_udid"], env=e, timeout=30, split=True)
-        if not res.ok and "No stored pairing" not in res.output:    # déjà absent du store : rien à oublier
+        try:
+            res = await run(PLUMESIGN, "pair", "forget", "-u", device["pairing_udid"], env=e, timeout=30, split=True)
+        except (OSError, RuntimeError) as err:    # plumesign absent, bloqué, non exécutable
+            raise RuntimeError(f"oubli de l'appairage de « {device['name']} » impossible : {err}") from None
+        # « Error: No stored pairing for X » est écrit sur stderr (sortie 1) : déjà absent du store,
+        # rien à oublier — sinon une TV dont l'appairage a disparu ne pourrait plus être retirée
+        if not res.ok and "No stored pairing" not in f"{res.output}\n{res.err}":
             raise RuntimeError(f"oubli de l'appairage de « {device['name']} » impossible : {res.tail(2)}")
 
 
 # ---------- découverte ----------
 
-async def discover() -> dict:
+async def discover(host: str | None = None) -> dict:
     """Apple TV visibles : celles qui proposent l'appairage, et celles déjà appairées avec nous.
-    Lecture seule (mDNS) : aucune connexion n'est ouverte vers les TV."""
-    found = await plume.discover()
+    Lecture seule (mDNS) : aucune connexion n'est ouverte vers les TV.
+    host : adresse saisie à la main, interrogée directement quand le multicast est bloqué."""
+    ip = None
+    if host:
+        ip = await resolve_host(clean_host(host))
+        if not ip:
+            raise RuntimeError(f"adresse introuvable : {host}")
+    found = await plume.discover(ip=ip)
     ours = {(d["pairing_udid"] or "").lower(): d for d in db.rows("SELECT * FROM devices")}
     pairable = [{**d, "known": False} for d in found if d["kind"] == "pairable"]
     paired = []
@@ -172,11 +278,18 @@ def start_pairing(identifier: str | None, ip: str, port: int, name: str) -> Sess
         s.result["device_id"] = device_id
         s.result["udid"] = udid
         db.log(f"Apple TV « {name} » appairée")
-        # Complète modèle / version (peut échouer si la TV se met en veille).
-        try:
-            await refresh_info(device_id)
-        except Exception as e:  # noqa: BLE001
-            db.log(f"Infos de {name} non récupérées pour l'instant : {e}", "warn")
+        # Complète modèle / version (la TV peut ne pas s'être encore ré-annoncée ou être passée en veille) :
+        # quelques essais espacés, l'UDID matériel confirmé en dépend (voir _renew)
+        for attempt, pause in enumerate((0, 3, 8)):
+            if pause:
+                await asyncio.sleep(pause)
+            try:
+                await refresh_info(device_id)
+                break
+            except Exception as e:  # noqa: BLE001
+                if attempt == 2:
+                    db.log(f"Infos de {name} non récupérées pour l'instant : {e}", "warn")
+        retry_apps(device_id)
 
     args = ["pair", "--ip", ip, "--port", port, "--host", PAIR_HOST]
     if identifier:
@@ -188,6 +301,16 @@ def start_pairing(identifier: str | None, ip: str, port: int, name: str) -> Sess
 
 # ---------- commandes sans fil ----------
 
+def retry_apps(device_id: int) -> None:
+    """Après un nouvel appairage : les apps de cette TV en échec (appairage perdu…) sont relancées tout
+    de suite, au lieu d'attendre la fin du délai de réessai (jusqu'à 45 min)."""
+    from . import renew      # import tardif : renew importe devices
+    for a in db.rows("SELECT id FROM apps WHERE device_id = ? AND enabled = 1 AND status IN ('error', 'pending')",
+                     device_id):
+        db.update("apps", a["id"], next_attempt_at=None)
+        renew.spawn(a["id"], "nouvel appairage")
+
+
 def _failed(device: dict, message: str, lost: bool = False) -> None:
     fields = dict(last_error=message, last_error_at=time.time())
     if lost:
@@ -195,13 +318,17 @@ def _failed(device: dict, message: str, lost: bool = False) -> None:
     db.update("devices", device["id"], **fields)
 
 
-def _target(device: dict) -> list[str]:
+def _target(device: dict, hint: str | None = None) -> list[str]:
     if device.get("legacy_pairing") or not device.get("pairing_udid"):
         msg = (f"appairage perdu avec « {device['name']} » : appairage d'une ancienne version de tvsign, "
                "réappaire-la une fois depuis tvsign (Apple TV › Appairer)")
         _failed(device, msg, lost=True)
         raise PairingLost(msg)
-    return ["-i", device["pairing_udid"], "-t", str(DEVICE_TIMEOUT), "--host", device.get("pair_host") or CLI_HOST]
+    target = ["-i", device["pairing_udid"], "-t", str(DEVICE_TIMEOUT), "--host", device.get("pair_host") or CLI_HOST]
+    if hint:
+        # requête mDNS directe vers la TV avant la recherche multicast (filtrée sur certains réseaux)
+        target += ["--hint-ip", hint]
+    return target
 
 
 def _error_line(res: Result) -> str:
@@ -213,10 +340,11 @@ def _error_line(res: Result) -> str:
 
 
 async def _wireless(device: dict, command: str, *extra, timeout: float = 120, ok_codes=(0,),
-                    on_line=None, on_timeout=None) -> Result:
+                    on_line=None, on_timeout=None, use_hint: bool = True) -> Result:
     """Lance `plumesign pair <command> -i <UDID> …` et traduit les codes de sortie.
     on_timeout() fournit le message d'un délai dépassé (contexte de l'appelant)."""
-    target = _target(device)
+    hint = await hint_ip(device) if use_hint else None
+    target = _target(device, hint)
     e = plume.env()
     res = await run(PLUMESIGN, "pair", command, *target, *extra, env=e, timeout=timeout, split=True,
                     on_line=on_line)
@@ -225,6 +353,10 @@ async def _wireless(device: dict, command: str, *extra, timeout: float = 120, ok
         return res
     why = _error_line(res)
     if res.code == EXIT_PAIRING_LOST and _CLI_ERROR.search(res.err):
+        if hint and "hint-ip" in res.err:
+            # plumesign plus ancien que tvsign : sans la requête dirigée, par multicast seul
+            return await _wireless(device, command, *extra, timeout=timeout, ok_codes=ok_codes,
+                                   on_line=on_line, on_timeout=on_timeout, use_hint=False)
         # pas une perte d'appairage : plumesign trop ancien (TVSIGN_PLUMESIGN vers un autre binaire ?)
         raise OldPlumesign(f"plumesign trop ancien pour « pair {command} » : {res.tail(1)}")
     if res.code == EXIT_PAIRING_LOST:
@@ -244,10 +376,10 @@ async def _wireless(device: dict, command: str, *extra, timeout: float = 120, ok
     raise RuntimeError(f"{command} : {why}")
 
 
-async def check_reachable(device: dict) -> None:
+async def check_reachable(device: dict, wait: bool = True) -> None:
     """Tunnel complet + RSD puis fermeture : échoue vite si l'Apple TV est injoignable,
     avant de solliciter Apple pour signer."""
-    async with lock(device["id"]):
+    async with _held(device["id"], wait):
         res = await _wireless(device, "check", timeout=90)
     for line in res.lines():
         parts = line.split()
@@ -255,11 +387,11 @@ async def check_reachable(device: dict) -> None:
             db.update("devices", device["id"], last_ip=parts[3], last_port=int(parts[4]))
 
 
-async def refresh_info(device_id: int) -> dict:
+async def refresh_info(device_id: int, wait: bool = True) -> dict:
     device = db.row("SELECT * FROM devices WHERE id = ?", device_id)
     if not device:
         raise RuntimeError("Apple TV inconnue")
-    async with lock(device_id):
+    async with _held(device_id, wait):
         res = await _wireless(device, "info", "--json", timeout=90)
     line = next((l for l in res.lines() if l.startswith("{")), None)
     if not line:
@@ -279,9 +411,9 @@ async def refresh_info(device_id: int) -> dict:
     return info
 
 
-async def installed_apps(device: dict, bundle_id: str | None = None) -> list[dict]:
+async def installed_apps(device: dict, bundle_id: str | None = None, wait: bool = True) -> list[dict]:
     extra = ["--json"] + (["-b", bundle_id] if bundle_id else [])
-    async with lock(device["id"]):
+    async with _held(device["id"], wait):
         res = await _wireless(device, "apps", *extra, timeout=90)
     out = []
     for line in res.lines():
@@ -291,6 +423,86 @@ async def installed_apps(device: dict, bundle_id: str | None = None) -> list[dic
             except json.JSONDecodeError:
                 pass
     return out
+
+
+# ---------- l'app est-elle bien sur la TV ? ----------
+
+def _has_bundle(apps: list[dict], bundle_id: str) -> bool:
+    return any((a.get("bundle_id") or "").lower() == bundle_id.lower() for a in apps)
+
+
+def signed_bundle(app_dir: Path, app: dict) -> str | None:
+    """Bundle ID réellement installé : celui de la dernière signature (il change avec l'équipe Apple),
+    sinon celui noté à la dernière vérification."""
+    signed = app_dir / "signed.ipa"
+    try:
+        if signed.exists():
+            return ipa.app_info(signed)["bundle_id"] or app.get("installed_bundle")
+    except Exception:  # noqa: BLE001 - fichier partiel ou corrompu
+        pass
+    return app.get("installed_bundle")
+
+
+async def confirm_installed(device: dict, bundle_id: str | None) -> float | None:
+    """Vérifie dans la liste des apps de la TV que l'app y est vraiment après l'installation.
+    Renvoie l'heure de la vérification, None si elle n'a pas pu se faire (TV qui s'endort, plumesign
+    ancien : on ne présume rien), NotInstalled si la TV répond sans l'app (confirmé deux fois)."""
+    if not bundle_id:
+        return None
+    for attempt in range(2):
+        try:
+            apps = await installed_apps(device)
+        except Exception as e:  # noqa: BLE001
+            db.log(f"« {device['name']} » : liste des apps illisible, installation non vérifiée ({e})", "warn")
+            return None
+        if _has_bundle(apps, bundle_id):
+            return time.time()
+        if attempt == 0:
+            await asyncio.sleep(3)     # installd peut mettre un instant à publier l'app
+    raise NotInstalled(f"l'installation s'est terminée mais « {bundle_id} » n'apparaît pas dans les apps de "
+                       f"« {device['name']} » : elle sera réinstallée")
+
+
+_AUDIT_NEXT: dict[int, float] = {}      # appareil -> prochain contrôle périodique
+
+
+async def audit_installed(now: float | None = None) -> None:
+    """Contrôle périodique : une app que la TV n'a plus (désinstallée à la main, TV réinitialisée,
+    installd qui l'a retirée) ne doit pas rester « valide » dans tvsign. Elle repasse en échec et
+    est réinstallée tout de suite. Une TV injoignable est simplement revue plus tard."""
+    if INSTALL_CHECK_HOURS <= 0:
+        return
+    from . import renew      # import tardif : renew importe devices
+    now = now or time.time()
+    for device in db.rows("SELECT * FROM devices WHERE pairing_lost = 0 AND legacy_pairing = 0"):
+        if _AUDIT_NEXT.get(device["id"], 0) > now or lock(device["id"]).locked():
+            continue
+        mine = [a for a in db.rows("SELECT * FROM apps WHERE device_id = ? AND enabled = 1 AND status = 'ok' "
+                                   "AND signed_at IS NOT NULL", device["id"])
+                if a["id"] not in renew._RUNNING and now - a["signed_at"] > 600]
+        if not mine:
+            continue
+        try:
+            apps = await installed_apps(device, wait=False)
+        except Exception:  # noqa: BLE001 - TV en veille, occupée… : on réessaie dans une heure
+            _AUDIT_NEXT[device["id"]] = now + 3600
+            continue
+        _AUDIT_NEXT[device["id"]] = now + INSTALL_CHECK_HOURS * 3600
+        for a in mine:
+            fresh = db.row("SELECT * FROM apps WHERE id = ?", a["id"])
+            if not fresh or fresh["status"] != "ok" or fresh["id"] in renew._RUNNING:
+                continue
+            bundle = signed_bundle(renew.app_dir(a["id"]), fresh)
+            if not bundle:
+                continue
+            if _has_bundle(apps, bundle):
+                db.update("apps", a["id"], verified_at=time.time(), installed_bundle=bundle)
+                continue
+            db.update("apps", a["id"], status="error", verified_at=None, next_attempt_at=None,
+                      last_error=f"l'app n'est plus installée sur « {device['name']} » "
+                                 "(désinstallée depuis la TV ?) : réinstallation en cours")
+            db.log(f"{a['name']} : absente de « {device['name']} », réinstallation", "warn", app_id=a["id"])
+            renew.spawn(a["id"], "app absente")
 
 
 async def install(device: dict, ipas: list[Path], on_event=None, wait_cap: float | None = None,
@@ -305,7 +517,7 @@ async def install(device: dict, ipas: list[Path], on_event=None, wait_cap: float
             on_event(step, **info)
 
     async with lock(device["id"]):
-        for ipa in ipas:
+        for package in ipas:
             st = {"percent": None, "waiting_since": None}
 
             def line(text: str) -> None:
@@ -341,11 +553,11 @@ async def install(device: dict, ipas: list[Path], on_event=None, wait_cap: float
 
             budget = INSTALL_TIMEOUT + (wait_cap or 0)
             try:
-                res = await _wireless(device, "install", ipa, "--stall", "60", timeout=budget,
+                res = await _wireless(device, "install", package, "--stall", "60", timeout=budget,
                                       on_line=line, on_timeout=on_timeout)
             except OldPlumesign:
                 # plumesign sans --stall : installation sans détection de l'attente
-                res = await _wireless(device, "install", ipa, timeout=budget, on_line=line,
+                res = await _wireless(device, "install", package, timeout=budget, on_line=line,
                                       on_timeout=on_timeout)
             if "INSTALLED" not in res.lines():
-                raise RuntimeError(f"installation de {ipa.name} : {res.tail()}")
+                raise RuntimeError(f"installation de {package.name} : {res.tail()}")
