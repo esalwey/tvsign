@@ -3,11 +3,13 @@
 #   powershell -ExecutionPolicy Bypass -File build.ps1 [-SkipInstaller] [-Clean]
 #
 # 1. venv (.venv-build) with Python 3.13 if available, else 3.14
-# 2. pip install ../requirements.txt + requirements-windows.txt (pywebview, pystray, pillow, pyinstaller)
+# 2. pip install --require-hashes -r requirements-lock.txt (pins ../requirements.txt + requirements-windows.txt)
 # 3. icons (tools/make_icon.py), PyInstaller onedir -> dist\tvsign\
 # 4. Inno Setup (installed with winget if missing) -> dist\installer\tvsign-setup-<version>.exe
 #
-# plumesign.exe is taken from ..\..\Impactor\target\release\plumesign.exe (override: $env:TVSIGN_PLUMESIGN_EXE).
+# plumesign.exe is taken from ..\vendor\Impactor\target\release\plumesign.exe (build it with
+# `cargo build --release --locked -p plumesign` inside vendor\Impactor; override: $env:TVSIGN_PLUMESIGN_EXE).
+# The Visual C++ runtime DLLs it imports are copied next to it (tvsign.spec).
 param(
     [switch]$SkipInstaller,
     [switch]$Clean
@@ -25,8 +27,8 @@ function Check($what) { if ($LASTEXITCODE -ne 0) { throw "$what failed (exit $LA
 
 # ---------- plumesign ----------
 $plumesign = $env:TVSIGN_PLUMESIGN_EXE
-if (-not $plumesign) { $plumesign = Join-Path (Split-Path $root -Parent) 'Impactor\target\release\plumesign.exe' }
-if (-not (Test-Path $plumesign)) { throw "plumesign.exe not found: $plumesign (build Impactor or set TVSIGN_PLUMESIGN_EXE)" }
+if (-not $plumesign) { $plumesign = Join-Path $root 'vendor\Impactor\target\release\plumesign.exe' }
+if (-not (Test-Path $plumesign)) { throw "plumesign.exe not found: $plumesign (build it in vendor\Impactor or set TVSIGN_PLUMESIGN_EXE)" }
 $env:TVSIGN_PLUMESIGN_EXE = (Resolve-Path $plumesign).Path
 
 # ---------- Python venv ----------
@@ -45,9 +47,7 @@ if (-not (Test-Path $py)) {
 & $py -c "import sys; print('Python', sys.version)"
 Step 'Installing dependencies'
 & $py -m pip install --disable-pip-version-check -q --upgrade pip; Check 'pip upgrade'
-& $py -m pip install --disable-pip-version-check -q -r (Join-Path $root 'requirements.txt') -r (Join-Path $here 'requirements-windows.txt'); Check 'pip install'
-# record of what this build used (output only: nothing reads it back)
-& $py -m pip freeze --disable-pip-version-check | Set-Content -Encoding utf8 (Join-Path $here 'requirements-lock.txt')
+& $py -m pip install --disable-pip-version-check -q --require-hashes -r (Join-Path $here 'requirements-lock.txt'); Check 'pip install'
 
 # ---------- icons ----------
 Step 'Generating icons'
