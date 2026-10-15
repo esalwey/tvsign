@@ -1235,6 +1235,10 @@ $("#form-reglages").addEventListener("submit", async (ev) => {
     await api("/api/settings", { method: "PATCH", json: body });
     if ("language" in body) await changerLangue(body.language || "auto", false);
     await chargerReglages();
+    if ("update_check" in body) {   // la bannière de nouvelle version suit aussitôt le réglage
+      if (body.update_check === "off") MAJ = null;
+      await verifierMaj();
+    }
     flash("ok", t("saved_t"));
     afficherFlashReglages();
   } catch (e) { err.textContent = e.message; }

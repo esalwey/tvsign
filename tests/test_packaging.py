@@ -253,6 +253,14 @@ class SuspendDetection(unittest.TestCase):
     def test_late_pass_is_a_suspend(self):
         self.assertEqual(renew.suspended_for(1000.0, 1000.0 + 8 * 3600), 8 * 3600)
 
+    def test_log_message_is_neutral_and_level_follows_the_edition(self):
+        msg, level = renew.suspended_message(8 * 3600, True)
+        self.assertEqual(level, "warn")
+        self.assertNotIn("PC", msg)
+        self.assertIn("8 h", msg)
+        msg, level = renew.suspended_message(8 * 3600, False)
+        self.assertEqual(level, "info")                         # NTP step, paused container or VM: not a warning
+
     def test_duration_text(self):
         self.assertEqual(renew._duration(5 * 60), "5 min")
         self.assertEqual(renew._duration(8 * 3600 + 12 * 60), "8 h 12 min")
@@ -375,6 +383,18 @@ class Translations(unittest.TestCase):
         for key in self.NEW:
             self.assertIn(key, self.entries)
             self.assertIn(key, self.keys)
+
+    def test_french_update_texts_use_the_informal_register(self):
+        for key in ("update_win", "update_docker", "update_check_note"):
+            fr = self.entries[key][0]
+            self.assertNotRegex(fr, r"[Vv]ous|[Vv]os|[Vv]otre|Téléchargez|Vérifiez", key)
+        self.assertIn("la version {current}", self.entries["update_win"][0])
+
+    def test_saving_the_update_setting_refreshes_the_banner(self):
+        i = self.app_js.index('await api("/api/settings", { method: "PATCH", json: body });')
+        block = self.app_js[i:i + 700]
+        self.assertIn('"update_check" in body', block)
+        self.assertIn("verifierMaj()", block)
 
     def test_new_keys_are_used(self):
         for key in self.NEW:

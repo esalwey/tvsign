@@ -9,7 +9,7 @@ import urllib.request
 
 from . import db, devices, ipa, plume, proc, settings
 from .config import (ACCOUNT_CHECK_HOURS, APP_WAIT_MINUTES, CHECK_INTERVAL, IPA_DIR,
-                     RELEASE_CHECK_MINUTES, RENEW_TIMEOUT_MINUTES, RETRY_MINUTES)
+                     RELEASE_CHECK_MINUTES, RENEW_TIMEOUT_MINUTES, RETRY_MINUTES, WINDOWS)
 
 # Arrêt du service en cours : plus aucun renouvellement ne démarre, ceux en cours peuvent finir.
 STOPPING = False
@@ -591,6 +591,13 @@ def suspended_for(expected_at: float | None, now: float, tolerance: float = 180.
     return late if late > tolerance else 0.0
 
 
+def suspended_message(late: float, windows: bool) -> tuple[str, str]:
+    """(message, niveau) du journal après une pause de la boucle. Sur Windows c'est presque sûrement la veille du PC
+    (avertissement) ; en Docker, un saut d'horloge NTP ou un conteneur / une VM en pause est banal (info)."""
+    return (f"Aucune vérification depuis {_duration(late + CHECK_INTERVAL)} : la machine était sans doute en "
+            "veille ou en pause ; reprise des renouvellements", "warn" if windows else "info")
+
+
 def _duration(seconds: float) -> str:
     minutes = int(seconds // 60)
     if minutes < 60:
@@ -617,8 +624,7 @@ async def loop() -> None:
         late = suspended_for(expected_at, now)
         if late:
             # PC en veille pendant la fenêtre de renouvellement : le journal l'explique, et les apps dues partent aussitôt
-            db.log(f"Aucune vérification depuis {_duration(late + CHECK_INTERVAL)} : le PC était sans doute en "
-                   "veille ; reprise des renouvellements", "warn")
+            db.log(*suspended_message(late, WINDOWS))
         HEALTH["last_loop_at"] = now
         HEALTH["next_check_at"] = now + CHECK_INTERVAL
         HEALTH["loop_error"] = None
