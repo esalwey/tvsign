@@ -209,7 +209,11 @@ def _error_line(res: Result) -> str:
         if line.startswith("ERROR "):
             parts = line.split(" ", 2)
             return parts[2] if len(parts) > 2 else line
-    return res.tail(2)
+    tail = res.tail(2)
+    if not tail and res.code not in (0, -1) and (res.code < 0 or res.code in (137, 139)):
+        # tué par le système sans rien écrire (SIGKILL : le plus souvent manque de mémoire)
+        return f"plumesign a été arrêté par le système (code {res.code}), probablement par manque de mémoire"
+    return tail
 
 
 async def _wireless(device: dict, command: str, *extra, timeout: float = 120, ok_codes=(0,),

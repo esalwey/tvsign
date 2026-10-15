@@ -5,6 +5,7 @@ Each check returns {id, status: ok|warn|error, detail, value}; the UI translates
 """
 import asyncio
 import email.utils
+import json
 import os
 import shutil
 import socket
@@ -78,6 +79,35 @@ async def _apple() -> tuple[dict, float | None]:
     return res, ts
 
 
+def _fetch_json(url: str) -> tuple[int | None, object, str]:
+    """(code HTTP, JSON décodé ou None, erreur)."""
+    req = urllib.request.Request(url, headers={"User-Agent": f"tvsign/{VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            code, body = r.status, r.read(65536)
+    except urllib.error.HTTPError as e:
+        return e.code, None, ""
+    except Exception as e:  # noqa: BLE001
+        return None, None, str(getattr(e, "reason", e))
+    try:
+        return code, json.loads(body.decode("utf-8", "replace")), ""
+    except ValueError:
+        return code, None, ""
+
+
+async def _anisette(url: str) -> tuple[dict, float | None]:
+    """Un serveur anisette-v3 répond à /v3/client_info par un JSON {client_info, user_agent} : une
+    simple réponse HTTP à la racine ne prouve pas que c'est bien lui (ni qu'il est utilisable)."""
+    base = url.strip().rstrip("/")
+    code, data, err = await asyncio.to_thread(_fetch_json, base + "/v3/client_info")
+    if code is None:
+        return _check("anisette", "error", f"{base} : {err}"), None
+    if isinstance(data, dict) and data.get("client_info") and data.get("user_agent"):
+        return _check("anisette", "ok", f"{base} (HTTP {code})", code), None
+    return _check("anisette", "error", f"{base} répond (HTTP {code}) mais pas comme un serveur anisette-v3 "
+                                       "(/v3/client_info)", code), None
+
+
 async def _reach(id_: str, url: str) -> tuple[dict, float | None]:
     code, ts, err = await asyncio.to_thread(_head, url)
     if code is None:
@@ -107,7 +137,7 @@ async def run_all() -> dict:
     results = await asyncio.gather(
         _plumesign(), _mdns(),
         _apple(),
-        _reach("anisette", anisette),
+        _anisette(anisette),
         _reach("github", "https://api.github.com/"),
     )
     plumesign_, mdns, (apple, apple_date), (anis, _), (github, gh_date) = results

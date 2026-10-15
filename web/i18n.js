@@ -475,7 +475,7 @@ const I18N = {
   c_digest_t: ["Nouvelle version refusée : fichier altéré", "New version refused: file altered"],
   c_digest_a: ["Le fichier téléchargé ne correspond pas à l'empreinte publiée. La version précédente reste installée.", "The downloaded file doesn't match the published checksum. The previous version stays installed."],
   c_cert_t: ["Certificat Apple refusé", "Apple certificate refused"],
-  c_cert_a: ["Un compte gratuit a 2 certificats au plus. Si un autre outil (AltStore, Sideloadly) en a créé, tvsign le remplacera au prochain essai.", "A free account has 2 certificates at most. If another tool (AltStore, Sideloadly) created one, tvsign replaces it on the next attempt."],
+  c_cert_a: ["Un compte gratuit a 2 certificats au plus. Si un autre outil (AltStore, Sideloadly) en a créé, révoque-en un sur developer.apple.com ou autorise la révocation dans Réglages › Certificats.", "A free account has 2 certificates at most. If another tool (AltStore, Sideloadly) created one, revoke one at developer.apple.com or allow revoking in Settings › Certificates."],
   c_app_open_t: ["App ouverte sur l'Apple TV", "App open on the Apple TV"],
   c_app_open_a: ["Fermez l'app sur l'Apple TV : la mise à jour sera retentée automatiquement.", "Close the app on the Apple TV: the update will be retried automatically."],
   c_plumesign_old_t: ["plumesign trop ancien", "plumesign too old"],
@@ -493,9 +493,27 @@ const I18N = {
   c_ipa_missing_t: ["Fichier IPA de l'app absent", "The app's IPA file is missing"],
   c_ipa_missing_a: ["Ce fichier importé n'a pas été restauré (sauvegarde sans les .ipa). Supprime l'app puis rajoute-la en important de nouveau l'IPA.", "This uploaded file was not restored (backup made without the .ipa files). Delete the app, then add it again by uploading the IPA."],
   c_team_t: ["Équipe de développeur Apple introuvable", "Apple developer team not found"],
-  c_team_a: ["Ce compte Apple n'a pas d'équipe de développeur : connecte-toi sur developer.apple.com et accepte le contrat, puis réessaie. Avec plusieurs équipes, tvsign utilise la première.", "This Apple account has no developer team: sign in at developer.apple.com and accept the agreement, then retry. With several teams, tvsign uses the first one."],
+  c_team_a: ["Ce compte Apple n'a pas d'équipe de développeur, ou l'équipe choisie n'existe plus : connecte-toi sur developer.apple.com et accepte le contrat, ou choisis une autre équipe avec le bouton Équipe du compte.", "This Apple account has no developer team, or the chosen team no longer exists: sign in at developer.apple.com and accept the agreement, or pick another team with the account's Team button."],
   c_source_t: ["Problème avec la source de l'app", "Problem with the app's source"],
   c_source_a: ["Vérifie le dépôt GitHub ou le lien dans les Réglages de l'app.", "Check the GitHub repository or the link in the app's Settings."],
+
+  // ---------- certificats et équipes de développeur ----------
+  c_certlimit_t: ["Compte Apple plein : un certificat est à libérer", "Apple account full: a certificate has to be freed"],
+  c_certlimit_a: ["Le compte a déjà le maximum de certificats de développement et tvsign ne révoque pas ceux d'autres outils (Xcode, SideStore, AltStore) sans ton accord. Révoque-en un sur developer.apple.com, ou autorise la révocation dans Réglages › Certificats.", "The account already holds the maximum number of development certificates and tvsign does not revoke those of other tools (Xcode, SideStore, AltStore) without your consent. Revoke one at developer.apple.com, or allow revoking in Settings › Certificates."],
+  certificates: ["Certificats", "Certificates"],
+  cert_revoke_label: ["Quand le compte Apple est plein", "When the Apple account is full"],
+  cert_revoke_own: ["Remplacer seulement les certificats de tvsign", "Replace only tvsign's own certificates"],
+  cert_revoke_never: ["Ne jamais révoquer", "Never revoke"],
+  cert_revoke_any: ["Révoquer n'importe lequel (Xcode, SideStore…)", "Revoke any certificate (Xcode, SideStore…)"],
+  cert_revoke_note: ["Un compte Apple gratuit a 2 certificats de développement. En révoquer un empêche les apps signées avec lui de se lancer, y compris celles de Xcode, SideStore ou AltStore sur ton iPhone.", "A free Apple account holds 2 development certificates. Revoking one stops the apps signed with it from launching, including those of Xcode, SideStore or AltStore on your iPhone."],
+  cert_until: ["certificat valable jusqu'au {date}", "certificate valid until {date}"],
+  team_button: ["Équipe", "Team"],
+  team_title: ["Équipe de développeur", "Developer team"],
+  team_loading: ["Lecture des équipes…", "Reading the teams…"],
+  team_none: ["Apple ne renvoie aucune équipe pour ce compte.", "Apple returns no team for this account."],
+  team_note: ["L'équipe fait partie de l'identifiant de l'app : en changer installe une seconde copie de l'app sur l'Apple TV.", "The team is part of the app's identifier: changing it installs a second copy of the app on the Apple TV."],
+  team_saved_t: ["Équipe enregistrée", "Team saved"],
+  team_saved: ["Les prochaines signatures l'utilisent.", "The next signatures use it."],
 };
 
 let LANG = "en";

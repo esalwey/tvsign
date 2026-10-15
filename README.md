@@ -171,6 +171,20 @@ Notifications (ntfy): the topic name acts as a password on the public ntfy.sh, a
 your Apple ID and your apps: pick a long random topic, or use a self-hosted ntfy. A protected
 server can be reached with `https://user:password@host/topic` (sent as Basic authentication).
 
+Apple certificates: a free Apple ID holds at most 2 development certificates, and revoking one stops
+the apps signed with it from launching (Xcode, SideStore, AltStore on your iPhone...). When the
+account is full, tvsign only replaces certificates it created itself (named `tvsign-<id>`, kept
+with the keys in `/data`) and dead ones; otherwise signing stops with a "certificate limit" message
+listing the certificates, and you either revoke one at developer.apple.com or choose, in Settings
+> Certificates, to let tvsign revoke any certificate (`TVSIGN_CERT_REVOKE=any`; `never` forbids
+all revocation). A certificate is renewed 30 days before it expires and its end date is shown on
+the account. Several Apple teams: the Team button of an account chooses the team used for signing;
+it is remembered, so a change in Apple's ordering never moves the apps to another team (the team is
+part of the app identifier). Several installs of tvsign (a NAS and a PC) should use different Apple
+IDs; each one pairs with the Apple TV under its own name (`tvsign-xxxxxxxx`, or `TVSIGN_PAIR_HOST`).
+A self-hosted anisette server over plain `http://` is supported; one over `https://` with a
+self-signed certificate needs `PLUMESIGN_ANISETTE_INSECURE=1`.
+
 Building from source: see [docs/building.md](docs/building.md).
 
 ---
@@ -340,6 +354,21 @@ conservé. À l'arrêt, un renouvellement en cours peut finir pendant `TVSIGN_SH
 Notifications (ntfy) : sur ntfy.sh public, le nom du sujet fait office de mot de passe, et les messages
 citent votre Apple ID et vos apps : choisir un sujet long et aléatoire, ou un ntfy auto-hébergé. Un
 serveur protégé s'utilise avec `https://utilisateur:motdepasse@hôte/sujet` (envoyé en authentification Basic).
+
+Certificats Apple : un Apple ID gratuit n'a droit qu'à 2 certificats de développement, et en révoquer
+un empêche les apps signées avec lui de se lancer (Xcode, SideStore, AltStore sur votre iPhone...).
+Quand le compte est plein, tvsign ne remplace que les certificats qu'il a créés lui-même (nommés
+`tvsign-<id>`, l'id est gardé avec les clés dans `/data`) et les certificats morts ; sinon la
+signature s'arrête avec un message « limite de certificats » qui liste les certificats : vous en
+révoquez un sur developer.apple.com, ou vous autorisez tvsign, dans Réglages > Certificats, à
+révoquer n'importe lequel (`TVSIGN_CERT_REVOKE=any` ; `never` interdit toute révocation). Un
+certificat est renouvelé 30 jours avant son expiration et sa date de fin s'affiche sur le compte.
+Plusieurs équipes Apple : le bouton Équipe d'un compte choisit l'équipe de signature ; elle est
+mémorisée, donc un changement d'ordre chez Apple ne déplace jamais les apps vers une autre équipe
+(l'équipe fait partie de l'identifiant de l'app). Plusieurs installations de tvsign (un NAS et un PC)
+doivent utiliser des Apple ID différents ; chacune s'appaire à l'Apple TV sous son propre nom
+(`tvsign-xxxxxxxx`, ou `TVSIGN_PAIR_HOST`). Un serveur anisette auto-hébergé en `http://` simple est
+accepté ; en `https://` avec un certificat auto-signé, il faut `PLUMESIGN_ANISETTE_INSECURE=1`.
 
 Compiler soi-même : voir [docs/building.md](docs/building.md).
 

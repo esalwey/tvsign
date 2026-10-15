@@ -35,6 +35,7 @@ async def lifespan(_: FastAPI):
     for f in TMP_DIR.glob("*"):
         if f.is_file() and time.time() - f.stat().st_mtime > 3600:
             f.unlink(missing_ok=True)
+    plume.sweep_stage()        # copies de travail de plumesign laissées par un processus tué
     task = asyncio.create_task(renew.loop())
     yield
     # arrêt : une installation en cours peut finir avant que l'arrêt ne l'interrompe
@@ -434,6 +435,33 @@ async def account_delete(email: str):
     except RuntimeError as e:
         db.log(f"Déconnexion de {email} échouée : {e}", "error")
         raise HTTPException(502, "logout_failed") from None
+    return {"ok": True}
+
+
+class TeamChoice(BaseModel):
+    team_id: str
+
+
+@app.get("/api/accounts/{email}/teams")
+async def account_teams(email: str):
+    try:
+        return {"teams": await plume.teams(email)}
+    except plume.UnknownAccount:
+        raise HTTPException(404, "unknown_account") from None
+    except RuntimeError as e:
+        raise HTTPException(502, str(e)) from None
+
+
+@app.post("/api/accounts/{email}/team")
+async def account_team(email: str, body: TeamChoice):
+    try:
+        await plume.set_team(email, body.team_id.strip().upper())
+    except plume.UnknownAccount:
+        raise HTTPException(404, "unknown_account") from None
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
+    except RuntimeError as e:
+        raise HTTPException(502, str(e)) from None
     return {"ok": True}
 
 
