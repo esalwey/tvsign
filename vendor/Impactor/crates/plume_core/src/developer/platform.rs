@@ -12,6 +12,17 @@ pub enum DeveloperPlatform {
 }
 
 impl DeveloperPlatform {
+    /// Platform named on a command line: `ios` (also `iphoneos`, `ipados`: the portal files
+    /// iPhone and iPad under iOS) or `tvos` (`appletvos`). visionOS is not mapped: its portal
+    /// request fields have not been captured from a real Xcode session.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "ios" | "iphoneos" | "ipados" | "iphone" | "ipad" => Some(DeveloperPlatform::IOs),
+            "tvos" | "appletvos" | "appletv" => Some(DeveloperPlatform::TvOs),
+            _ => None,
+        }
+    }
+
     pub fn request_fields(self) -> &'static [(&'static str, &'static str)] {
         match self {
             DeveloperPlatform::IOs => &[],
@@ -31,6 +42,17 @@ impl DeveloperPlatform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_map_to_platforms() {
+        assert_eq!(DeveloperPlatform::from_name("ios"), Some(DeveloperPlatform::IOs));
+        assert_eq!(DeveloperPlatform::from_name("iPadOS"), Some(DeveloperPlatform::IOs));
+        assert_eq!(DeveloperPlatform::from_name(" tvOS "), Some(DeveloperPlatform::TvOs));
+        assert_eq!(DeveloperPlatform::from_name("appletvos"), Some(DeveloperPlatform::TvOs));
+        assert_eq!(DeveloperPlatform::from_name("visionos"), None);
+        assert_eq!(DeveloperPlatform::from_name("watchos"), None);
+        assert_eq!(DeveloperPlatform::from_name(""), None);
+    }
 
     #[test]
     fn default_is_ios() {

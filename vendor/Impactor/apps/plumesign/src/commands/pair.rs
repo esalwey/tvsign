@@ -9,7 +9,8 @@ use idevice::IdeviceError;
 use idevice::RsdService;
 use idevice::installation_proxy::InstallationProxyClient;
 use plume_utils::wireless::{
-    PairingStore, RsdConnection, ServiceKind, discover, locate, locate_and_connect, pair,
+    PairedDevice, PairingStore, RpPairingFile, RsdConnection, ServiceKind, discover, locate,
+    locate_and_connect, pair, pair_usb,
 };
 
 use crate::get_data_path;
@@ -48,6 +49,12 @@ pub enum PairCommands {
     Find(FindArgs),
     /// Delete a stored pairing
     Forget(ForgetArgs),
+    /// Pair once with an iPhone or iPad plugged in over USB (iOS 17 or later)
+    Usb(UsbArgs),
+    /// Store a pairing file made elsewhere (Impactor, another computer) for a device
+    Import(ImportArgs),
+    /// Tell whether Developer Mode is on (`DEVMODE on` / `DEVMODE off`)
+    Devmode(TargetArgs),
     /// Print a paired device's properties over the wireless tunnel
     Info(InfoArgs),
     /// Check that a paired device is reachable and still trusts this host
@@ -96,6 +103,29 @@ pub struct TargetArgs {
         default_value_t = 10
     )]
     pub timeout: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct UsbArgs {
+    /// UDID of the device to pair (the only one plugged in when omitted)
+    #[arg(short = 'u', long = "udid", value_name = "UDID")]
+    pub udid: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ImportArgs {
+    /// Pairing file (.plist)
+    #[arg(value_name = "FILE", required = true)]
+    pub file: std::path::PathBuf,
+    /// UDID of the device the file belongs to
+    #[arg(short = 'u', long = "udid", value_name = "UDID", required = true)]
+    pub udid: String,
+    /// Name to remember the device under
+    #[arg(short = 'n', long = "name", value_name = "NAME")]
+    pub name: Option<String>,
+    /// Model identifier, e.g. iPhone15,2
+    #[arg(short = 'm', long = "model", value_name = "MODEL")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -199,6 +229,15 @@ pub async fn execute(args: PairArgs) -> Result<()> {
         Some(PairCommands::List) => run_list(&store).await,
         Some(PairCommands::Find(find_args)) => run_find(&store, find_args).await,
         Some(PairCommands::Forget(forget_args)) => run_forget(&store, forget_args).await,
+        Some(PairCommands::Usb(usb_args)) => {
+            exit_with(run_usb(&store, &args.host, usb_args).await)
+        }
+        Some(PairCommands::Import(import_args)) => {
+            exit_with(run_import(&store, &args.host, import_args).await)
+        }
+        Some(PairCommands::Devmode(target)) => {
+            exit_with(run_devmode(&store, &args.host, target).await)
+        }
         Some(PairCommands::Info(info_args)) => {
             exit_with(run_info(&store, &args.host, info_args).await)
         }
@@ -266,6 +305,86 @@ async fn run_pair(store: &PairingStore, args: PairArgs) -> Result<()> {
     flush_stdout();
 
     Ok(())
+}
+
+/// Pairs with a device plugged in over USB and stores the pairing. Prints one JSON line with what
+/// lockdown reported, then `PAIRED - <udid>` (no identifier: the device is not on mDNS yet).
+async fn run_usb(store: &PairingStore, host: &str, args: UsbArgs) -> Result<()> {
+    log::info!("Pairing over USB as {host:?}");
+    let paired = pair_usb(args.udid.as_deref(), host).await?;
+    let path = store.save(&paired.device, &paired.pairing_file).await?;
+    log::info!(
+        "Paired with {} ({}), UDID {}, saved to {}",
+        paired.device.name,
+        paired.device.model,
+        paired.device.udid,
+        path.display()
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "UniqueDeviceID": paired.device.udid,
+            "DeviceName": paired.info.name,
+            "ProductType": paired.info.product_type,
+            "ProductVersion": paired.info.product_version,
+            "DeviceFamily": device_family(None, paired.info.product_type.as_deref()),
+        })
+    );
+    println!("PAIRED - {}", paired.device.udid);
+    flush_stdout();
+    Ok(())
+}
+
+/// Stores a pairing file made elsewhere after checking that it parses.
+async fn run_import(store: &PairingStore, host: &str, args: ImportArgs) -> Result<()> {
+    let pairing_file = RpPairingFile::read_from_file(&args.file)
+        .await
+        .map_err(|e| anyhow::anyhow!("Not a valid pairing file ({}): {e}", args.file.display()))?;
+    let device = PairedDevice {
+        udid: args.udid.clone(),
+        name: args.name.clone().unwrap_or_else(|| args.udid.clone()),
+        model: args.model.clone().unwrap_or_else(|| "Unknown".to_string()),
+        account_id: host.to_string(),
+    };
+    let path = store.save(&device, &pairing_file).await?;
+    log::info!("Imported pairing for {} into {}", device.udid, path.display());
+    println!("PAIRED - {}", device.udid);
+    flush_stdout();
+    Ok(())
+}
+
+/// Developer Mode status through the AMFI service of the wireless tunnel.
+async fn run_devmode(store: &PairingStore, host: &str, target: TargetArgs) -> Result<()> {
+    use idevice::amfi::AmfiClient;
+
+    let mut connection = connect(store, host, &target).await?;
+    let mut client =
+        AmfiClient::connect_rsd(&mut connection.adapter, &mut connection.handshake).await?;
+    let on = client.get_developer_mode_status().await?;
+    println!("DEVMODE {}", if on { "on" } else { "off" });
+    Ok(())
+}
+
+/// Family of a device from its `DeviceClass` or, failing that, its `ProductType`:
+/// `tvos`, `ios` (iPhone, iPod touch), `ipados`, `visionos`.
+fn device_family(device_class: Option<&str>, product_type: Option<&str>) -> Option<&'static str> {
+    [device_class, product_type]
+        .into_iter()
+        .flatten()
+        .find_map(|value| {
+            let v = value.to_ascii_lowercase();
+            if v.starts_with("appletv") {
+                Some("tvos")
+            } else if v.starts_with("ipad") {
+                Some("ipados")
+            } else if v.starts_with("iphone") || v.starts_with("ipod") {
+                Some("ios")
+            } else if v.starts_with("realitydevice") || v.starts_with("vision") {
+                Some("visionos")
+            } else {
+                None
+            }
+        })
 }
 
 async fn connect(store: &PairingStore, host: &str, target: &TargetArgs) -> Result<RsdConnection> {
@@ -369,6 +488,10 @@ async fn run_info(store: &PairingStore, host: &str, args: InfoArgs) -> Result<()
             property_string(&connection, &["HardwareModel", "HWModel"]),
         ),
     ];
+    let family = device_family(
+        property_string(&connection, &["DeviceClass"]).as_deref(),
+        property_string(&connection, &["ProductType"]).as_deref(),
+    );
     let udid_matches = unique_device_id
         .as_deref()
         .map(|udid| udid.eq_ignore_ascii_case(&record.udid));
@@ -381,6 +504,7 @@ async fn run_info(store: &PairingStore, host: &str, args: InfoArgs) -> Result<()
         );
         out.insert("pairing_udid".into(), record.udid.clone().into());
         out.insert("udid_matches_pairing".into(), udid_matches.into());
+        out.insert("DeviceFamily".into(), family.into());
         out.insert(
             "ip".into(),
             connection.device.address.ip().to_string().into(),
@@ -404,6 +528,9 @@ async fn run_info(store: &PairingStore, host: &str, args: InfoArgs) -> Result<()
         println!("Identifier: {}", connection.device.service_identifier);
         println!("PairingUDID: {}", record.udid);
         println!("Address: {}", connection.device.address);
+        if let Some(family) = family {
+            println!("DeviceFamily: {family}");
+        }
         for (key, value) in &fields {
             if let Some(value) = value {
                 println!("{key}: {value}");
@@ -1059,6 +1186,59 @@ mod tests {
         ]);
         assert_eq!(ipa_bundle_id(&data).unwrap(), "com.example.tv");
         assert!(ipa_bundle_id(&ipa(&[("Payload/readme.txt", b"x")])).is_err());
+    }
+
+    #[test]
+    fn family_comes_from_the_class_then_the_model() {
+        assert_eq!(device_family(Some("AppleTV"), None), Some("tvos"));
+        assert_eq!(device_family(None, Some("AppleTV11,1")), Some("tvos"));
+        assert_eq!(device_family(Some("iPhone"), None), Some("ios"));
+        assert_eq!(device_family(None, Some("iPhone15,2")), Some("ios"));
+        assert_eq!(device_family(None, Some("iPod9,1")), Some("ios"));
+        assert_eq!(device_family(Some("iPad"), Some("iPad13,4")), Some("ipados"));
+        assert_eq!(device_family(None, Some("RealityDevice14,1")), Some("visionos"));
+        assert_eq!(device_family(Some("Watch"), Some("Watch6,1")), None);
+        assert_eq!(device_family(None, None), None);
+    }
+
+    #[test]
+    fn import_stores_a_valid_pairing_file_and_refuses_garbage() {
+        let dir = std::env::temp_dir().join(format!(
+            "plumesign-import-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.plist");
+        std::fs::write(&good, RpPairingFile::generate("tvsign").to_bytes()).unwrap();
+        let bad = dir.join("bad.plist");
+        std::fs::write(&bad, b"not a plist").unwrap();
+
+        let store = PairingStore::new(dir.join("store"));
+        let args = |file: &std::path::Path| ImportArgs {
+            file: file.to_path_buf(),
+            udid: "00008110-001A2B3C00000000".to_string(),
+            name: Some("Mon iPhone".to_string()),
+            model: Some("iPhone15,2".to_string()),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            assert!(run_import(&store, "tvsign", args(&bad)).await.is_err());
+            assert!(store.list().await.unwrap().is_empty());
+            run_import(&store, "tvsign", args(&good)).await.unwrap();
+            let records = store.list().await.unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].name, "Mon iPhone");
+            assert_eq!(records[0].model, "iPhone15,2");
+            assert_eq!(records[0].udid, "00008110-001A2B3C00000000");
+        });
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

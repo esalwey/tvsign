@@ -70,7 +70,7 @@ pub struct DevicesArgs {
     /// Team ID to list devices for
     #[arg(short = 't', long = "team", value_name = "TEAM_ID")]
     pub team_id: Option<String>,
-    /// Filter by device platform (ios, tvos, watchos)
+    /// Platform to list devices for (ios, tvos; default ios)
     #[arg(long = "platform", value_name = "PLATFORM")]
     pub platform: Option<String>,
 }
@@ -86,6 +86,9 @@ pub struct RegisterDeviceArgs {
     /// Device name
     #[arg(short = 'n', long = "name", value_name = "NAME", required = true)]
     pub name: String,
+    /// Platform to register the device for (ios, tvos; default ios)
+    #[arg(long = "platform", value_name = "PLATFORM")]
+    pub platform: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -306,8 +309,9 @@ async fn devices(args: DevicesArgs) -> Result<()> {
         args.team_id.unwrap()
     };
 
+    let platform = parse_platform(args.platform.as_deref())?;
     let p = session
-        .qh_list_devices(&team_id, DeveloperPlatform::default())
+        .qh_list_devices(&team_id, platform)
         .await?
         .devices;
 
@@ -325,19 +329,25 @@ async fn register_device(args: RegisterDeviceArgs) -> Result<()> {
         args.team_id.unwrap()
     };
 
+    let platform = parse_platform(args.platform.as_deref())?;
     let p = session
-        .qh_add_device(
-            &team_id,
-            &args.name,
-            &args.udid,
-            DeveloperPlatform::default(),
-        )
+        .qh_add_device(&team_id, &args.name, &args.udid, platform)
         .await?
         .device;
 
     log::info!("{:#?}", p);
 
     Ok(())
+}
+
+/// `--platform` value to a portal platform; iOS when absent, as before the flag worked.
+fn parse_platform(name: Option<&str>) -> Result<DeveloperPlatform> {
+    match name {
+        None => Ok(DeveloperPlatform::default()),
+        Some(name) => DeveloperPlatform::from_name(name).ok_or_else(|| {
+            anyhow::anyhow!("Unsupported platform {name:?}: use ios or tvos")
+        }),
+    }
 }
 
 pub async fn teams(session: &DeveloperSession) -> Result<String> {
