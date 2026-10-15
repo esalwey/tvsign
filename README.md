@@ -183,10 +183,11 @@ Apple refuses the data of the servers that generate it as Android (error `-80045
   `https://ani2.stikstore.app` by itself when it does not answer. **Leave the Settings field empty**
   for that. The client info and user agent sent to Apple are the ones the server announces.
 - A server you choose yourself (Settings, or `TVSIGN_ANISETTE_URL`) is used alone, without fallback,
-  and must serve Windows data too. A setting that names one of the old Android servers
-  (`ani.sidestore.app`, `ani.stikstore.app`, `anisette.crystall1ne.dev`, `ani3server.fly.dev`,
-  `ani.jaydenha.uk`, `omni.ethxn.xyz`) is replaced by the default, with a line in the log; the same
-  value in an environment variable is ignored.
+  and must serve Windows data too: a server that announces anything else is not used (tvsign says so and
+  sends nothing to Apple, which would only answer `-80045` or a 503 page). A setting that names one of
+  the old Android servers (`ani.sidestore.app`, `ani.stikstore.app`, `anisette.crystall1ne.dev`,
+  `ani3server.fly.dev`, `ani.jaydenha.uk`, `omni.ethxn.xyz`) is replaced by the default, with a line in
+  the log; the same value in an environment variable is ignored.
 - The anisette identity is created again by itself (the old one, `state.plist` in the `PlumeImpactor`
   folder, is deleted) and provisioned again whenever the server or Apple says it is not valid.
 - Accounts that were already connected keep renewing as long as Apple accepts their session. If it
@@ -202,9 +203,11 @@ If signing in still fails:
 - **`-80045`** with the default server: Apple refuses this account or this connection. It is not a
   tvsign problem and retrying makes it worse (Apple limits the attempts): wait several hours, from
   another network if you can, then sign in once. Apps already installed keep working until they expire.
-- **HTTP 503**: Apple's servers are busy (tvsign retries by itself a few times), or the anisette
-  server is not accepted: check that the Settings field is empty. Settings › Diagnostics tells whether
-  the anisette server answers and serves Windows data.
+- **HTTP 503**: Apple's servers are busy (tvsign tries once more, and a sign-in then takes the data of
+  the other anisette server), or the anisette server is not accepted: check that the Settings field is
+  empty. Settings › Diagnostics tells whether the anisette server answers and serves Windows data.
+- **HTTP 429**: too many requests. Do not insist: tvsign waits several hours before trying again by itself,
+  and the account does not need to be signed in again.
 
 Building from source: see [docs/building.md](docs/building.md).
 
@@ -389,10 +392,12 @@ de la version 1.0.1 :
   seul sur `https://ani2.stikstore.app` quand il ne répond pas. **Laissez le champ des Réglages vide**
   pour cela. Le client info et le user agent envoyés à Apple sont ceux que le serveur annonce.
 - Un serveur choisi par vos soins (Réglages, ou `TVSIGN_ANISETTE_URL`) est utilisé seul, sans repli, et
-  doit lui aussi fournir des données Windows. Un réglage qui désigne l'un des anciens serveurs Android
-  (`ani.sidestore.app`, `ani.stikstore.app`, `anisette.crystall1ne.dev`, `ani3server.fly.dev`,
-  `ani.jaydenha.uk`, `omni.ethxn.xyz`) est remplacé par le serveur par défaut, avec une ligne dans le
-  journal ; la même valeur dans une variable d'environnement est ignorée.
+  doit lui aussi fournir des données Windows : un serveur qui annonce autre chose n'est pas utilisé
+  (tvsign le dit et n'envoie rien à Apple, qui répondrait seulement `-80045` ou une page 503). Un réglage
+  qui désigne l'un des anciens serveurs Android (`ani.sidestore.app`, `ani.stikstore.app`,
+  `anisette.crystall1ne.dev`, `ani3server.fly.dev`, `ani.jaydenha.uk`, `omni.ethxn.xyz`) est remplacé par
+  le serveur par défaut, avec une ligne dans le journal ; la même valeur dans une variable
+  d'environnement est ignorée.
 - L'identité anisette est recréée toute seule (l'ancienne, `state.plist` dans le dossier
   `PlumeImpactor`, est supprimée) et provisionnée de nouveau chaque fois que le serveur ou Apple dit
   qu'elle n'est plus valide.
@@ -411,9 +416,12 @@ Si la connexion échoue encore :
   problème de tvsign et insister l'aggrave (Apple limite les essais) : attendez plusieurs heures, depuis
   un autre réseau si possible, puis connectez-vous une seule fois. Les apps déjà installées continuent
   de fonctionner jusqu'à leur expiration.
-- **HTTP 503** : les serveurs d'Apple sont chargés (tvsign réessaie seul quelques fois), ou le serveur
-  anisette n'est pas accepté : vérifiez que le champ des Réglages est vide. Réglages › Diagnostic
-  indique si le serveur anisette répond et fournit des données Windows.
+- **HTTP 503** : les serveurs d'Apple sont chargés (tvsign réessaie une fois, puis une connexion prend les
+  données de l'autre serveur anisette), ou le serveur anisette n'est pas accepté : vérifiez que le champ des
+  Réglages est vide. Réglages › Diagnostic indique si le serveur anisette répond et fournit des données
+  Windows.
+- **HTTP 429** : trop de requêtes. N'insistez pas : tvsign attend plusieurs heures avant de réessayer
+  seul, et il n'y a pas besoin de reconnecter le compte.
 
 Compiler soi-même : voir [docs/building.md](docs/building.md).
 

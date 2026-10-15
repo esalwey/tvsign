@@ -9,6 +9,7 @@ alerte unique d'un compte à reconnecter. Les textes d'erreur ci-dessous sont ce
 import asyncio
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -287,6 +288,16 @@ PORTAL_1100 = ("Error: Developer API error 1100 (HTTP Some(200)): Your session h
 BAD_PASSWORD = "Error: Authentication SRP error -22406: Your Apple ID or password was entered incorrectly."
 NETWORK = ("Error: Anisette error: Request Error error sending request for url "
            "(https://ani.jkcoxson.com/v3/client_info)")
+GSA_429 = "Error: Apple GrandSlam answered HTTP 429 without a usable reply: Too Many Requests"
+PORTAL_503 = ("Error: Apple developer services answered HTTP 503 without a usable reply: "
+              "503 Service Temporarily Unavailable")
+PORTAL_429 = "Error: Apple developer services answered HTTP 429 without a usable reply: Too Many Requests"
+NOT_WINDOWS = ("Error: Anisette error: anisette server not usable: https://anisette.example.org announces "
+               "`<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>`: Apple only accepts "
+               "Windows anisette since 2026-10-12 (use the default server, or one that serves Windows anisette)")
+NOT_WINDOWS_BOTH = ("Error: Anisette error: no anisette server could be used: https://ani.jkcoxson.com: anisette server "
+                    "not usable: https://ani.jkcoxson.com announces `<Mac15,7> <macOS;27.0>`: Apple only accepts "
+                    "Windows anisette since 2026-10-12 | https://ani2.stikstore.app: anisette server not usable: ...")
 
 
 class Classification(unittest.TestCase):
@@ -294,12 +305,16 @@ class Classification(unittest.TestCase):
         (SRP_80045, "apple_refused"),
         (GSA_503, "apple_503"),
         (PROVISIONING_503, "apple_503"),
-        ("Error: Apple GrandSlam answered HTTP 429 without a usable reply: Too Many Requests", "apple_503"),
+        (PORTAL_503, "apple_503"),
+        (GSA_429, "apple_rate_limited"),
+        (PORTAL_429, "apple_rate_limited"),
         (SMS_403, "sms_denied"),
         (NEVER_SIGNED_IN, "never_signed_in"),
         (SYNC_22421, "anisette_refused"),
         (BAD_MD_22409, "anisette_refused"),
         (MID_80009, "anisette_refused"),
+        (NOT_WINDOWS, "anisette_unsupported"),
+        (NOT_WINDOWS_BOTH, "anisette_unsupported"),
         (NOT_PROVISIONED, "anisette_reprovision"),
         (SERVER_45061, "anisette_reprovision"),
     ]
@@ -363,12 +378,38 @@ class Failures(unittest.TestCase):
         self.assertIsNone(db.row("SELECT ok FROM account_status WHERE email = ?", self.email))   # session intacte
 
     def test_503_is_refused_but_not_slow(self):
-        for output in (GSA_503, PROVISIONING_503):
+        for output in (GSA_503, PROVISIONING_503, PORTAL_503):
             e = self.fail(output)
             self.assertIsInstance(e, plume.AppleRefused)
             self.assertFalse(e.slow)
             self.assertIn("503", str(e))
             self.assertIn("anisette", str(e))
+            # the usual delay of a renewal, not a longer one: the message does not pretend otherwise
+            self.assertNotIn("espacé", str(e))
+
+    def test_429_asks_to_slow_down_like_minus_80045(self):
+        for output in (GSA_429, PORTAL_429):
+            e = self.fail(output)
+            self.assertIsInstance(e, plume.AppleRefused)
+            self.assertEqual(e.kind, "apple_rate_limited")
+            self.assertTrue(e.slow)
+            self.assertIn("429", str(e))
+            self.assertIn("n'insiste pas", str(e))
+            self.assertNotIn("expirée", str(e))
+        self.assertIsNone(db.row("SELECT ok FROM account_status WHERE email = ?", self.email))   # session intacte
+        # the next try of a renewal is hours away
+        now = 1_000_000.0
+        self.assertGreaterEqual(renew._retry_at({"expires_at": None}, now, slow=True) - now, 3 * 3600)
+
+    def test_a_server_that_is_not_windows_waits_for_the_user_not_for_a_retry(self):
+        for output in (NOT_WINDOWS, NOT_WINDOWS_BOTH):
+            e = self.fail(output)
+            self.assertIs(type(e), RuntimeError, output)
+            self.assertNotIsInstance(e, (plume.Transient, plume.SessionExpired, plume.AppleRefused))
+            self.assertIn("Windows", str(e))
+            self.assertIn("12 octobre 2026", str(e))
+            self.assertNotIn("passager", str(e))
+        self.assertEqual(self.reset_calls, [])
 
     def test_expired_session_names_the_reason_and_the_account(self):
         e = self.fail(PORTAL_1100)
@@ -549,6 +590,64 @@ class OneNotificationPerEpisode(unittest.TestCase):
         self.assertEqual(len(self.notes), 2, "un nouvel épisode est signalé de nouveau")
 
 
+class RefusedRenewals(unittest.TestCase):
+    """Un renouvellement que refuse Apple : -80045 et 429 attendent des heures, un 503 réessaie à l'allure
+    habituelle, aucun ne passe pour une session expirée."""
+
+    def setUp(self):
+        db.init()
+        self.email = "refused@example.com"
+        store = plume.STORE
+        store.mkdir(parents=True, exist_ok=True)
+        (store / "accounts.json").write_text(json.dumps({
+            "selected_account": self.email,
+            "accounts": {self.email: {"first_name": "R", "team_id": "TEAM"}}}), encoding="utf-8")
+        plume._LAST = {}
+        plume._set_status(self.email, True, "session valide")
+        self.device = db.execute("INSERT INTO devices (name, pair_identifier, udid, created_at) "
+                                 "VALUES ('Salon', 'pid-refused', 'UDID-REFUSED', 0)")
+        self.app = db.execute(
+            "INSERT INTO apps (name, source_type, device_id, account_email, created_at, enabled, status) "
+            "VALUES ('Refused', 'upload', ?, ?, 0, 1, 'pending')", self.device, self.email)
+        (renew.app_dir(self.app) / "original.ipa").write_bytes(b"not read: the signing is refused first")
+        self.kind = "apple_refused"
+
+        async def reachable(device):
+            return None
+
+        async def refused(*args, **kwargs):
+            raise plume.AppleRefused("signature : refus d'Apple", self.kind)
+        self.saved = renew.devices.check_reachable, plume.ensure_device
+        renew.devices.check_reachable, plume.ensure_device = reachable, refused
+
+    def tearDown(self):
+        renew.devices.check_reachable, plume.ensure_device = self.saved
+        (plume.STORE / "accounts.json").unlink(missing_ok=True)
+        plume._LAST = {}
+        plume.ALERTED.discard(self.email)
+        db.execute("DELETE FROM account_status WHERE email = ?", self.email)
+        db.execute("DELETE FROM events WHERE app_id = ?", self.app)
+        db.execute("DELETE FROM apps WHERE id = ?", self.app)
+        db.execute("DELETE FROM devices WHERE id = ?", self.device)
+        (renew.app_dir(self.app) / "original.ipa").unlink(missing_ok=True)
+
+    def wait_after_failure(self, kind):
+        self.kind = kind
+        asyncio.run(renew._renew(self.app, "auto"))
+        app = db.row("SELECT * FROM apps WHERE id = ?", self.app)
+        self.assertEqual(app["status"], "error")
+        self.assertEqual(db.row("SELECT ok FROM account_status WHERE email = ?", self.email)["ok"], 1)   # session intacte
+        return app["next_attempt_at"] - app["last_attempt_at"]
+
+    def test_minus_80045_and_429_wait_hours_a_503_does_not(self):
+        hours = renew.APPLE_BACKOFF_MINUTES * 60
+        self.assertGreaterEqual(self.wait_after_failure("apple_refused"), hours)
+        self.assertGreaterEqual(self.wait_after_failure("apple_rate_limited"), hours)
+        usual = self.wait_after_failure("apple_503")
+        self.assertAlmostEqual(usual, renew.RETRY_MINUTES * 60, delta=30)
+        self.assertLess(usual, hours)
+
+
 class AnisetteDiagnostic(AnisetteCase):
     WINDOWS = {"client_info": "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iTunes/12.12.4.1)>",
                "user_agent": "akd/1.0 CFNetwork/808.1.4"}
@@ -584,11 +683,47 @@ class AnisetteDiagnostic(AnisetteCase):
         self.assertEqual(r["status"], "error")
         self.assertNotIn(settings.FALLBACK_ANISETTE, r["detail"])
 
-    def test_a_server_that_is_not_windows_is_flagged(self):
+    def test_a_server_that_is_not_windows_is_an_error_because_plumesign_refuses_it(self):
         settings.raw_set("anisette_url", "https://anisette.example.org")
         r = self.check({"https://anisette.example.org": (self.MAC, "")})
-        self.assertEqual(r["status"], "warn")
+        self.assertEqual(r["status"], "error")
         self.assertIn("Windows", r["detail"])
+        self.assertIn("n'utilisera pas", r["detail"])
+
+    def test_an_odd_answer_never_raises(self):
+        for odd in ({"client_info": 42}, {"client_info": ["Windows"]}, {"client_info": None}, {}, []):
+            self.assertFalse(diag._windows(odd), odd)
+        self.assertTrue(diag._windows(self.WINDOWS))
+        self.assertFalse(diag._windows(None))
+        # the check itself refuses such an answer before it gets that far
+        import io
+        import urllib.request
+
+        class Answer(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        saved = urllib.request.urlopen
+        urllib.request.urlopen = lambda *a, **k: Answer(b'{"client_info": 42, "user_agent": "x"}')
+        try:
+            data, error = diag._client_info("https://anisette.example.org")
+        finally:
+            urllib.request.urlopen = saved
+        self.assertIsNone(data)
+        self.assertIn("anisette", error)
+
+    def test_the_default_server_asked_explicitly_keeps_its_fallback(self):
+        # plumesign does the same with PLUMESIGN_ANISETTE_URL=https://ani.jkcoxson.com
+        for value in (settings.DEFAULT_ANISETTE, settings.DEFAULT_ANISETTE + "/", settings.DEFAULT_ANISETTE.upper()):
+            settings.raw_set("anisette_url", value)
+            self.assertEqual(settings.anisette_servers(), [settings.DEFAULT_ANISETTE, settings.FALLBACK_ANISETTE], value)
+        settings.raw_set("anisette_url", settings.FALLBACK_ANISETTE)
+        self.assertEqual(settings.anisette_servers(), [settings.FALLBACK_ANISETTE])    # a chosen server is alone
+        r = self.check({settings.FALLBACK_ANISETTE: (self.WINDOWS, "")})
+        self.assertEqual(r["status"], "ok")
 
 
 FAKE_PLUMESIGN = r'''
@@ -740,6 +875,54 @@ class LoginSession(unittest.TestCase):
         self.assertIn("anisette", self.logged[-1][1])
 
 
+def web_causes() -> list[tuple]:
+    """Les règles CAUSES de web/app.js (expression, clé), lues dans le fichier : les expressions simples de
+    JavaScript sont aussi des expressions régulières de Python."""
+    js = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+    start = js.index("const CAUSES = [")
+    block = js[start:js.index("\n];", start)]
+    rules = []
+    for m in re.finditer(r'^\s*\[/(.+)/([a-z]*), "(c_[a-z0-9_]+)"\],?\s*$', block, re.M):
+        rules.append((re.compile(m.group(1), re.I if "i" in m.group(2) else 0), m.group(3)))
+    return rules
+
+
+def web_cause(text: str) -> str | None:
+    return next((key for rx, key in web_causes() if rx.search(text)), None)
+
+
+class WebCauses(unittest.TestCase):
+    """Le message qu'affiche l'interface pour une erreur : celui de plumesign, et celui que tvsign en fait."""
+
+    def test_the_rules_are_all_read(self):
+        keys = [key for _, key in web_causes()]
+        self.assertGreater(len(keys), 20)
+        for key in ("c_apple_blocked", "c_rate_limited", "c_gsa_503", "c_anisette_unsupported", "c_session"):
+            self.assertIn(key, keys)
+
+    def test_what_plumesign_writes(self):
+        for output, key in ((SRP_80045, "c_apple_blocked"), (GSA_503, "c_gsa_503"), (PORTAL_503, "c_gsa_503"),
+                            (PROVISIONING_503, "c_gsa_503"), (GSA_429, "c_rate_limited"),
+                            (PORTAL_429, "c_rate_limited"), (SMS_403, "c_sms_denied"),
+                            (NEVER_SIGNED_IN, "c_never_signed_in"), (NOT_WINDOWS, "c_anisette_unsupported"),
+                            (NOT_WINDOWS_BOTH, "c_anisette_unsupported"), (SYNC_22421, "c_anisette_refused"),
+                            (NOT_PROVISIONED, "c_anisette_refused"), (PORTAL_1100, "c_session")):
+            self.assertEqual(web_cause(output), key, output)
+
+    def test_what_tvsign_says_about_it(self):
+        for kind, key in (("apple_refused", "c_apple_blocked"), ("apple_rate_limited", "c_rate_limited"),
+                          ("apple_503", "c_gsa_503"), ("sms_denied", "c_sms_denied"),
+                          ("never_signed_in", "c_never_signed_in"), ("anisette_unsupported", "c_anisette_unsupported"),
+                          ("anisette_refused", "c_anisette_refused"), ("anisette_reprovision", "c_anisette_refused")):
+            self.assertEqual(web_cause(plume.explain(kind, "Error: x")), key, kind)
+
+    def test_every_cause_of_the_rules_has_a_title_and_an_advice(self):
+        i18n = (ROOT / "web" / "i18n.js").read_text(encoding="utf-8")
+        for _, key in web_causes():
+            for suffix in ("_t", "_a"):
+                self.assertIn(f"  {key}{suffix}: [", i18n, key + suffix)
+
+
 class DocumentationMatchesDefaults(unittest.TestCase):
     """Les textes de l'interface et le README disent le même serveur par défaut que le code."""
 
@@ -762,7 +945,8 @@ class DocumentationMatchesDefaults(unittest.TestCase):
 
     def test_every_new_cause_is_translated(self):
         i18n = (ROOT / "web" / "i18n.js").read_text(encoding="utf-8")
-        for key in ("c_apple_blocked", "c_gsa_503", "c_sms_denied", "c_never_signed_in", "c_anisette_refused"):
+        for key in ("c_apple_blocked", "c_gsa_503", "c_rate_limited", "c_sms_denied", "c_never_signed_in",
+                    "c_anisette_unsupported", "c_anisette_refused"):
             for suffix in ("_t", "_a"):
                 self.assertIn(f"  {key}{suffix}: [", i18n, key + suffix)
         self.assertIn("prompt_device_sms_denied", i18n)

@@ -208,7 +208,15 @@ def anisette_url() -> str:
     return get("anisette_url")
 
 
+def same_server(a: str, b: str) -> bool:
+    """Même adresse de serveur, à la casse et à la barre finale près (comme plumesign)."""
+    return a.strip().rstrip("/").lower() == b.strip().rstrip("/").lower()
+
+
 def anisette_servers() -> list[str]:
-    """Serveurs que plumesign essaiera, dans l'ordre."""
+    """Serveurs que plumesign essaiera, dans l'ordre. Comme lui : le réglage vide, ou l'adresse par défaut
+    saisie telle quelle, donne le serveur par défaut et son repli ; tout autre serveur est utilisé seul."""
     custom = anisette_url()
-    return [custom] if custom else [DEFAULT_ANISETTE, FALLBACK_ANISETTE]
+    if custom and not same_server(custom, DEFAULT_ANISETTE):
+        return [custom]
+    return [DEFAULT_ANISETTE, FALLBACK_ANISETTE]

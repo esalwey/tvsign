@@ -92,9 +92,11 @@ const CAUSES = [
   [/compte .*(introuvable|retiré)|account .*not found/i, "c_account_missing"],
   // refus d'Apple et problèmes d'anisette précis : avant les règles générales (anisette, session)
   [/-80045|cannot be completed at this time/i, "c_apple_blocked"],
-  [/(GrandSlam|GSA) (answered|returned) HTTP (429|50[234])|Apple answered HTTP (429|50[234]) to the anisette|Apple répond HTTP (429|50[234])|50[234] Service Temporarily Unavailable/i, "c_gsa_503"],
+  [/(GrandSlam|GSA|developer services) (answered|returned) HTTP 429|Apple answered HTTP 429 to the anisette|Apple limite le nombre de requêtes|Too Many Requests/i, "c_rate_limited"],
+  [/(GrandSlam|GSA|developer services) (answered|returned) HTTP 50[234]|Apple answered HTTP 50[234] to the anisette|Apple répond HTTP 50[234]|50[234] Service Temporarily Unavailable/i, "c_gsa_503"],
   [/SMS 2FA refused|Access to this Apple Developer Service was denied|refuse les codes par SMS/i, "c_sms_denied"],
   [/-22411\b/, "c_never_signed_in"],
+  [/only accepts Windows anisette|ne fournit pas de données Windows/i, "c_anisette_unsupported"],
   [/-22421\b|-22409\b|-80009\b|MID is invalid|-45061|not provisioned/i, "c_anisette_refused"],
   [/anisette/i, "c_anisette"],
   [/reconnexion|-22406|HTTP Some\(401\)|unauthori[sz]ed|session .*(expir|invalid)|not logged|log ?in required/i, "c_session"],

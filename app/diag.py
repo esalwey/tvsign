@@ -97,13 +97,17 @@ def _client_info(url: str) -> tuple[dict | None, str]:
         return None, f"HTTP {e.code}"
     except Exception as e:  # noqa: BLE001
         return None, str(getattr(e, "reason", e))
-    if not isinstance(data, dict) or not data.get("client_info"):
+    info = data.get("client_info") if isinstance(data, dict) else None
+    if not isinstance(info, str) or not info.strip():
         return None, "réponse inattendue (ce n'est pas un serveur anisette v3 ?)"
     return data, ""
 
 
 def _windows(data: dict | None) -> bool:
-    return bool(data) and "windows" in data["client_info"].lower()
+    """Le serveur annonce des données Windows. Un client_info qui n'est pas du texte (réponse JSON étrange)
+    ne l'est pas : jamais d'exception ici, le diagnostic doit toujours répondre."""
+    info = data.get("client_info") if isinstance(data, dict) else None
+    return isinstance(info, str) and "windows" in info.lower()
 
 
 async def _anisette() -> dict:
@@ -123,9 +127,10 @@ async def _anisette() -> dict:
             return _check("anisette", "warn", f"{first_url} inutilisable ({why}) : repli sur {url}", url)
         return _check("anisette", "ok", f"{url} : {data['client_info']}", url)
     if data:
-        return _check("anisette", "warn",
-                      f"{url} répond « {data['client_info']} » : Apple n'accepte que des données Windows "
-                      "(laisser le réglage vide pour le serveur par défaut)", url)
+        # plumesign refuse un tel serveur sans rien envoyer à Apple : les renouvellements échoueront
+        return _check("anisette", "error",
+                      f"{url} répond « {data['client_info']} » : Apple n'accepte que des données Windows, "
+                      "plumesign n'utilisera pas ce serveur (laisser le réglage vide pour le serveur par défaut)", url)
     return _check("anisette", "error", " ; ".join(f"{u} : {e or 'données non Windows'}" for u, _, e in found), url)
 
 

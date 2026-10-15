@@ -215,26 +215,33 @@ def _errors(output: str) -> str:
 # Refus d'Apple qui ne disent rien de la session et qu'il ne sert à rien de répéter :
 # - -80045 « This action cannot be completed at this time » : refus de l'ouverture de session (SRP init),
 #   côté compte ou adresse IP, même avec des données anisette Windows valides ;
+# - HTTP 429 : trop de requêtes, Apple demande de ralentir ;
 # - HTTP 503 (page HTML) : données anisette ou identité d'appareil refusées (serveur Android, identité
-#   périmée), ou charge momentanée du serveur d'Apple ; HTTP 429 : trop de requêtes.
+#   périmée), ou charge momentanée du serveur d'Apple. Les services développeur (« Apple developer services »)
+#   répondent comme GrandSlam.
 _APPLE_REFUSED = re.compile(r"-80045\b|cannot be completed at this time", re.I)
-_APPLE_503 = re.compile(r"(GrandSlam|GSA) (answered|returned) HTTP (429|50[234])|"
-                        r"Apple answered HTTP (429|50[234]) to the anisette|"
-                        r"50[234] (Service Temporarily Unavailable|Bad Gateway|Gateway Time-?out)|"
-                        r"Too Many Requests", re.I)
+_APPLE_429 = re.compile(r"(GrandSlam|GSA|developer services) (answered|returned) HTTP 429|"
+                        r"Apple answered HTTP 429 to the anisette|Too Many Requests", re.I)
+_APPLE_503 = re.compile(r"(GrandSlam|GSA|developer services) (answered|returned) HTTP 50[234]|"
+                        r"Apple answered HTTP 50[234] to the anisette|"
+                        r"50[234] (Service Temporarily Unavailable|Bad Gateway|Gateway Time-?out)", re.I)
 # Envoi ou contrôle d'un code par SMS refusé (HTTP 403 « Access to this Apple Developer Service was denied »)
 _SMS_DENIED = re.compile(r"SMS 2FA refused|Access to this Apple Developer Service was denied", re.I)
 # -22411 : Apple ID jamais utilisé sur un appareil Apple
 _NEVER_SIGNED_IN = re.compile(r"-22411\b")
+# Serveur anisette qui ne fournit pas de données Windows : plumesign ne l'utilise pas (Apple les refuse)
+_ANISETTE_UNSUPPORTED = re.compile(r"only accepts Windows anisette", re.I)
 # -22421 (hsc 434), -22409, -80009 : données anisette désynchronisées ou refusées ;
-# -45061 : identité anisette non provisionnée (plumesign la provisionne de nouveau tout seul)
+# -45061 : identité anisette non provisionnée (plumesign en refait une toute seule)
 _ANISETTE_REFUSED = re.compile(r"-22421\b|-22409\b|-80009\b|MID is invalid", re.I)
 _REPROVISION = re.compile(r"-45061\b|Anisette not provisioned", re.I)
 
-# Ce qu'il faut faire d'une erreur : « apple_refused » (-80045) attend longtemps, Apple limite les essais ;
-# « apple_503 » et « anisette_* » sont réessayées à l'allure habituelle ; « sms_denied » et
-# « never_signed_in » demandent une action de l'utilisateur (aucun essai automatique n'y change rien).
-USER_KINDS = frozenset({"sms_denied", "never_signed_in"})
+# Ce qu'il faut faire d'une erreur : « apple_refused » (-80045) et « apple_rate_limited » (429) attendent
+# longtemps, Apple limite les essais ; « apple_503 » et « anisette_* » sont réessayées à l'allure habituelle ;
+# « sms_denied », « never_signed_in » et « anisette_unsupported » demandent une action de l'utilisateur
+# (aucun essai automatique n'y change rien).
+USER_KINDS = frozenset({"sms_denied", "never_signed_in", "anisette_unsupported"})
+SLOW_KINDS = frozenset({"apple_refused", "apple_rate_limited"})
 
 
 def classify(output: str) -> str | None:
@@ -242,9 +249,10 @@ def classify(output: str) -> str | None:
     Jamais « session expirée » : ces erreurs ne disent rien de l'état de la session.
     Les lignes de journal (repli sur un autre serveur, nouvel essai…) ne comptent pas : seule l'erreur finale."""
     output = _errors(output)
-    for kind, rx in (("apple_refused", _APPLE_REFUSED), ("apple_503", _APPLE_503), ("sms_denied", _SMS_DENIED),
-                     ("never_signed_in", _NEVER_SIGNED_IN), ("anisette_refused", _ANISETTE_REFUSED),
-                     ("anisette_reprovision", _REPROVISION)):
+    for kind, rx in (("apple_refused", _APPLE_REFUSED), ("apple_rate_limited", _APPLE_429),
+                     ("apple_503", _APPLE_503), ("sms_denied", _SMS_DENIED),
+                     ("never_signed_in", _NEVER_SIGNED_IN), ("anisette_unsupported", _ANISETTE_UNSUPPORTED),
+                     ("anisette_refused", _ANISETTE_REFUSED), ("anisette_reprovision", _REPROVISION)):
         if rx.search(output):
             return kind
     return None
@@ -286,8 +294,9 @@ class Transient(RuntimeError):
 
 
 class AppleRefused(RuntimeError):
-    """Apple refuse la requête (-80045, HTTP 503/429). Avec -80045 (kind « apple_refused ») Apple limite
-    les essais : pas de nouvel essai rapproché, ça prolongerait le blocage (voir renew._retry_at)."""
+    """Apple refuse la requête (-80045, HTTP 503/429). Avec -80045 (kind « apple_refused ») et 429
+    (« apple_rate_limited ») Apple limite les essais : pas de nouvel essai rapproché, ça prolongerait le
+    blocage (voir renew._retry_at)."""
 
     def __init__(self, message: str, kind: str = "apple_refused"):
         super().__init__(message)
@@ -295,7 +304,7 @@ class AppleRefused(RuntimeError):
 
     @property
     def slow(self) -> bool:
-        return self.kind == "apple_refused"
+        return self.kind in SLOW_KINDS
 
 
 ANISETTE_STATE = "anisette-state-windows.plist"      # identité anisette de plumesign (voir PATCHES.md)
@@ -325,7 +334,7 @@ def _failure(email: str, what: str, res: Result) -> RuntimeError:
     """Erreur d'une commande plumesign du compte, classée : session expirée (bouton Reconnecter),
     refus d'Apple (attendre), passagère (anisette, réseau), ou autre."""
     kind = classify(res.output)
-    if kind in ("apple_refused", "apple_503"):
+    if kind in ("apple_refused", "apple_rate_limited", "apple_503"):
         return AppleRefused(f"{what} : {_why(res)}", kind)
     if kind in USER_KINDS:
         return RuntimeError(f"{what} : {_why(res)}")
@@ -349,17 +358,24 @@ def explain(kind: str | None, detail: str = "") -> str | None:
         return ("Apple refuse temporairement la connexion (erreur -80045, côté compte ou réseau) : n'insiste pas, "
                 "Apple limite les essais et chaque nouvel essai peut prolonger le blocage ; attends plusieurs "
                 f"heures{tail}")
+    if kind == "apple_rate_limited":
+        return ("Apple limite le nombre de requêtes (HTTP 429) : n'insiste pas, tvsign attend plusieurs heures "
+                f"avant de réessayer{tail}")
     if kind == "apple_503":
         return ("Apple répond HTTP 503 : données anisette refusées (serveur anisette Android ?) ou serveur d'Apple "
-                f"surchargé, l'essai suivant est espacé{tail}")
+                f"surchargé ; nouvel essai automatique plus tard{tail}")
     if kind == "sms_denied":
         return f"Apple refuse les codes par SMS : utilise le code d'un appareil Apple de confiance{tail}"
     if kind == "never_signed_in":
         return f"Apple refuse cet Apple ID (-22411) : il n'a jamais été connecté sur un appareil Apple{tail}"
+    if kind == "anisette_unsupported":
+        return ("le serveur anisette choisi ne fournit pas de données Windows, les seules qu'Apple accepte depuis le "
+                "12 octobre 2026 : laisse le réglage vide (serveur par défaut) ou choisis un serveur qui en fournit"
+                f"{tail}")
     if kind == "anisette_refused":
         return f"Apple refuse les données anisette (-22421/-22409) : identité anisette à réinitialiser{tail}"
     if kind == "anisette_reprovision":
-        return f"identité anisette invalide (-45061), provisionnée de nouveau automatiquement{tail}"
+        return f"identité anisette invalide (-45061), refaite automatiquement{tail}"
     return None
 
 
