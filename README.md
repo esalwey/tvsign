@@ -250,6 +250,8 @@ never put it in a synced or network-shared folder in clear.
   Renewals and the web interface pause while it runs. The previous state is kept aside for 30 days.
 - The archive is **not encrypted**. On Windows the browser's Downloads folder is often synced by
   OneDrive: choose a folder that is not, or move the file to a safe place right away.
+- Imported certificates (see *Signing with an imported certificate*) are not in the archive unless
+  you tick *Include imported certificates and their private keys*.
 - Or back up the whole data folder with the container stopped (Hyper Backup, Appdata Backup, restic…).
 - Never run the old and the new instance at the same time after a move.
 
@@ -315,6 +317,8 @@ The full guide (French) is [windows/README-windows.md](windows/README-windows.md
 - Notification secrets (webhook addresses, bot and access tokens, ntfy passwords) are stored in the
   database, are never sent back by the API (shown as `********`) and are masked in logs, the support
   bundle and error messages. Notifications are plain POSTs that never follow redirects.
+- Imported certificates (an advanced, optional route) are stored encrypted and never returned by the
+  API; see *Signing with an imported certificate*.
 
 ### Configuration
 
@@ -498,6 +502,37 @@ Xcode) count too. tvsign shows "active apps 2/3" per Apple TV on the account car
 you add a fourth. When Apple or the Apple TV refuses ("maximum number of installed apps…"), the
 app shows **Action needed** with the explanation and tvsign waits 24 hours instead of using up more
 App IDs. Free a slot (**Pause** an app, or remove it from the Apple TV) then press **Renew**.
+
+### Signing with an imported certificate (advanced)
+
+The free Apple ID is the default and the recommended route. If you already hold a signing certificate
+and its provisioning profile, from your own Apple Developer account or from a provider you chose
+yourself, an app can use them instead: app settings → **Advanced** → *Method* → *Imported
+certificate*. tvsign does not recommend or contact any service.
+
+- Import a `.p12` (with its password) and a `.mobileprovision` **for the app's device**. Nothing is
+  saved until every check passes: neither file expired, the profile made for tvOS (Apple TV) or iOS
+  (iPhone, iPad), the device's UDID listed in the profile (or an enterprise profile), the certificate
+  one of the profile's, and the app's identifier covered by it (a wildcard profile such as `*` or
+  `com.example.*`, or one made for exactly this app; an app with extensions needs a wildcard).
+  Each refusal says what is wrong.
+- A certificate belongs to one device and signs any app its profile covers. Each app chooses *Apple
+  ID* or an imported certificate. The free-account limits (3 apps per Apple TV…) do not count these apps.
+- **No 7-day renewal.** The app is signed again only to install a new version (or when you press
+  **Renew**) and stays valid until the certificate or the profile ends, whichever comes first. You
+  are warned (notification, tray, journal) **7 days** and **1 day** before, and when it ends;
+  importing a new certificate as *Replaces…* signs the apps again at once.
+- **Revocation.** Every 12 hours tvsign asks Apple's OCSP responder about the certificates that apps
+  use (`TVSIGN_CERT_CHECK_HOURS`, 0 = never; only `*.apple.com` is contacted) and recognises a device
+  refusing a revoked identity at install time. The app then shows **Action needed** with the reason
+  and one alert is sent. A check that gets no answer concludes nothing.
+- The key and the profile are kept encrypted (AES-256-GCM) in `certs/` of the data folder, the key
+  in `vault.key`, both readable by the tvsign user only; the `.p12` and its password are not kept.
+  **Backups leave them out** unless you tick *Include imported certificates and their private keys*
+  at export (the archive then holds the keys in clear, like the Apple session). The support bundle
+  never contains them.
+- Switching an app from one route to the other installs it under another identifier (the free route
+  adds the team to it): the previous copy stays on the device until you delete it.
 
 ### Several anisette servers
 
@@ -793,6 +828,8 @@ partager, à ne jamais mettre en clair dans un dossier synchronisé ou partagé 
   L'état précédent est gardé à côté pendant 30 jours.
 - L'archive **n'est pas chiffrée**. Sous Windows, le dossier Téléchargements du navigateur est souvent
   synchronisé par OneDrive : choisir un dossier qui ne l'est pas, ou déplacer le fichier aussitôt.
+- Les certificats importés (voir *Signature avec un certificat importé*) ne sont pas dans l'archive,
+  sauf si vous cochez *Inclure les certificats importés et leurs clés privées*.
 - Ou sauvegarder tout le dossier de données, conteneur arrêté (Hyper Backup, Appdata Backup, restic…).
 - Après un déménagement, ne jamais faire tourner l'ancienne et la nouvelle instance en même temps.
 
@@ -864,6 +901,8 @@ Le guide complet est [windows/README-windows.md](windows/README-windows.md).
   sont stockés dans la base, jamais renvoyés par l'API (affichés `********`) et masqués dans les
   journaux, le dossier de support et les messages d'erreur. Les notifications sont de simples POST qui
   ne suivent jamais une redirection.
+- Les certificats importés (voie avancée et facultative) sont stockés chiffrés et jamais renvoyés par
+  l'API ; voir *Signature avec un certificat importé*.
 
 ### Configuration
 
@@ -1069,6 +1108,39 @@ sur la carte du compte et prévient à l'ajout d'une quatrième. Quand Apple ou 
 (« maximum number of installed apps… »), l'app affiche **Action requise** avec l'explication et
 tvsign attend 24 heures au lieu d'épuiser d'autres App ID. Libérez une place (**Pause** d'une app,
 ou suppression sur l'Apple TV) puis touchez **Renouveler**.
+
+### Signature avec un certificat importé (avancé)
+
+L'Apple ID gratuit reste la voie par défaut et conseillée. Si vous avez déjà un certificat de
+signature et son profil de provisionnement, issus de votre propre compte Apple Developer ou d'un
+fournisseur de votre choix, une app peut les utiliser à la place : réglages de l'app → **Avancé** →
+*Méthode* → *Certificat importé*. tvsign ne recommande ni ne contacte aucun service.
+
+- Importez un `.p12` (avec son mot de passe) et un `.mobileprovision` **pour l'appareil de l'app**.
+  Rien n'est enregistré avant que toutes les vérifications passent : aucun des deux fichiers expiré,
+  profil fait pour tvOS (Apple TV) ou iOS (iPhone, iPad), UDID de l'appareil dans le profil (ou profil
+  d'entreprise), certificat figurant dans le profil, identifiant de l'app couvert par celui-ci (profil
+  à joker comme `*` ou `com.exemple.*`, ou fait pour cette app précisément ; une app avec extensions
+  demande un joker). Chaque refus dit ce qui ne va pas.
+- Un certificat appartient à un appareil et signe toute app que son profil couvre. Chaque app choisit
+  *Apple ID* ou un certificat importé. Les limites du compte gratuit (3 apps par Apple TV…) ne
+  comptent pas ces apps.
+- **Pas de renouvellement tous les 7 jours.** L'app n'est signée à nouveau que pour installer une
+  nouvelle version (ou en touchant **Renouveler**) et reste valable jusqu'à la fin du certificat ou du
+  profil, la plus proche des deux. Vous êtes prévenu (notification, icône, journal) **7 jours** et
+  **1 jour** avant, puis à la fin ; importer un nouveau certificat avec *Remplace…* signe aussitôt les
+  apps à nouveau.
+- **Révocation.** Toutes les 12 heures, tvsign interroge le serveur OCSP d'Apple pour les certificats
+  que des apps utilisent (`TVSIGN_CERT_CHECK_HOURS`, 0 = jamais ; seul `*.apple.com` est contacté) et
+  reconnaît le refus d'une identité révoquée par l'appareil à l'installation. L'app affiche alors
+  **Action requise** avec la raison et une alerte part. Un contrôle sans réponse ne conclut rien.
+- La clé et le profil sont gardés chiffrés (AES-256-GCM) dans `certs/` du dossier de données, la clé
+  dans `vault.key`, lisibles par le seul utilisateur de tvsign ; le `.p12` et son mot de passe ne sont
+  pas gardés. **Les sauvegardes les laissent de côté** sauf si vous cochez *Inclure les certificats
+  importés et leurs clés privées* à l'export (l'archive contient alors les clés en clair, comme la
+  session Apple). Le dossier de support ne les contient jamais.
+- Passer une app d'une voie à l'autre l'installe sous un autre identifiant (la voie gratuite y ajoute
+  l'équipe) : l'ancien exemplaire reste sur l'appareil jusqu'à ce que vous le supprimiez.
 
 ### Plusieurs serveurs anisette
 
