@@ -489,7 +489,7 @@ class Targets(unittest.TestCase):
 
     def test_message_catalogue_is_complete_and_formats(self):
         params = dict(name="N", reason="r", h=6, until="u", tag="t", why="w", version="v", notes="", prev="p",
-                      email="e@x.y", need="26.0", have="18.4")
+                      email="e@x.y", need="26.0", have="18.4", system="tvOS", who="l'Apple TV", times=3)
         for key in notifier.MESSAGES:
             for lang in ("fr", "en"):
                 self.assertTrue(notifier.text(key, lang, **params), (key, lang))

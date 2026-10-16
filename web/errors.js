@@ -5,7 +5,7 @@
 // Le serveur renvoie un code stable (« code » ou « code:paramètre »), ou {champ: code} pour les réglages.
 // Un texte libre (message de plumesign, d'un téléchargement…) passe par les causes connues ci-dessous.
 // Réglage (clé de l'API) -> libellé du champ affiché, pour qu'une erreur de validation parle comme le formulaire.
-const LIBELLE_REGLAGE = { language: "language", renew_before_hours: "renew_before", anisette_url: "anisette_server",
+const LIBELLE_REGLAGE = { language: "language", renew_before_hours: "renew_before", renew_before_hours_mobile: "renew_before_mobile", anisette_url: "anisette_server",
   renew_window_start: "set_lbl_renew_window_start", renew_window_end: "set_lbl_renew_window_end",
   update_check: "update_check" };
 const libelleReglage = (k) => (k === "ntfy_url" ? "ntfy" : LIBELLE_REGLAGE[k] ? t(LIBELLE_REGLAGE[k]) : k);
@@ -41,14 +41,19 @@ const CAUSES = [
   [/recherche des Apple TV/i, "c_discover_failed"],
   [/arrêté par le système|killed by the system/i, "c_oom"],
   [/ntfy|notification .*échouée|notify_failed/i, "c_ntfy"],
-  [/maximum number of (installed )?(apps|app ?ids?)|too many (installed )?(apps|app ?ids?)|app ?id limit|limit of \d+ (apps|app ?ids)|limite du compte gratuit|reached the maximum number/i, "c_limit"],
+  [/maximum number of (installed )?(apps|app ?ids?)|too many (installed )?(apps|app ?ids?)|app ?id limit|limit of \d+ (apps|app ?ids)|limite du compte gratuit|free developer profile|reached the maximum number/i, "c_limit"],
   [/limite de requêtes GitHub|rate limit exceeded/i, "c_gh_rate"],
   [/jeton GitHub refusé/i, "c_gh_token"],
   [/dépôt GitHub introuvable/i, "c_gh_missing"],
-  [/demande tvOS/i, "c_tvos"],
+  [/demande (tvOS|iOS|iPadOS)/i, "c_tvos"],
+  [/seules les apps (tvOS|iPhone)|réservée à l'iPad|pas encore pris en charge/i, "c_platform"],
   [/aucune IPA trouvée/, "c_no_release"],
   [/8220|no devices from which/i, "c_8220"],
   [/ancienne version de tvsign/i, "c_legacy"],
+  [/usbmuxd is not reachable/i, "c_usbmuxd"],
+  [/No (iPhone or iPad|device \S+) connected over USB/i, "c_usb_none"],
+  [/\d+ devices are connected over USB/i, "c_usb_many"],
+  [/offers no tunnel service|iOS 17 or later is required/i, "c_ios17"],
   [/appairage perdu|appairage absent|PAIRING_LOST|pairing record|not paired|No stored pairing/i, "c_lost"],
   [/aucune Apple TV/i, "c_no_tv"],
   [/aucun compte Apple/i, "c_no_account"],
@@ -65,6 +70,9 @@ const CAUSES = [
   [/anisette/i, "c_anisette"],
   [/reconnexion|-22406|HTTP Some\(401\)|unauthori[sz]ed|session .*(expir|invalid)|not logged|log ?in required/i, "c_session"],
   [/plumesign occupé/i, "c_busy"],
+  // iPhone / iPad : verrouillé ou occupé (iOS remplace une app ouverte), à tester avant « app ouverte » des Apple TV
+  [/verrouillé depuis son démarrage|locked since (boot|it started)/i, "c_locked"],
+  [/l'installation n'avance plus|installation bloquée à \d+ % depuis \d+ min \(appareil/i, "c_stalled"],
   [/ouverte sur l'Apple TV|app ouverte sur la TV|installd ne progresse plus|installation (bloquée|en attente)/i, "c_app_open"],
   [/n'est plus installée|n'apparaît pas dans les apps/i, "c_not_installed"],
   [/plumesign trop ancien/i, "c_plumesign_old"],
@@ -193,7 +201,7 @@ function evenementTexte(message) {
 }
 // déclencheurs enregistrés par le serveur (en français) -> libellé traduit
 const declencheur = (x) => ({ auto: t("tr_auto"), manuel: t("tr_manual"), ajout: t("tr_added"), "nouvelle version": t("tr_new_version"),
-  "nouvelle source": t("tr_new_source"), "nouvelle destination": t("tr_new_dest"), "nouvelle IPA": t("tr_new_ipa"),
+  "nouvelle source": t("tr_new_source"), "nouvelle destination": t("tr_new_dest"), "présence": t("tr_presence"), "nouvelle IPA": t("tr_new_ipa"),
   "mise à jour": t("tr_update"), "retour arrière": t("tr_rollback"), reconnexion: t("tr_reconnect"), appairage: t("tr_paired"),
   "nouvel appairage": t("tr_repaired"), "app absente": t("tr_missing") }[x] || x);
 

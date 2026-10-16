@@ -7,6 +7,7 @@
   <img alt="Docker amd64 / arm64" src="https://img.shields.io/badge/docker-amd64%20%C2%B7%20arm64-2f6bff?style=flat-square&logo=docker&logoColor=white">
   <img alt="Windows 10 / 11" src="https://img.shields.io/badge/windows-10%20%C2%B7%2011-111318?style=flat-square">
   <img alt="tvOS 26+" src="https://img.shields.io/badge/tvOS-26%2B-000?style=flat-square&logo=apple">
+  <img alt="iOS / iPadOS 17+" src="https://img.shields.io/badge/iOS%20%C2%B7%20iPadOS-17%2B-000?style=flat-square&logo=apple">
   <a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-555?style=flat-square"></a>
 </p>
 
@@ -22,6 +23,7 @@ tvsign keeps sideloaded tvOS apps alive on your Apple TVs. Apps signed with a fr
 after 7 days; tvsign re-signs them with your own Apple ID and reinstalls them over Wi-Fi/Ethernet
 before they expire, and installs new releases of the apps you follow (GitHub releases, a link, or
 an uploaded `.ipa`). Everything runs on your own machine, managed from a small web interface.
+iPhones and iPads (iOS / iPadOS 17+) work the same way: see [iPhone and iPad](#iphone-and-ipad).
 
 Two editions share the same code:
 
@@ -52,8 +54,10 @@ host or distribute any app content.
 - A correct clock (NTP).
 - Not supported: Docker Desktop on Windows/macOS (use the Windows edition), 32-bit ARM, TrueNAS CORE.
 
-No `NET_ADMIN`, no `/dev/net/tun`, no IPv6 and no root are needed: the encrypted tunnel to the
-Apple TV runs entirely in user space inside `plumesign`. The server runs as an unprivileged user.
+No `NET_ADMIN`, no `/dev/net/tun` and no root are needed: the encrypted tunnel to the device runs
+entirely in user space inside `plumesign`. The server runs as an unprivileged user. An Apple TV needs
+no IPv6; an iPhone or iPad may announce itself with a link-local IPv6 address only (see
+[iPhone and iPad](#iphone-and-ipad)).
 
 ### Install
 
@@ -115,9 +119,9 @@ bridge of the TV's LAN, not a NATed network. Unprivileged LXC is fine: no TUN de
 2. Enter the **setup code** from `docker compose logs tvsign` (also in `<data>/setup-code.txt`) and
    choose the admin password. `TVSIGN_PASSWORD_FILE` can preset it instead.
 3. The wizard then walks through: language (or **restore a backup**), environment checks, Apple ID
-   sign-in (a dedicated free Apple ID is recommended; the password is never stored), Apple TV pairing
-   (on the TV: Settings › Remotes and Devices › Remote App and Devices, then type the PIN), and the
-   app to keep installed.
+   sign-in (a dedicated free Apple ID is recommended; the password is never stored), device pairing
+   (Apple TV: Settings › Remotes and Devices › Remote App and Devices, then type the PIN; iPhone / iPad:
+   see below), and the app to keep installed.
 
 The wizard says "all set" only once the first install has actually succeeded; until then it shows
 the live state of the install (and the reason if it failed). Signing **revokes the certificate
@@ -170,6 +174,66 @@ multicast, and whether the TV still answers directly.
 - The UI warns when it is served over plain `http://` on the network: the Apple ID password and
   codes then travel unencrypted. Use a VPN or an HTTPS reverse proxy (see Security). Added to a
   phone's home screen, the page opens like an app (manifest and icon included).
+
+### iPhone and iPad
+
+iPhones and iPads (**iOS / iPadOS 17 or later**) are kept alive like an Apple TV: tvsign signs with
+your Apple ID and reinstalls over Wi-Fi before the 7 days are up. **Status: new. The renewal path is
+the Apple TV one (same tunnel, same installer), but the one-time USB pairing step has not been
+validated on every device and iOS release yet: treat it as experimental and report what you see.**
+
+**One-time setup, per device**
+
+1. **Pair once.** An iPhone shows no PIN screen like an Apple TV, so the pairing keys are created over
+   USB (`plumesign pair usb`). After that every renewal runs over Wi-Fi.
+   - *Windows edition:* plug the device in, unlock it, tap **Trust**, then Pair › iPhone / iPad ›
+     **Pair over USB**. This needs Apple's USB driver (Apple Mobile Device Service): install iTunes or
+     the Apple Devices app from the Microsoft Store; tvsign does not bundle it.
+   - *Docker:* the container has no USB on purpose (host networking only, no devices, no root).
+     Pair on any computer that has usbmuxd (Windows with iTunes / Apple Devices, macOS, Linux with the
+     `usbmuxd` package) with `plumesign pair usb` (`plumesign.exe` sits in the Windows edition's install
+     folder; other systems: build it from `vendor/Impactor`, see [docs/building.md](docs/building.md)).
+     Then in tvsign: Pair › iPhone / iPad › **Import a pairing file** and upload the `<UDID>.plist`
+     created in plumesign's `remotepairing` folder (`%APPDATA%\PlumeImpactor\remotepairing` on
+     Windows, `~/.config/PlumeImpactor/remotepairing` elsewhere), **not** the `<UDID>.info.plist` next
+     to it. The UDID is read from the file name (`<UDID>.plist`, `plume_<UDID>.plist`), otherwise
+     type it. A pairing file made by Impactor is accepted too.
+2. **Install a first app** from tvsign. It installs even though Developer Mode is still off, but it
+   may not launch yet.
+3. **Trust the developer** once the app is installed: Settings › General › VPN & Device Management ›
+   your Apple ID › Trust (once per Apple ID). tvsign cannot do it for you.
+4. **Turn on Developer Mode:** Settings › Privacy & Security › Developer Mode, then restart the
+   device. The option does not exist on a device that never ran a signed app, so it only appears
+   after step 2; tvsign cannot reveal or enable it, but shows a banner while it is off.
+
+**What is different from an Apple TV**
+
+- **Away from home is normal.** A phone leaves, sleeps, goes into Low Power Mode. iPhones and iPads
+  renew `TVSIGN_RENEW_BEFORE_HOURS_MOBILE` (96 h) before expiry instead of 60 h (never less than the
+  general setting; a per-device value can be set through the API: `PATCH /api/devices/<id>` with
+  `renew_before_hours`). While an app of a phone is due, tvsign looks for the phone on the network every
+  `TVSIGN_PRESENCE_MINUTES` (3, `0` = off) and renews as soon as it shows up, instead of waiting for the
+  next retry. "Not on the network" and "locked since it started" (unlock it once with its passcode) are
+  transient and notify only when expiry gets close, like a sleeping TV.
+- **No "close the app" wait.** iOS replaces a running app; a stalled install on a phone means a locked,
+  busy or full device.
+- **Network.** The phone only answers Bonjour when awake (screen on or charging helps), and may
+  announce itself with a link-local IPv6 address only: a host with IPv6 disabled (some NAS and Docker
+  setups) may then never see it. Wi-Fi client isolation and VLANs behave as for an Apple TV. There is
+  no guarantee that an idle phone is reachable.
+- **Free account limits** apply to the whole Apple ID, tvOS and iOS apps together: 10 App IDs per
+  7 days (every extension, such as a widget or share sheet, costs one more) and 3 apps installed at a
+  time per device. No push notifications, iCloud or associated domains. tvsign warns when an IPA has
+  extensions or such entitlements (detected when the IPA carries its signature) and shows, per Apple
+  ID, the apps and the estimated App IDs.
+- **Use an Apple ID dedicated to tvsign.** AltStore, SideStore and Sideloadly on the same Apple ID revoke
+  each other's certificates in a loop; tvsign says so after three revocations in 7 days.
+- Releases that ship both an iOS and a tvOS `.ipa` are matched to the device (an iPad-only app is refused
+  on an iPhone, `MinimumOSVersion` is checked against the device).
+
+**Not supported:** iOS / iPadOS 16 and older (no wireless RemotePairing; pre-17 Wi-Fi sync is another
+protocol), Apple Watch, Apple Vision Pro (recognised and refused for now), Mac, and pairing over
+Wi-Fi alone without USB or an imported file.
 
 ### Backups
 
@@ -256,8 +320,9 @@ The full guide (French) is [windows/README-windows.md](windows/README-windows.md
 
 Everything is optional. The main variables: `TZ`, `PUID`, `PGID`, `TVSIGN_PORT` (8765),
 `TVSIGN_HOST` (0.0.0.0), `TVSIGN_PASSWORD_FILE`, `TVSIGN_ALLOWED_HOSTS`, `TVSIGN_NTFY_URL`,
-`TVSIGN_RENEW_BEFORE_HOURS` (60), `TVSIGN_ANISETTE_URL` (empty: `ani.jkcoxson.com`, fallback
-`ani2.stikstore.app`), `TVSIGN_GITHUB_TOKEN`, `TVSIGN_LANGUAGE`.
+`TVSIGN_RENEW_BEFORE_HOURS` (60), `TVSIGN_RENEW_BEFORE_HOURS_MOBILE` (96, iPhone / iPad),
+`TVSIGN_PRESENCE_MINUTES` (3, how often a due phone is looked for; 0 = off), `TVSIGN_ANISETTE_URL`
+(empty: `ani.jkcoxson.com`, fallback `ani2.stikstore.app`), `TVSIGN_GITHUB_TOKEN`, `TVSIGN_LANGUAGE`.
 Settings set in the web UI are stored in the database; an environment variable always wins.
 
 An app is only shown as valid when the Apple TV really has it: after each installation tvsign checks
@@ -482,6 +547,7 @@ tvsign garde en vie les apps tvOS installées hors App Store sur vos Apple TV. U
 Apple ID gratuit expire au bout de 7 jours ; tvsign la re-signe avec votre propre Apple ID et la
 réinstalle par le réseau avant l'expiration, et installe les nouvelles versions des apps suivies
 (releases GitHub, lien, ou `.ipa` envoyé). Tout tourne chez vous, piloté par une petite interface web.
+Les iPhone et iPad (iOS / iPadOS 17+) fonctionnent de la même façon : voir [iPhone et iPad](#iphone-et-ipad).
 
 Deux éditions, même code :
 
@@ -515,8 +581,10 @@ n'héberge ni ne distribue aucun contenu.
 - Non pris en charge : Docker Desktop sous Windows/macOS (prendre l'édition Windows), ARM 32 bits,
   TrueNAS CORE.
 
-Ni `NET_ADMIN`, ni `/dev/net/tun`, ni IPv6, ni root : le tunnel chiffré vers l'Apple TV tourne
-entièrement en espace utilisateur dans `plumesign`. Le serveur tourne sous un utilisateur non privilégié.
+Ni `NET_ADMIN`, ni `/dev/net/tun`, ni root : le tunnel chiffré vers l'appareil tourne entièrement en
+espace utilisateur dans `plumesign`. Le serveur tourne sous un utilisateur non privilégié. Une
+Apple TV n'a pas besoin d'IPv6 ; un iPhone ou un iPad peut ne s'annoncer qu'avec une adresse IPv6 locale
+au lien (voir [iPhone et iPad](#iphone-et-ipad)).
 
 ### Installation
 
@@ -582,8 +650,9 @@ n'est nécessaire.
    permet de le prédéfinir.
 3. L'assistant enchaîne : langue (ou **restaurer une sauvegarde**), vérification de l'environnement,
    connexion à l'Apple ID (un Apple ID gratuit dédié est conseillé ; le mot de passe n'est jamais
-   enregistré), appairage de l'Apple TV (sur la TV : Réglages › Télécommandes et appareils › App
-   Télécommande et appareils, puis saisir le code), et l'app à garder installée.
+   enregistré), appairage de l'appareil (Apple TV : Réglages › Télécommandes et appareils › App
+   Télécommande et appareils, puis saisir le code ; iPhone / iPad : voir plus bas), et l'app à garder
+   installée.
 
 L'assistant n'affiche « C'est prêt » qu'une fois la première installation réussie ; d'ici là il
 montre l'avancement réel (et la raison en cas d'échec). La signature **révoque le certificat créé par
@@ -640,6 +709,72 @@ pont ou à un multicast bloqué, et si la TV répond encore en direct.
 - L'interface avertit quand elle est servie en `http://` sur le réseau : le mot de passe de l'Apple ID
   et les codes circulent alors en clair. Utiliser un VPN ou un reverse proxy HTTPS (voir Sécurité).
   Ajoutée à l'écran d'accueil d'un téléphone, la page s'ouvre comme une app (manifeste et icône inclus).
+
+### iPhone et iPad
+
+Les iPhone et iPad (**iOS / iPadOS 17 ou plus récent**) sont gardés en vie comme une Apple TV :
+tvsign signe avec votre Apple ID et réinstalle par le Wi-Fi avant la fin des 7 jours. **État :
+nouveau. Le renouvellement est celui de l'Apple TV (même tunnel, même installateur), mais
+l'appairage USB initial n'a pas encore été validé sur tous les appareils et versions d'iOS :
+considérez-le comme expérimental et signalez ce que vous constatez.**
+
+**Mise en place, une fois par appareil**
+
+1. **Appairer une fois.** Un iPhone n'affiche pas d'écran de code comme l'Apple TV : les clés
+   d'appairage sont créées par USB (`plumesign pair usb`). Ensuite, tous les renouvellements passent
+   par le Wi-Fi.
+   - *Édition Windows :* branchez l'appareil, déverrouillez-le, touchez **Se fier**, puis Appairer ›
+     iPhone / iPad › **Appairer en USB**. Il faut le pilote USB d'Apple (Apple Mobile Device
+     Service) : installez iTunes ou l'app Appareils Apple du Microsoft Store ; tvsign ne l'embarque pas.
+   - *Docker :* le conteneur n'a volontairement pas d'USB (réseau hôte seul, aucun périphérique, pas
+     de root). Faites l'appairage sur un ordinateur doté de usbmuxd (Windows avec iTunes / Appareils
+     Apple, macOS, Linux avec le paquet `usbmuxd`) avec `plumesign pair usb` (`plumesign.exe` est dans
+     le dossier d'installation de l'édition Windows ; ailleurs, le compiler depuis `vendor/Impactor`,
+     voir [docs/building.md](docs/building.md)). Puis dans tvsign : Appairer › iPhone / iPad ›
+     **Importer un fichier d'appairage** et envoyez le `<UDID>.plist` créé dans le dossier
+     `remotepairing` de plumesign (`%APPDATA%\PlumeImpactor\remotepairing` sous Windows,
+     `~/.config/PlumeImpactor/remotepairing` ailleurs), **pas** le `<UDID>.info.plist` qui est à côté.
+     L'UDID est lu dans le nom du fichier (`<UDID>.plist`, `plume_<UDID>.plist`), sinon saisissez-le.
+     Un fichier fait par Impactor est accepté aussi.
+2. **Installer une première app** depuis tvsign. Elle s'installe même si le Mode développeur est
+   encore désactivé, mais peut ne pas se lancer pour l'instant.
+3. **Faire confiance au développeur** une fois l'app installée : Réglages › Général › VPN et
+   gestion de l'appareil › votre Apple ID › Faire confiance (une fois par Apple ID). tvsign ne peut pas
+   le faire à votre place.
+4. **Activer le Mode développeur :** Réglages › Confidentialité et sécurité › Mode développeur, puis
+   redémarrage de l'appareil. L'option n'existe pas sur un appareil qui n'a jamais exécuté d'app
+   signée : elle n'apparaît qu'après l'étape 2. tvsign ne peut ni la faire apparaître ni l'activer,
+   mais affiche une bannière tant qu'il est désactivé.
+
+**Ce qui change par rapport à une Apple TV**
+
+- **Être absent de la maison est normal.** Un téléphone sort, se met en veille, passe en économie
+  d'énergie. Les iPhone et iPad se renouvellent `TVSIGN_RENEW_BEFORE_HOURS_MOBILE` (96 h) avant
+  l'expiration au lieu de 60 h (jamais moins que le réglage général ; une valeur par appareil existe
+  via l'API : `PATCH /api/devices/<id>` avec `renew_before_hours`). Tant qu'une app d'un téléphone est
+  due, tvsign cherche le téléphone sur le réseau toutes les `TVSIGN_PRESENCE_MINUTES` (3, `0` =
+  désactivé) et le renouvelle dès qu'il apparaît, sans attendre le prochain essai. « Hors du
+  réseau » et « verrouillé depuis son démarrage » (le déverrouiller une fois avec son code) sont
+  passagers et ne notifient qu'à l'approche de l'expiration, comme une TV en veille.
+- **Pas d'attente « fermez l'app ».** iOS remplace une app ouverte ; une installation bloquée sur
+  un téléphone signale un appareil verrouillé, occupé ou plein.
+- **Réseau.** Le téléphone ne répond à Bonjour que réveillé (écran allumé ou en charge, c'est mieux)
+  et peut ne s'annoncer qu'avec une adresse IPv6 locale au lien : un hôte sans IPv6 (certains NAS et
+  configurations Docker) risque alors de ne jamais le voir. L'isolation des clients Wi-Fi et les
+  VLAN se comportent comme pour une Apple TV. Rien ne garantit qu'un téléphone au repos soit joignable.
+- **Limites du compte gratuit**, pour tout l'Apple ID, apps tvOS et iOS ensemble : 10 identifiants
+  d'app par 7 jours (chaque extension, comme un widget ou le partage, en coûte un de plus) et 3 apps
+  installées à la fois par appareil. Ni notifications push, ni iCloud, ni domaines associés. tvsign
+  avertit quand une IPA contient des extensions ou ces droits (détecté quand l'IPA porte sa signature)
+  et affiche, par Apple ID, les apps et les identifiants d'app estimés.
+- **Utilisez un Apple ID dédié à tvsign.** AltStore, SideStore et Sideloadly sur le même Apple ID
+  révoquent mutuellement leurs certificats en boucle ; tvsign le signale après trois révocations en 7 jours.
+- Les releases qui publient une `.ipa` iOS et une `.ipa` tvOS sont associées à l'appareil (une app
+  réservée à l'iPad est refusée sur un iPhone, `MinimumOSVersion` est comparée à l'appareil).
+
+**Non pris en charge :** iOS / iPadOS 16 et plus ancien (pas de RemotePairing sans fil ; la synchro
+Wi-Fi d'avant iOS 17 est un autre protocole), Apple Watch, Apple Vision Pro (reconnu et refusé pour
+l'instant), Mac, et l'appairage par le seul Wi-Fi sans USB ni fichier importé.
 
 ### Sauvegardes
 
@@ -734,8 +869,10 @@ Le guide complet est [windows/README-windows.md](windows/README-windows.md).
 
 Tout est facultatif. Variables principales : `TZ`, `PUID`, `PGID`, `TVSIGN_PORT` (8765),
 `TVSIGN_HOST` (0.0.0.0), `TVSIGN_PASSWORD_FILE`, `TVSIGN_ALLOWED_HOSTS`, `TVSIGN_NTFY_URL`,
-`TVSIGN_RENEW_BEFORE_HOURS` (60), `TVSIGN_ANISETTE_URL` (vide : `ani.jkcoxson.com`, repli
-`ani2.stikstore.app`), `TVSIGN_GITHUB_TOKEN`, `TVSIGN_LANGUAGE`.
+`TVSIGN_RENEW_BEFORE_HOURS` (60), `TVSIGN_RENEW_BEFORE_HOURS_MOBILE` (96, iPhone / iPad),
+`TVSIGN_PRESENCE_MINUTES` (3, fréquence de recherche d'un téléphone dû ; 0 = jamais),
+`TVSIGN_ANISETTE_URL` (vide : `ani.jkcoxson.com`, repli `ani2.stikstore.app`), `TVSIGN_GITHUB_TOKEN`,
+`TVSIGN_LANGUAGE`.
 Les réglages faits dans l'interface sont enregistrés en base ; une variable d'environnement a
 toujours la priorité.
 

@@ -26,7 +26,11 @@ const ICONS = {
   alerte: '<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5 2.5 20h19z"/><path d="M12 10v4.5M12 17.2v.1"/></svg>',
   cle: '<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="m11 12 8-8M16 7l2 2M14 9l2 2"/></svg>',
   ok: '<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>',
+  phone: '<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x="6.5" y="2.5" width="11" height="19" rx="2.5"/><path d="M11 18.5h2"/></svg>',
 };
+const OS_NAME = { tvos: "tvOS", ios: "iOS", ipados: "iPadOS", visionos: "visionOS" };
+const estMobile = (famille) => famille === "ios" || famille === "ipados";   // iPhone / iPad
+const platformOf = (famille) => (estMobile(famille) ? "iphoneos" : "appletvos");
 
 async function api(path, opts = {}) {
   const { json, quiet, ...init } = opts;
@@ -94,7 +98,7 @@ function flash(ton, titre, texte = "") {
 
 // ---------- rendu sans perte de focus ----------
 const CLES = ["data-renew", "data-toggle", "data-edit", "data-del-app", "data-refresh-dev", "data-del-dev", "data-check",
-  "data-select", "data-relogin", "data-logout", "data-team", "data-open", "data-key", "data-update", "data-rollback", "data-dismiss-update", "data-replace",
+  "data-select", "data-relogin", "data-logout", "data-devmode", "data-team", "data-open", "data-key", "data-update", "data-rollback", "data-dismiss-update", "data-replace",
   "data-reinstall", "data-retry-version", "data-accept-version", "data-rename-dev", "data-renew-all"];
 function cleDe(el) {
   if (!el?.getAttribute) return null;
@@ -137,9 +141,11 @@ async function busy(b, attr, label, fn) {
 }
 
 // ---------- état d'une app ----------
+// Délai de renouvellement de l'app, en heures : celui de son appareil (iPhone / iPad : plus long), sinon le général.
+const fenetreRenouv = (a, s) => a.renew_before_hours ?? s.renew_before_hours;
 // [ton, libellé] ; ton : ok | warn | err | cours | neutre
 function etatApp(a, now, s) {
-  const exp = a.expires_at, fenetre = s.renew_before_hours * 3600;
+  const exp = a.expires_at, fenetre = fenetreRenouv(a, s) * 3600;
   const expiree = exp ? exp <= now : false;
   if (a.running) {
     const ph = a.phase || {};
@@ -196,7 +202,7 @@ function noteMaj(a, now) {
   if (a.update_tag) {
     const m = /^tvos:(.+)$/.exec(a.update_block || "");
     const quoi = a.source_type === "url" ? t("update_new_file") : a.update_tag;
-    const pourquoi = m ? t("update_tvos", { min: m[1], have: tvOS(a) }) : a.update_block === "rollback" ? t("update_rolled_back") : t("update_manual");
+    const pourquoi = m ? t("update_tvos", { min: m[1], have: tvOS(a), os: OS_NAME[a.device_family || "tvos"] || "tvOS" }) : a.update_block === "rollback" ? t("update_rolled_back") : t("update_manual");
     html += `<div class="probleme probleme--info" role="group" aria-label="${esc(t("update_available_t", { tag: quoi }))}">
       <span class="probleme__ic">${ICONS.app}</span>
       <div class="probleme__texte">
@@ -221,7 +227,7 @@ function jauge(a, now, s, ton) {
   const debut = a.signed_at && a.signed_at < exp ? a.signed_at : exp - 7 * 86400;
   const total = Math.max(1, exp - debut);
   const pct = Math.min(100, Math.max(0, ((exp - now) / total) * 100));
-  const renouv = a.renew_at ?? exp - s.renew_before_hours * 3600;
+  const renouv = a.renew_at ?? exp - fenetreRenouv(a, s) * 3600;
   const posRenouv = Math.min(100, Math.max(0, ((renouv - debut) / total) * 100));
   const reste = exp - now;
   const label = reste > 0 ? t("gauge_valid", { left: restant(reste), date: fmtDate(exp) }) : t("gauge_expired", { date: fmtDate(exp) });
@@ -239,20 +245,22 @@ function jauge(a, now, s, ton) {
 
 // App ouverte sur l'Apple TV : installation en attente (installd tient la mise à jour jusqu'à sa fermeture).
 function noteApp(a, now) {
-  const tv = a.device_name || "Apple TV";
+  const tv = a.device_name || t("device");
+  const mobile = estMobile(a.device_family);
   let titre, texte;
   if (a.running && a.phase?.step === "waiting_app") {
-    titre = t("wait_app_t", { name: a.name });
-    texte = t("wait_app", { tv, when: relatif(a.phase.deadline, now) });
+    // iOS remplace une app ouverte : une attente y vient d'ailleurs (appareil verrouillé, occupé, plein)
+    titre = t(mobile ? "wait_phone_t" : "wait_app_t", { name: mobile ? tv : a.name });
+    texte = t(mobile ? "wait_phone" : "wait_app", { tv, when: relatif(a.phase.deadline, now) });
   } else if (!a.running && a.tv_present === false) {
     return `<div class="probleme probleme--info" role="group" aria-label="${esc(t("not_on_tv_t", { tv }))}">
-      <span class="probleme__ic">${ICONS.tv}</span>
+      <span class="probleme__ic">${mobile ? ICONS.phone : ICONS.tv}</span>
       <div class="probleme__texte"><p class="probleme__titre">${esc(t("not_on_tv_t", { tv }))}</p><p>${esc(t("not_on_tv", { when: relatif(a.tv_checked_at, now) }))}</p></div>
       <button class="btn btn--petit" data-reinstall="${a.id}" aria-label="${esc(t("reinstall") + " " + a.name)}">${t("reinstall")}</button>
     </div>`;
   } else return "";
   return `<div class="probleme probleme--info" role="status">
-      <span class="probleme__ic">${ICONS.tv}</span>
+      <span class="probleme__ic">${mobile ? ICONS.phone : ICONS.tv}</span>
       <div class="probleme__texte"><p class="probleme__titre">${esc(titre)}</p><p>${esc(texte)}</p></div>
     </div>`;
 }
@@ -269,6 +277,26 @@ function versionRefusee(a) {
       <span class="probleme__ic">${ICONS.alerte}</span>
       <div class="probleme__texte"><p class="probleme__titre">${esc(titre)}</p><p>${esc(conseil)}</p>${detail}</div>
       <span class="probleme__actions">${accepter}<button class="btn btn--petit" data-retry-version="${a.id}" aria-label="${esc(t("retry_version") + " " + a.name)}">${t("retry_version")}</button></span>
+    </div>`;
+}
+
+// Limites du compte gratuit repérées dans l'IPA (extensions, push, iCloud, domaines associés).
+function avertissementsApp(a) {
+  const w = (a.warnings || "").split(",").filter(Boolean);
+  if (!w.length) return "";
+  const lignes = w.map((x) => (x.startsWith("appex:") ? t("warn_appex", { n: x.slice(6) }) : t("warn_" + x.replace(/-/g, "_"))));
+  return `<div class="probleme probleme--info" role="status">
+      <span class="probleme__ic">${ICONS.alerte}</span>
+      <div class="probleme__texte"><p class="probleme__titre">${esc(t("warn_t"))}</p>${lignes.map((l) => `<p>${esc(l)}</p>`).join("")}</div>
+    </div>`;
+}
+
+// Première installation sur iPhone / iPad : le certificat du développeur est à approuver une fois par Apple ID.
+function noteConfiance(a, now) {
+  if (!estMobile(a.device_family) || !a.created_at || now - a.created_at > 3 * 86400) return "";
+  return `<div class="probleme probleme--info" role="status">
+      <span class="probleme__ic">${ICONS.phone}</span>
+      <div class="probleme__texte"><p class="probleme__titre">${esc(t("phone_trust_t"))}</p><p>${esc(t("phone_trust"))}</p></div>
     </div>`;
 }
 
@@ -329,11 +357,13 @@ function carteApp(a, now, s) {
     </div>
     ${jauge(a, now, s, ton)}
     ${noteApp(a, now)}
+    ${noteConfiance(a, now)}
+    ${avertissementsApp(a)}
     ${problemeApp(a, now)}
     ${noteMaj(a, now)}
     ${versionRefusee(a)}
     <dl class="meta">
-      <div><dt>Apple TV</dt><dd>${a.device_id ? esc(a.device_name || "Apple TV") : `<span class="texte-err">${t("none_f")}</span>`}</dd></div>
+      <div><dt>${t("device")}</dt><dd>${a.device_id ? esc(a.device_name || t("device")) : `<span class="texte-err">${t("none_m")}</span>`}</dd></div>
       <div><dt>${t("account")}</dt><dd>${compte ? esc(compte) : t("default_account")}</dd></div>
       ${essai ? `<div><dt>${t("last_attempt")}</dt><dd>${essai}</dd></div>` : a.signed_at ? `<div><dt>${t("signed")}</dt><dd>${esc(relatif(a.signed_at, now))}</dd></div>` : ""}
       ${a.verified_at ? `<div><dt>${t("verified_on_tv")}</dt><dd>${esc(relatif(a.verified_at, now))}</dd></div>` : ""}
@@ -359,7 +389,7 @@ function synthese(s, now) {
   const echecs = actives.filter((a) => a.status === "error" || !a.device_id);
   const lim = 2 * ((h && h.check_interval) || 600) + 300;   // une passe ne fait que lancer les renouvellements (ils tournent à part)
   const enRetard = actives.filter((a) => !a.running && a.status !== "error" && a.expires_at && a.expires_at > now
-    && (a.renew_at ?? a.expires_at - s.renew_before_hours * 3600) < now - lim);
+    && (a.renew_at ?? a.expires_at - fenetreRenouv(a, s) * 3600) < now - lim);
   const arret = boucleArretee(h, now);
   const cours = s.apps.filter((a) => a.running);
   const attente = cours.filter((a) => a.phase?.step === "waiting_app");
@@ -376,7 +406,7 @@ function synthese(s, now) {
   const prochaine = actives.filter((a) => a.expires_at).sort((x, y) => x.expires_at - y.expires_at)[0];
   // aucune app active avec un profil valide (toutes en pause, ou pas encore installées) : pas de « à jour » vert
   if (!prochaine) return ["neutre", t("sum_idle_t"), t("sum_idle")];
-  const quand = Math.max(now, prochaine.renew_at ?? prochaine.expires_at - s.renew_before_hours * 3600);
+  const quand = Math.max(now, prochaine.renew_at ?? prochaine.expires_at - fenetreRenouv(prochaine, s) * 3600);
   return ["ok", t("sum_ok_t"), t("sum_next", { when: quand <= now + 60 ? t("now") : relatif(quand, now) })];
 }
 
@@ -426,6 +456,10 @@ function renderAlertes() {
       html.push(`<div class="banner banner--info"><p><strong>${t("no_tv_t")}</strong>${t("no_tv")}</p>
         <button class="btn btn--primary" data-open="dlg-pair">${t("pair")}</button></div>`);
     }
+    for (const d of s.devices.filter((x) => estMobile(x.family) && x.dev_mode === 0)) {
+      html.push(`<div class="banner"><p><strong>${esc(t("devmode_off_t", { name: d.name }))}</strong>${esc(t("devmode_off"))}</p>
+        <button class="btn" data-devmode="${d.id}">${t("devmode_check")}</button></div>`);
+    }
     const legacy = s.devices.filter((x) => x.legacy_pairing);
     if (legacy.length) {
       html.push(`<div class="banner banner--info"><p><strong>${esc(tn("legacy_t", legacy.length, { names: legacy.map((d) => d.name).join(", ") }))}</strong>${t("legacy")}</p>
@@ -443,7 +477,7 @@ function renderAlertes() {
     }
     for (const d of s.devices.filter((x) => x.pairing_lost && !x.legacy_pairing)) {
       html.push(`<div class="banner"><p><strong>${esc(t("lost_t", { name: d.name }))}</strong>${t("lost")}</p>
-        <button class="btn btn--primary" data-open="dlg-pair">${t("pair")}</button></div>`);
+        <button class="btn btn--primary" data-open="dlg-pair" data-pair-kind="${estMobile(d.family) ? "phone" : "tv"}">${t("pair")}</button></div>`);
     }
   }
   setHTML($("#alertes"), html.join(""));
@@ -474,17 +508,26 @@ function renderDevices(s, now) {
   setHTML($("#devices"), s.devices.length ? `<div class="list">${s.devices.map((d) => {
     const [ton, mot, errRecente] = etatTV(d, now);
     const apps = s.apps.filter((a) => a.device_id === d.id).map((a) => a.name);
+    const mobile = estMobile(d.family), fam = d.family || "tvos";
+    const vieux = mobile && parseInt(d.os_version, 10) < 17;
+    const notes = [];
+    if (mobile && d.dev_mode === 1) notes.push(["", t("devmode_row_on")]);
+    if (mobile && d.dev_mode === 0) notes.push(["texte-err", t("devmode_row_off")]);
+    if (mobile && d.app_count > 3) notes.push(["texte-err", t("dev_apps_limit", { n: d.app_count })]);
+    else if (mobile && d.app_count === 3) notes.push(["", t("dev_apps_full", { n: d.app_count })]);
+    if (vieux) notes.push(["texte-err", t("dev_old_os")]);
     return `<div class="row">
-      <span class="row__icon row__icon--${COULEUR[ton]}">${ICONS.tv}</span>
+      <span class="row__icon row__icon--${COULEUR[ton]}">${mobile ? ICONS.phone : ICONS.tv}</span>
       <div class="row__label">
-        <p class="row__title">${esc(d.name)}</p>
-        <p class="row__sub"><span class="etat etat--${ton}">${mot}</span> · ${esc(d.model || t("unknown_model"))} · tvOS ${esc(d.os_version || "?")}${d.last_ip ? ` · ${esc(d.last_ip)}` : ""}${d.host_hint ? ` · ${esc(t("manual_addr", { host: d.host_hint }))}` : ""}${d.busy ? ` · ${esc(t("tv_busy"))}` : ""}</p>
+        <p class="row__title">${esc(d.name)}<small>${esc(t("family_" + fam))}</small></p>
+        <p class="row__sub"><span class="etat etat--${ton}">${mot}</span> · ${esc(d.model || t("unknown_model"))} · ${OS_NAME[fam] || "tvOS"} ${esc(d.os_version || "?")}${d.last_ip ? ` · ${esc(d.last_ip)}` : ""}${d.host_hint ? ` · ${esc(t("manual_addr", { host: d.host_hint }))}` : ""}${d.busy ? ` · ${esc(t("tv_busy"))}` : ""}</p>
         <p class="row__sub">${esc(t("last_contact", { when: relatif(d.last_seen, now) }))}${apps.length ? ` · ${esc(apps.join(", "))}` : ""}</p>
+        ${notes.map(([cls, txt]) => `<p class="row__sub ${cls}">${esc(txt)}</p>`).join("")}
         ${d.legacy_pairing ? `<p class="row__sub">${t("legacy_row")}</p>`
           : errRecente ? `<p class="row__sub texte-err">${esc(enClair(d.last_error).titre)} ${d.last_error_at ? `(${esc(relatif(d.last_error_at, now))})` : ""}</p>` : ""}
       </div>
       <div class="row__buttons">
-        ${d.pairing_lost || d.legacy_pairing ? `<button class="row__action row__action--go" data-open="dlg-pair">${t("repair")}</button>` : ""}
+        ${d.pairing_lost || d.legacy_pairing ? `<button class="row__action row__action--go" data-open="dlg-pair" data-pair-kind="${mobile ? "phone" : "tv"}">${t("repair")}</button>` : ""}
         ${d.legacy_pairing ? "" : `<button class="row__action" data-refresh-dev="${d.id}" aria-label="${esc(t("test_connection") + " " + d.name)}">${t("test_connection")}</button>`}
         ${d.legacy_pairing ? "" : `<button class="row__action" data-addr-dev="${d.id}" aria-label="${esc(t("address") + " " + d.name)}">${t("address")}</button>`}
         <button class="row__action" data-rename-dev="${d.id}" data-nom="${esc(d.name)}" aria-label="${esc(t("rename") + " " + d.name)}">${t("rename")}</button>
@@ -510,6 +553,7 @@ function renderAccounts(s, now) {
       <div class="row__label">
         <p class="row__title">${esc(a.email)}${a.selected ? `<small>${t("default_account")}</small>` : ""}</p>
         <p class="row__sub">${etat}${a.team_id ? ` · ${t("team")} <span class="mono">${esc(a.team_id)}</span>` : ""}${a.cert_expires ? ` · ${esc(t("cert_until", { date: a.cert_expires }))}` : ""} · ${esc(t("checked_when", { when: relatif(a.checked_at, now) }))}</p>
+        ${a.apps ? `<p class="row__sub ${a.app_ids >= 8 ? "texte-err" : ""}">${esc(t("acc_budget", { apps: a.apps, ids: a.app_ids }))}</p>` : ""}
         ${note}${places}
       </div>
       <div class="row__buttons">
@@ -521,7 +565,7 @@ function renderAccounts(s, now) {
       </div>
     </div>`;
   }).join("")}</div>
-    <p class="group__footer">${esc(heures ? t("acc_footer_h", { h: Math.round(heures) }) : t("acc_footer"))}</p>`
+    <p class="group__footer">${esc(heures ? t("acc_footer_h", { h: Math.round(heures) }) : t("acc_footer"))}${s.accounts.some((x) => x.apps) ? " " + esc(t("acc_budget_note")) : ""}</p>`
     : `<div class="vide"><p>${t("acc_empty")}</p><button class="btn" data-open="dlg-login">${t("add_account")}</button></div>`);
 }
 
@@ -650,7 +694,7 @@ document.addEventListener("click", async (ev) => {
   if (!b || b.closest("dialog") || !b.closest("#vue-main, #vue-onboarding")) return;
   const d = b.dataset;
   if (d.reload) return location.reload();
-  if (d.open) return openDialog(d.open);
+  if (d.open) return openDialog(d.open, d.pairKind);
   if (d.relogin) {
     openDialog("dlg-login");
     $("#form-login").email.value = d.relogin;
@@ -667,7 +711,7 @@ document.addEventListener("click", async (ev) => {
     $("#replace-input").click();
     return;
   }
-  if (!(d.renew || d.toggle || d.delApp || d.refreshDev || d.delDev || d.check || d.select || d.logout
+  if (!(d.renew || d.toggle || d.delApp || d.refreshDev || d.delDev || d.check || d.select || d.logout || d.devmode
       || d.update || d.rollback || d.dismissUpdate || d.reinstall || d.retryVersion || d.acceptVersion
       || d.renameDev || d.renewAll)) return;
   try {
@@ -740,6 +784,15 @@ document.addEventListener("click", async (ev) => {
         else flash("ok", t("tv_ok_t"), " " + t(verif ? "tv_ok_verified" : "tv_ok"));
       });
     }
+    if (d.devmode) {
+      await busy(b, "data-devmode", t("devmode_checking"), async () => {
+        const r = await api(`/api/devices/${d.devmode}/devmode`, { method: "POST" });
+        const nom = STATE?.devices.find((x) => String(x.id) === d.devmode)?.name || "";
+        if (r.dev_mode === true) flash("ok", t("devmode_on_t"));
+        else if (r.dev_mode === false) flash("err", t("devmode_off_t", { name: nom }), " " + t("devmode_off"));
+        else flash("info", t("devmode_unknown_t"));
+      });
+    }
     if (d.delDev) {
       const deps = (STATE?.apps || []).filter((a) => String(a.device_id) === d.delDev).map((a) => a.name);
       const msg = t("confirm_del_tv", { name: d.nom }) + (deps.length ? "\n\n" + t("confirm_del_tv_apps", { apps: deps.join(", ") }) : "");
@@ -802,10 +855,14 @@ $("#journal-bloc").addEventListener("change", (e) => {
 $("#journal-bloc").addEventListener("toggle", (e) => store.set("tvsign.journal.ouvert", e.target.open ? "1" : "0"));
 if (store.get("tvsign.journal.ouvert") === "1") $("#journal-bloc").open = true;
 
-function openDialog(id) {
+function openDialog(id, kind) {
   if (!STATE && id !== "dlg-login") return flash("err", t("sum_unreachable_t"), " " + t("retry_moment"));
   if (id === "dlg-app") fillAppForm();
-  if (id === "dlg-pair") { $("#pair-manuel").open = false; $("#pair-host").value = ""; scan(); }   // une adresse saisie avant ne doit pas masquer la recherche automatique
+  if (id === "dlg-pair") {
+    $("#pair-manuel").open = false; $("#pair-host").value = "";    // une adresse saisie avant ne doit pas masquer la recherche automatique
+    $(`input[name="pair_kind"][value="${kind === "phone" ? "phone" : "tv"}"]`).checked = true;
+    syncPairKind();
+  }
   if (id === "dlg-login") {
     $("#login-session").innerHTML = ""; $("#login-error").textContent = "";
     $("#login-submit").disabled = false;
@@ -888,7 +945,10 @@ function presetCartes(list, nom, choisi = null) {
         <span class="row__sub mono">${esc(p.repo)}</span></span>
     </label>`).join("")}</div>` : `<div class="vide"><p>${t("no_presets")}</p></div>`;
 }
-const optionsTV = (choix) => STATE.devices.map((d) => `<option value="${d.id}" ${d.id === choix ? "selected" : ""}>${esc(d.name)}</option>`).join("");
+const optionsTV = (choix) => STATE.devices.map((d) => `<option value="${d.id}" ${d.id === choix ? "selected" : ""}>${esc(d.name)} (${esc(t("family_" + (d.family || "tvos")))})</option>`).join("");
+// préréglages qui conviennent à la famille de l'appareil choisi (Apple TV : apps tvOS ; iPhone / iPad : apps iPhone)
+const presetsFor = (list, device) => list.filter((p) => (p.platform || "appletvos") === platformOf(device?.family));
+const appareilChoisi = () => STATE.devices.find((d) => String(d.id) === $("#form-app").device_id.value);
 async function fillAppForm() {
   const f = $("#form-app");
   f.device_id.innerHTML = optionsTV(STATE.devices[0]?.id) || `<option value="">${t("no_tv_paired")}</option>`;
@@ -897,12 +957,17 @@ async function fillAppForm() {
   $("#app-error").textContent = STATE.devices.length ? "" : t("pair_first");
   $("#app-submit").disabled = !STATE.devices.length;
   syncTabs();
-  const list = await presets();
+  await presetsDeAppareil();
+}
+async function presetsDeAppareil() {
+  const f = $("#form-app");
+  const tous = await presets();
   if (PRESETS_ECHEC) {
     // liste illisible : on le dit et on propose de réessayer, sans changer d'onglet à la place de l'utilisateur
     $("#app-presets").innerHTML = `<p class="erreur">${t("presets_failed")} <button class="lien lien--inline" type="button" id="app-presets-retry">${t("try_again")}</button></p>`;
     return;
   }
+  const list = presetsFor(tous, appareilChoisi());
   $("#app-presets").innerHTML = presetCartes(list, "preset");
   canalDuPreset("preset", "channel");
   if (!list.length && f.source_type.value === "preset") { f.source_type.value = "github"; syncTabs(); }
@@ -923,7 +988,10 @@ function syncTabs() {
   const type = $("#form-app").source_type.value;
   $$("#form-app [data-for]").forEach((el) => (el.hidden = !el.dataset.for.split(" ").includes(type)));
 }
-$("#form-app").addEventListener("change", (e) => { if (e.target.name === "source_type") syncTabs(); });
+$("#form-app").addEventListener("change", (e) => {
+  if (e.target.name === "source_type") syncTabs();
+  if (e.target.name === "device_id") presetsDeAppareil();
+});
 $("#form-app").addEventListener("submit", async (ev) => {
   if (ev.submitter && ev.submitter.value !== "ok") return;
   ev.preventDefault();
@@ -1197,6 +1265,53 @@ $("#dlg-login").addEventListener("close", () => { annulerSession("login"); $("#l
 $("#dlg-pair").addEventListener("close", () => annulerSession("pair"));
 
 // ---------- appairage ----------
+const pairKind = () => $('input[name="pair_kind"]:checked')?.value || "tv";
+function syncPairKind() {
+  const k = pairKind();
+  $$("#dlg-pair [data-pair]").forEach((el) => (el.hidden = el.dataset.pair !== k));
+  $("#pair-rescan").hidden = k !== "tv";
+  if (k === "tv") return scan();
+  annulerSession("pair");
+  $("#pair-session").innerHTML = "";
+  $("#import-error").textContent = "";
+  $("#pair-phone-steps").innerHTML = t("phone_steps");
+  const usb = STATE?.capabilities?.usb_pairing !== false;
+  $("#pair-usb").disabled = !usb;
+  $("#pair-usb-none").hidden = usb;
+}
+$("#dlg-pair").addEventListener("change", (e) => { if (e.target.name === "pair_kind") syncPairKind(); });
+$("#pair-usb").onclick = async () => {
+  const box = $("#pair-session");
+  $("#import-error").textContent = "";
+  box.innerHTML = `<p class="statut"><span class="etat etat--cours">${t("pair_usb_running")}</span></p>`;
+  try {
+    const sess = await api("/api/devices/pair-usb", { json: {} });
+    watchSession(sess, box, { cle: "pair", label: t("pair_usb"), doneText: t("pair_usb_done"), numerique: false });
+  } catch (e) {
+    box.innerHTML = `<p class="erreur">${esc(e.message)}</p>`;
+  }
+};
+$("#import-go").onclick = async (ev) => {
+  const b = ev.currentTarget, dlg = $("#dlg-pair"), err = $("#import-error"), box = $("#pair-session");
+  const file = dlg.querySelector('[name="pfile"]').files[0];
+  err.textContent = ""; box.innerHTML = "";
+  if (!file) return (err.textContent = t("import_choose"));
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("name", dlg.querySelector('[name="pname"]').value.trim());
+  fd.append("udid", dlg.querySelector('[name="pudid"]').value.trim());
+  fd.append("family", dlg.querySelector('[name="pfamily"]').value);
+  await busy(b, "id", t("uploading"), async () => {
+    try {
+      const r = await api("/api/devices/import-pairing", { method: "POST", body: fd });
+      const nom = dlg.querySelector('[name="pname"]').value.trim() || t("device");
+      box.innerHTML = `<p class="statut"><span class="etat etat--${r.info_error ? "warn" : "ok"}">${esc(t("import_done", { name: nom }))}</span></p>`
+        + (r.info_error ? `<p class="code__invite">${esc(t("import_offline"))}</p>` : "");
+      dlg.querySelector('[name="pfile"]').value = "";
+      refresh();
+    } catch (e) { err.textContent = e.message; }
+  });
+};
 async function scan(host) {
   const list = $("#pair-list");
   annulerSession("pair");
@@ -1458,7 +1573,10 @@ const WIZ_RENDU = {
       <ol class="consigne">${t("pair_steps")}</ol>
       ${legacy.length ? `<div class="banner banner--info"><p><strong>${esc(tn("legacy_t", legacy.length, { names: legacy.map((d) => d.name).join(", ") }))}</strong>${t("legacy")}</p></div>` : ""}
       ${ok.map((d) => fait(t("wiz_tv_done", { name: d.name }))).join("")}
-      <button class="btn ${ok.length ? "" : "btn--primary"}" data-open="dlg-pair">${ok.length ? t("pair_another") : t("pair_title")}</button>`;
+      <div class="actions-form">
+        <button class="btn ${ok.length ? "" : "btn--primary"}" data-open="dlg-pair" data-pair-kind="tv">${ok.length ? t("pair_another") : t("pair_title")}</button>
+        <button class="btn" data-open="dlg-pair" data-pair-kind="phone">${t("wiz_pair_phone")}</button>
+      </div>`;
   },
   app: () => {
     const tvs = (STATE?.devices || []).filter((d) => !d.legacy_pairing);
@@ -1469,10 +1587,13 @@ const WIZ_RENDU = {
       <p class="assistant__texte">${t("wiz_app_wait")}</p>`;
     if (a) return `${titreEtape("wiz_app_title", "")}${blocPremiereApp(a)}`;
     const choix = WIZ.preset, canal = WIZ.canal || (PRESETS?.[0]?.default_channel === "beta" ? "beta" : "stable");
+    // seuls les préréglages qui conviennent à l'appareil (Apple TV : apps tvOS ; iPhone / iPad : apps iPhone)
+    const proposes = PRESETS ? presetsFor(PRESETS, tvs[0]) : null;
     return `${titreEtape("wiz_app_title", t("wiz_app_text"))}
-      ${PRESETS ? presetCartes(PRESETS, "wiz-preset", choix)
+      ${proposes ? presetCartes(proposes, "wiz-preset", choix)
         : PRESETS_ECHEC ? `<p class="erreur">${t("presets_failed")} <button class="lien lien--inline" type="button" id="wiz-presets">${t("try_again")}</button></p>`
         : `<p class="statut"><span class="etat etat--cours">${t("loading")}</span></p>`}
+      ${proposes && !proposes.length && estMobile(tvs[0]?.family) ? `<p class="group__footer">${t("wiz_no_phone_preset")}</p>` : ""}
       <p class="group__header espace">${t("channel")}</p>
       <div class="segmented" role="radiogroup" aria-label="${esc(t("channel"))}">
         <label><input type="radio" name="wiz-canal" value="stable" ${canal === "beta" ? "" : "checked"}><span>${t("channel_stable")}</span></label>
@@ -1481,7 +1602,7 @@ const WIZ_RENDU = {
       <p class="group__footer">${t("channel_note")}</p>
       ${tvs.length ? "" : `<p class="erreur">${t("pair_first")}</p>`}
       <div class="actions-form">
-        <button class="btn btn--primary" id="wiz-installer" ${tvs.length && PRESETS?.length ? "" : "disabled"}>${t("install")}</button>
+        <button class="btn btn--primary" id="wiz-installer" ${tvs.length && proposes?.length ? "" : "disabled"}>${t("install")}</button>
         <button class="btn" data-open="dlg-app">${t("other_app")}</button>
       </div>
       <p class="erreur" id="wiz-erreur" role="alert">${esc(WIZ.erreur)}</p>`;

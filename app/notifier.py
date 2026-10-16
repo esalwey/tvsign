@@ -73,9 +73,9 @@ MESSAGES: dict[str, tuple[str, str]] = {
     "update_installed": ("{name} : version {version} installée{notes}", "{name}: version {version} installed{notes}"),
     "update_rolled_back": ("{name} : la version {tag} n'a pas pu être installée ({why}), retour à la version {prev}",
                            "{name}: version {tag} could not be installed ({why}), back to version {prev}"),
-    "update_blocked_os": ("{name} : la version {tag} demande tvOS {need} ou plus, l'Apple TV est en tvOS {have} : "
+    "update_blocked_os": ("{name} : la version {tag} demande {system} {need} ou plus, {who} est en {system} {have} : "
                           "version actuelle conservée",
-                          "{name}: version {tag} needs tvOS {need} or later, the Apple TV runs tvOS {have}: "
+                          "{name}: version {tag} needs {system} {need} or later, the device runs {system} {have}: "
                           "current version kept"),
     "update_failed": ("{name} : la mise à jour n'a pas pu être installée ({why}), la version actuelle reste valable",
                       "{name}: the update could not be installed ({why}), the current version stays valid"),
@@ -85,6 +85,12 @@ MESSAGES: dict[str, tuple[str, str]] = {
                      "sideloadées avec ce compte (iPhone…) vont cesser de fonctionner",
                      "an old certificate of {email} was revoked to sign {name}: other apps sideloaded with "
                      "this account (iPhone…) will stop working"),
+    "cert_revoke_loop": ("le certificat de {email} a été révoqué {times} fois ou plus en 7 jours : un autre outil "
+                         "(AltStore, SideStore, Sideloadly…) utilise le même Apple ID et les deux se révoquent en "
+                         "boucle. Utilise un Apple ID dédié à tvsign",
+                         "the certificate of {email} was revoked {times} times or more in 7 days: another tool "
+                         "(AltStore, SideStore, Sideloadly…) uses the same Apple ID and the two keep revoking each "
+                         "other. Use an Apple ID dedicated to tvsign"),
     "cert_revoked_other": ("{name} : certificat Apple révoqué (autre outil sur le même compte), "
                            "re-signature en cours",
                            "{name}: Apple certificate revoked (another tool on the same account), re-signing"),

@@ -140,6 +140,9 @@ RETRY_MINUTES = _num("TVSIGN_RETRY_MINUTES", 45, 5)
 # Pause before trying again after Apple refused a request outright (error -80045, HTTP 503/429): it
 # limits the attempts, and every new one can lengthen the block. In minutes.
 APPLE_BACKOFF_MINUTES = _num("TVSIGN_APPLE_BACKOFF_MINUTES", 180, 5)
+# How often a phone or tablet that is due for renewal is looked for on the network, in minutes
+# (0 = never): it renews as soon as it shows up instead of waiting for the next retry.
+PRESENCE_MINUTES = _num("TVSIGN_PRESENCE_MINUTES", 3, 0, kind=float)
 # Apple session check, in hours.
 ACCOUNT_CHECK_HOURS = _num("TVSIGN_ACCOUNT_CHECK_HOURS", 6, 1, kind=float)
 # GitHub release check between renewals, in minutes (0 = never).

@@ -17,6 +17,7 @@ from xml.parsers.expat import ExpatError
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import families
 from .config import ALLOW_PRIVATE_URLS, GITHUB_TOKEN, MAX_UPLOAD_MB, PRESETS_FILE, VERSION
 from .util import replace_retry
 
@@ -46,12 +47,14 @@ class UrlRejected(SourceRejected):
 
 
 class OsTooOld(SourceRejected):
-    """L'IPA demande un tvOS plus récent que celui de l'Apple TV (MinimumOSVersion). Contrairement
+    """L'IPA demande un système plus récent que celui de l'appareil (MinimumOSVersion). Contrairement
     aux autres refus, celui-ci se lève de lui-même quand la TV est mise à jour."""
 
-    def __init__(self, min_os: str, have: str):
-        super().__init__(f"cette app demande tvOS {min_os} ou plus, l'Apple TV est en tvOS {have}")
-        self.min_os, self.have = min_os, have
+    def __init__(self, min_os: str, have: str, family: str = "tvos"):
+        system = {"tvos": "tvOS", "ios": "iOS", "ipados": "iPadOS"}.get(family, "tvOS")
+        device = "l'Apple TV" if family == "tvos" else f"cet {families.label(family)}"
+        super().__init__(f"cette app demande {system} {min_os} ou plus, {device} est en {system} {have}")
+        self.min_os, self.have, self.family = min_os, have, family
 
 
 class SourceUnavailable(RuntimeError):
@@ -78,6 +81,56 @@ def os_older(have, need) -> bool:
     return h + (0,) * (width - len(h)) < n + (0,) * (width - len(n))
 
 
+class PlatformRejected(SourceRejected):
+    """L'IPA est valide mais ne convient pas à l'appareil visé (autre plateforme, iOS trop ancien) :
+    une autre IPA de la même release (iOS + tvOS) peut convenir, on essaie la suivante.
+    `code` : code d'erreur stable de l'API (voir families.PlatformMismatch)."""
+
+    def __init__(self, message: str, code: str | None = None):
+        super().__init__(message)
+        self.code = code
+
+
+# Droits qu'un compte gratuit refuse (poussée, iCloud, domaines associés) : repérés dans la signature
+# de l'exécutable principal quand l'IPA en porte une.
+_RISKY_ENTITLEMENTS = (
+    (b"aps-environment", "push"),
+    (b"com.apple.developer.icloud-", "icloud"),
+    (b"com.apple.developer.ubiquity-", "icloud"),
+    (b"com.apple.developer.associated-domains", "associated-domains"),
+)
+_SCAN_MAX = 256 * 1024 * 1024
+
+
+def _risks(z: zipfile.ZipFile, app_dir: str, executable: str | None) -> list[str]:
+    """Limites du compte gratuit visibles dans l'IPA : « appex:N » (chaque extension coûte un
+    identifiant d'app de plus) et « push » / « icloud » / « associated-domains »."""
+    found = []
+    appex = {n[len(app_dir) + 1:].split("/")[1] for n in z.namelist()
+             if n.startswith(f"{app_dir}/PlugIns/") and n[len(app_dir) + 1:].count("/") >= 2
+             and n[len(app_dir) + 1:].split("/")[1].endswith(".appex")}
+    if appex:
+        found.append(f"appex:{len(appex)}")
+    try:
+        member = f"{app_dir}/{executable}" if executable else None
+        if member and member in z.namelist():
+            needles = {n: k for n, k in _RISKY_ENTITLEMENTS}
+            keep = max(len(n) for n in needles) - 1
+            tail, read, hits = b"", 0, set()
+            with z.open(member) as f:
+                while read < _SCAN_MAX and (chunk := f.read(1 << 20)):
+                    read += len(chunk)
+                    window = tail + chunk
+                    for needle, key in needles.items():
+                        if needle in window:
+                            hits.add(key)
+                    tail = window[-keep:]
+            found += sorted(hits)
+    except (OSError, zipfile.BadZipFile, RuntimeError, EOFError):   # IPA abîmée : sans incidence ici
+        pass
+    return found
+
+
 def app_info(ipa: Path) -> dict:
     """Infos de l'app d'une IPA. ValueError si le fichier n'est pas une IPA exploitable
     (Info.plist absent, illisible, ni dictionnaire, ou sans identifiant d'app)."""
@@ -89,6 +142,9 @@ def app_info(ipa: Path) -> dict:
             info = plistlib.loads(z.read(names[0]))
         except (plistlib.InvalidFileException, ExpatError, ValueError) as e:
             raise ValueError(f"Info.plist illisible ({e})") from e
+        risks = []
+        if isinstance(info, dict) and _text(info.get("DTPlatformName")) == "iphoneos":
+            risks = _risks(z, names[0].rsplit("/", 1)[0], _text(info.get("CFBundleExecutable")))
     if not isinstance(info, dict):
         raise ValueError("Info.plist inattendu (dictionnaire attendu)")
     bundle_id = _text(info.get("CFBundleIdentifier"))
@@ -100,12 +156,12 @@ def app_info(ipa: Path) -> dict:
         "version": _text(info.get("CFBundleShortVersionString")) or _text(info.get("CFBundleVersion")),
         "platform": _text(info.get("DTPlatformName")),
         "min_os": _text(info.get("MinimumOSVersion")),
+        "ui_family": families.parse_ui_family(info.get("UIDeviceFamily")),
+        "warnings": risks,
     }
 
 
-def check_tvos(info: dict) -> None:
-    if info["platform"] != "appletvos":
-        raise ValueError(f"app pour « {info['platform'] or 'inconnu'} », seules les apps tvOS sont acceptées")
+check_platform = families.check_platform
 
 
 def _profile(signed_ipa: Path) -> dict | None:
@@ -552,12 +608,41 @@ def normalize_repo(value: str | None) -> str | None:
     return v
 
 
+# Noms d'assets : « NuvioTV.ipa », « App-tvOS.ipa », « app_ios.ipa »… Un « tv » au milieu d'un mot
+# (« settings.ipa ») ne compte pas.
+_TV_WORD = re.compile(r"(?<![a-z])(apple[-_ ]?tv|tvos|tv)(?![a-z])", re.I)
+_TV_CAMEL = re.compile(r"(?<=[a-z])TV(?![a-z])")           # NuvioTV
+_IOS_NAME = re.compile(r"(?<![a-z])(ios|iphone|iphoneos|ipad|ipados)(?![a-z])", re.I)
+
+
+def _name_rank(name: str, family: str = "tvos") -> int:
+    """0 : le nom annonce la bonne famille, 1 : neutre, 2 : annonce l'autre famille."""
+    stem = name.rsplit(".", 1)[0]
+    tv = bool(_TV_CAMEL.search(stem) or _TV_WORD.search(stem))
+    ios = bool(_IOS_NAME.search(stem))
+    wants_tv = family == "tvos"
+    mine, other = (tv, ios) if wants_tv else (ios, tv)
+    if mine and not other:
+        return 0
+    if other and not mine:
+        return 2
+    return 1
+
+
 def latest_github(repo: str, tag_prefixes: list[str] | str | None, prereleases: bool = False,
-                  asset_name: str | None = None, pinned_tag: str | None = None) -> dict | None:
-    """Release la plus récente qui correspond : {tag, url, sha256, key, prerelease, asset, notes}.
+                  asset_name: str | None = None, pinned_tag: str | None = None,
+                  family: str = "tvos") -> dict | None:
+    """Release la plus récente qui correspond : {tag, url, sha256, key, prerelease, asset, notes, name,
+    published_at, candidates}.
     tag_prefixes : le tag doit commencer par l'un d'eux (aucun : tous les tags).
     prereleases : False (canal stable) les ignore, True (canal beta) les inclut.
-    pinned_tag : version épinglée par l'utilisateur ; seule cette release est considérée (préfixes et canal ignorés)."""
+    pinned_tag : version épinglée par l'utilisateur ; seule cette release est considérée (préfixes et canal ignorés).
+    family : famille de l'appareil visé ; décide quelle IPA préférer quand une release en publie
+    plusieurs (iOS + tvOS). candidates : toutes les IPA utilisables de la release, par ordre de
+    préférence (la première est celle des champs ci-dessus).
+
+    Une release plus récente que celle renvoyée mais sans IPA (publication en cours) est signalée par
+    « newer_without_ipa » : l'appelant ne doit pas y voir une nouvelle version, ni revenir en arrière."""
     if isinstance(tag_prefixes, str):
         tag_prefixes = [tag_prefixes]
     tag_prefixes = [p for p in (tag_prefixes or []) if p]
@@ -567,6 +652,7 @@ def latest_github(repo: str, tag_prefixes: list[str] | str | None, prereleases: 
     releases = _get_json(f"https://api.github.com/repos/{repo}/releases?per_page=100")
     # L'API ne renvoie pas toujours la plus récente en premier : on trie par date de publication.
     releases = sorted(releases, key=lambda r: r.get("published_at") or r.get("created_at") or "", reverse=True)
+    without_ipa = None
     for rel in releases:
         if rel.get("draft"):
             continue
@@ -582,15 +668,22 @@ def latest_github(repo: str, tag_prefixes: list[str] | str | None, prereleases: 
                 if a["name"].lower().endswith(".ipa") and a.get("state", "uploaded") == "uploaded"]
         if asset_name:
             ipas = [a for a in ipas if a["name"].lower() == asset_name.lower()]
-        # plusieurs IPA (iOS + tvOS) : on préfère celle qui annonce tvOS dans son nom
-        ipas.sort(key=lambda a: not re.search(r"tv", a["name"], re.I))
-        if ipas:
-            sha256 = _sha256_of(rel, ipas[0])
+        # plusieurs IPA (iOS + tvOS) : on préfère celle dont le nom annonce la famille de l'appareil
+        ipas.sort(key=lambda a: _name_rank(a["name"], family))
+        if not ipas:
+            if without_ipa is None:
+                without_ipa = rel["tag_name"]      # la plus récente est en cours de publication
+            continue
+        candidates = []
+        for a in ipas:
+            sha256 = _sha256_of(rel, a)
             # identité du contenu : un tag fixe (nightly, latest) dont l'IPA est remplacée change de clé
-            key = sha256 or f"{ipas[0].get('id')}:{ipas[0].get('updated_at')}:{ipas[0].get('size')}"
-            return {"tag": rel["tag_name"], "url": _asset_url(ipas[0]),
-                    "sha256": sha256, "key": key, "prerelease": bool(rel.get("prerelease")),
-                    "asset": ipas[0]["name"], "notes": (rel.get("body") or "")[:4000], "name": rel.get("name") or rel["tag_name"]}
+            key = sha256 or f"{a.get('id')}:{a.get('updated_at')}:{a.get('size')}"
+            candidates.append({"url": _asset_url(a), "sha256": sha256, "key": key, "asset": a["name"]})
+        return {"tag": rel["tag_name"], **candidates[0], "prerelease": bool(rel.get("prerelease")),
+                "published_at": rel.get("published_at") or rel.get("created_at"),
+                "candidates": candidates, "newer_without_ipa": without_ipa,
+                "notes": (rel.get("body") or "")[:4000], "name": rel.get("name") or rel["tag_name"]}
     return None
 
 
@@ -616,10 +709,12 @@ def keep_copy(src: Path, dst: Path, copy: bool = True) -> None:
 
 
 def download(url: str, dest: Path, sha256: str | None = None, expect_bundle: str | None = None,
-             max_os: str | None = None, unchanged_sha: str | None = None) -> dict | None:
-    """Télécharge, vérifie (taille, empreinte, IPA tvOS, bundle ID, tvOS minimal de la TV) puis remplace
-    dest ; l'ancienne IPA est conservée en cas d'échec. Renvoie les infos de l'app, ou None si le fichier
-    a la même empreinte que `unchanged_sha` (dest n'est alors pas touché)."""
+             max_os: str | None = None, unchanged_sha: str | None = None,
+             family: str = "tvos", model: str | None = None) -> dict | None:
+    """Télécharge, vérifie (taille, empreinte, plateforme de l'IPA selon la famille de l'appareil, bundle ID,
+    version minimale du système de l'appareil `max_os`) puis remplace dest ; l'ancienne IPA est conservée en
+    cas d'échec. Renvoie les infos de l'app, ou None si le fichier a la même empreinte que `unchanged_sha`
+    (dest n'est alors pas touché). Sans précision, l'appareil est une Apple TV (comportement d'origine)."""
     part = dest.with_suffix(".part")
     try:
         h = hashlib.sha256()
@@ -651,14 +746,14 @@ def download(url: str, dest: Path, sha256: str | None = None, expect_bundle: str
         except ValueError as e:
             raise SourceRejected(str(e)) from e
         try:
-            check_tvos(info)
+            check_platform(info, family, model)
         except ValueError as e:
-            raise SourceRejected(str(e)) from e
+            raise PlatformRejected(str(e), getattr(e, "code", None)) from e
         if expect_bundle and info["bundle_id"] != expect_bundle:
             raise SourceRejected(f"identifiant d'app changé ({expect_bundle} → {info['bundle_id']}) : "
                                  "version refusée par sécurité ; supprime et rajoute l'app pour l'accepter")
         if max_os and os_older(max_os, info.get("min_os")):
-            raise OsTooOld(info["min_os"], max_os)
+            raise OsTooOld(info["min_os"], max_os, family)
         info["sha256"] = h.hexdigest()
         replace_retry(part, dest)
         return info
@@ -707,6 +802,7 @@ def presets() -> list[dict]:
         channels = preset_channels(p)
         default = p.get("default_channel")
         out.append({**p, "channels": channels,
+                    "platform": p.get("platform") or "appletvos",
                     "default_channel": default if default in channels else next(iter(channels))})
     return out
 

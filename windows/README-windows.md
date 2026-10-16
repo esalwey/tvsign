@@ -96,6 +96,19 @@ Also check that your home network is set to the **Private** profile, not **Publi
 
 The tvsign **Diagnostics** page shows how many Apple TVs are visible on the network. Uninstalling tvsign removes the rule (Windows asks for a confirmation), except for a **silent** uninstall (`/VERYSILENT`), which leaves it: remove it yourself in an administrator PowerShell with `netsh advfirewall firewall delete rule name="tvsign plumesign"`. Reinstalling in another folder updates the rule's program path.
 
+### Pair an iPhone or an iPad (iOS / iPadOS 17 or later)
+
+An iPhone shows no code: pairing is done **once, over a USB cable**, then everything happens over Wi-Fi.
+
+1. Install Apple's USB driver if needed: **iTunes** or the **Apple Devices** app from the Microsoft Store (they install *Apple Mobile Device Service*). tvsign does not bundle it.
+2. Plug the device into the PC, unlock it and tap **Trust**.
+3. In tvsign: **Pair**, **iPhone / iPad** tab, then **Pair over USB**.
+4. Install a first app from tvsign. It installs even if Developer Mode is off, but may not launch yet.
+5. Once the app is installed: *Settings > General > VPN & Device Management*, tap your Apple ID then **Trust** (once per Apple ID).
+6. Turn on **Developer Mode**: *Settings > Privacy & Security > Developer Mode*, then restart. The option only appears after the first install (step 4); tvsign shows a banner while it is off.
+
+An iPhone or iPad is renewed **96 hours** before expiry, and as soon as it is back on the home network. It only answers when awake (screen on or charging helps). Use an Apple ID dedicated to tvsign: AltStore, SideStore or Sideloadly on the same account revoke each other's certificates.
+
 ### 5. The PC must be on for renewals
 
 An app signed with a free account expires after **7 days**. tvsign renews it **60 hours before** it expires, which leaves about two and a half days of margin.
@@ -286,6 +299,19 @@ L'outil **plumesign**, fourni avec tvsign, trouve l'Apple TV en **écoutant le r
 Vérifiez aussi que votre réseau domestique est en profil **Privé** et non **Public** (*Paramètres › Réseau et Internet › Wi-Fi ou Ethernet › Type de profil réseau*). En profil Public, Windows bloque la recherche des appareils.
 
 La page **Diagnostic** de tvsign indique combien d'Apple TV sont visibles sur le réseau. Désinstaller tvsign supprime la règle (Windows demande une confirmation), sauf lors d'une désinstallation **silencieuse** (`/VERYSILENT`) qui la laisse : supprimez-la vous-même dans un PowerShell administrateur avec `netsh advfirewall firewall delete rule name="tvsign plumesign"`. Réinstaller dans un autre dossier met à jour le chemin du programme de la règle.
+
+### Appairer un iPhone ou un iPad (iOS / iPadOS 17 ou plus récent)
+
+Un iPhone n'affiche pas de code : l'appairage se fait **une seule fois par câble USB**, puis tout se passe en Wi-Fi.
+
+1. Installez le pilote USB d'Apple si ce n'est pas fait : **iTunes** ou l'app **Appareils Apple** du Microsoft Store (elles installent *Apple Mobile Device Service*). tvsign ne l'embarque pas.
+2. Branchez l'appareil au PC, déverrouillez-le et touchez **Se fier**.
+3. Dans tvsign : **Appairer**, onglet **iPhone / iPad**, puis **Appairer en USB**.
+4. Installez une première app depuis tvsign. Elle s'installe même si le Mode développeur est désactivé, mais peut ne pas se lancer pour l'instant.
+5. Une fois l'app installée : *Réglages > Général > VPN et gestion de l'appareil*, touchez votre Apple ID puis **Faire confiance** (une fois par Apple ID).
+6. Activez le **Mode développeur** : *Réglages > Confidentialité et sécurité > Mode développeur*, puis redémarrage. L'option n'apparaît qu'après la première installation (étape 4) ; tvsign affiche une bannière tant qu'il est désactivé.
+
+Un iPhone ou un iPad est renouvelé **96 heures** avant l'expiration, et dès qu'il revient sur le réseau de la maison. Il ne répond que réveillé (écran allumé ou en charge, c'est mieux). Utilisez un Apple ID réservé à tvsign : AltStore, SideStore ou Sideloadly sur le même compte révoquent leurs certificats mutuellement.
 
 ### 5. Le PC doit être allumé pour les renouvellements
 

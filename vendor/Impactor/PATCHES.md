@@ -352,6 +352,25 @@ script stops with "does not apply" until then). The merged tree is the reference
   loopback (direct answer, split PTR/SRV/TXT, silence), `locate_via` through a hint, a foreign tag never
   taken for our device.
 
+## iPhone and iPad (plume_utils, plume_core, plumesign)
+
+`crates/plume_utils/src/wireless/usb.rs` (new), `mod.rs`, `crates/plume_core/src/developer/platform.rs`,
+`apps/plumesign/src/commands/pair.rs`, `apps/plumesign/src/commands/account.rs`
+
+Like the unicast entry, the fork's `tvsign` branch does not know these changes: port them there before the
+next `scripts/vendor-impactor` run, and rebase `vendor/patches/0001-tvsign-unicast-discovery.patch` over them
+(its `pair.rs` and `mod.rs` hunks touch the same lines). The merged tree is the reference.
+
+- `usb.rs`: `pair_usb` pairs an iPhone or iPad plugged in over USB (usbmuxd, iOS 17 or later), `select_device`
+  picks the one device (or the one named by `--udid`), `UsbPairing` / `UsbDeviceInfo` carry what lockdown
+  reported. The pairing is stored like a wireless one, without an identifier (the device is not on mDNS yet).
+- `pair.rs`: `pair usb [-u UDID]` (one JSON line, then `PAIRED - <udid>`), `pair import FILE -u UDID` (stores a
+  pairing file made elsewhere after checking that it parses), `pair devmode` (`DEVMODE on` / `DEVMODE off`
+  through AMFI), and a `DeviceFamily` field (`tvos`, `ios`, `ipados`, `visionos`) in `pair info`.
+- `platform.rs`: `DeveloperPlatform::from_name`; `account.rs`: `--platform ios|tvos` on `register-device`
+  and `devices` (iOS when absent, as before the flag worked).
+- Tests: family from class then model, import of a valid file and of garbage, platform names.
+
 ## Misc
 
 - `crates/plume_utils/src/cgbi.rs`: a CgBI PNG with a zero or huge dimension, or a huge inflated size,

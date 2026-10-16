@@ -7,9 +7,10 @@ import re
 import shutil
 import time
 
-from . import backup, db, devices, ipa, notifier, plume, proc, selfupdate, settings, util
+from . import backup, db, devices, families, ipa, notifier, plume, proc, selfupdate, settings, util
 from .config import (ACCOUNT_CHECK_HOURS, APP_WAIT_MINUTES, APPLE_BACKOFF_MINUTES, CHECK_INTERVAL, IPA_DIR,
-                     RELEASE_CHECK_MINUTES, RENEW_TIMEOUT_MINUTES, RETRY_MINUTES, UPDATE_WAIT_MINUTES, WINDOWS)
+                     PRESENCE_MINUTES, RELEASE_CHECK_MINUTES, RENEW_TIMEOUT_MINUTES, RETRY_MINUTES,
+                     UPDATE_WAIT_MINUTES, WINDOWS)
 
 # Arrêt du service en cours : plus aucun renouvellement ne démarre, ceux en cours peuvent finir.
 STOPPING = False
@@ -36,6 +37,11 @@ UPDATE_TRIGGERS = ("nouvelle version", "mise à jour", "nouvelle IPA", "nouvelle
 # Renouvellements qui re-signent toujours et appliquent la version demandée même si la mise à jour auto est coupée.
 FORCE_SIGN = ("manuel", "nouvelle destination", "nouvelle IPA", "retour arrière")
 FORCE_UPDATE = ("mise à jour", "nouvelle source")
+_ABSENT: set[int] = set()               # apps dont le dernier échec vient d'un appareil absent du réseau
+_DEVMODE_LOGGED: set[int] = set()       # appareils dont le mode développeur désactivé est déjà au journal
+PRESENCE_MIN_GAP = 10 * 60              # secondes entre deux essais déclenchés par la réapparition d'un appareil
+REVOKE_WINDOW = 7 * 86400
+REVOKE_LOOP = 3                         # révocations en 7 jours : un autre outil partage le compte
 
 # État de la boucle, exposé dans /api/state pour l'interface.
 HEALTH: dict = {
@@ -61,6 +67,33 @@ def app_dir(app_id: int):
 
 def _fmt(ts: float) -> str:
     return notifier.fmt_time(ts)
+
+
+def _device_of(app: dict) -> dict | None:
+    return db.row("SELECT * FROM devices WHERE id = ?", app["device_id"]) if app.get("device_id") else None
+
+
+def before_hours(app: dict, device: dict | None = None) -> float:
+    """Heures avant l'expiration où le renouvellement automatique commence, pour l'appareil de l'app."""
+    return settings.renew_before_hours_for(device or _device_of(app))
+
+
+def _download_args(device: dict | None) -> dict:
+    """Arguments de plateforme pour ipa.download. Une Apple TV (ou aucun appareil) : aucun, le
+    contrôle d'origine (IPA tvOS) s'applique tel quel."""
+    if not device or device.get("family", "tvos") == "tvos":
+        return {}
+    return dict(family=device["family"], model=device.get("model"))
+
+
+def _older_than_installed(app: dict, found: dict) -> bool:
+    """La release proposée est-elle plus ancienne que celle installée ? (publication retardée de la
+    plus récente, asset effacé puis renvoyé : ne jamais revenir en arrière). Une version épinglée par
+    l'utilisateur est toujours acceptée, même plus ancienne."""
+    if app.get("pinned_tag"):
+        return False
+    have, new = app.get("source_published_at"), found.get("published_at")
+    return bool(have and new and new < have)
 
 
 # ---------- notifications ----------
@@ -220,8 +253,15 @@ def _device_os(app: dict) -> str | None:
     return d["os_version"] if d else None
 
 
+def _os_words(family: str | None) -> tuple[str, str]:
+    """(système, appareil) pour un message : « tvOS », « l'Apple TV » ou « iOS », « cet iPhone »."""
+    system = {"ios": "iOS", "ipados": "iPadOS"}.get(family or "", "tvOS")
+    return system, "l'Apple TV" if system == "tvOS" else f"cet {families.label(family)}"
+
+
 def _blocked_by_os(app: dict) -> str | None:
-    """tvOS minimal demandé par la version refusée, si le refus vient de là (« tvos:26.1 »)."""
+    """Système minimal demandé par la version refusée, si le refus vient de là (« tvos:26.1 », quelle que
+    soit la famille de l'appareil)."""
     block = str(app.get("update_block") or "")
     return block[5:] if block.startswith("tvos:") else None
 
@@ -245,7 +285,8 @@ async def _lift_os_block(app: dict) -> None:
         fields = dict(bad_tag=None, bad_key=None, bad_reason=None, update_tag=None, update_notes=None, update_block=None)
         db.update("apps", app["id"], **fields)
         app.update(fields)
-        db.log(f"{app['name']} : tvOS {have} sur l'Apple TV, la version refusée (tvOS {need} minimum) est de nouveau candidate",
+        system, who = _os_words((_device_of(app) or {}).get("family"))
+        db.log(f"{app['name']} : {system} {have} sur {who}, la version refusée ({system} {need} minimum) est de nouveau candidate",
                app_id=app["id"])
 
 
@@ -282,12 +323,14 @@ async def refresh_source(app: dict, force: bool = False) -> bool:
     dest = app_dir(app["id"]) / "original.ipa"
     prev = app_dir(app["id"]) / "original.prev.ipa"
     hold = dest.with_suffix(".hold")
-    tag, key, sha256, notes = None, None, None, None
+    tag, key, sha256, notes, published = None, None, None, None, None
     try:
         if dest.exists():
             await _lift_os_block(app)
         if app["source_type"] == "github":
             found = await asyncio.to_thread(_latest, app)
+            if found and dest.exists() and _older_than_installed(app, found):
+                return False        # la release la plus récente n'a pas (encore) d'IPA : on garde la version actuelle
             if not found:
                 if not dest.exists():
                     channel = "stable" if app.get("channel") != "beta" else "beta"
@@ -306,9 +349,13 @@ async def refresh_source(app: dict, force: bool = False) -> bool:
             _NO_MATCH_LOGGED.discard(app["id"])
             tag, url, sha256, key = found["tag"], found["url"], found["sha256"], found.get("key")
             notes = found.get("notes")
+            published = found.get("published_at")
+            # plusieurs IPA dans la release (iOS + tvOS) : la suivante est essayée si la première ne convient pas
+            candidates = found.get("candidates") or [{"url": url, "sha256": sha256, "key": key}]
         else:
             tag = url = app["source"]
             key = await asyncio.to_thread(ipa.url_key, url)
+            candidates = [{"url": url, "sha256": None, "key": key}]
         unchanged_sha = None
         if dest.exists():
             if not force and _rejected(app, tag, key):
@@ -338,10 +385,10 @@ async def refresh_source(app: dict, force: bool = False) -> bool:
                    + (" (empreinte SHA-256 vérifiée)" if sha256 else ""), app_id=app["id"])
         # dest remplacé seulement si valide ; un bundle ID différent de l'app suivie est refusé
         expect = app.get("bundle_id") if dest.exists() else None
-        extra = {}
+        extra = _download_args(_device_of(app))
         have_os = _device_os(app)
         if have_os:
-            extra["max_os"] = have_os             # une release qui demande un tvOS plus récent que la TV est refusée
+            extra["max_os"] = have_os             # une release qui demande un système plus récent que l'appareil est refusée
         if unchanged_sha:
             extra["unchanged_sha"] = unchanged_sha
         # dernière IPA installée gardée à côté (retour en arrière) ; si une mise à jour jamais installée
@@ -349,7 +396,16 @@ async def refresh_source(app: dict, force: bool = False) -> bool:
         keep = dest.exists() and not pending_update(app)
         if keep:
             await asyncio.to_thread(ipa.keep_copy, dest, hold, not unchanged_sha)   # copie possible : pas sur la boucle
-        info = await asyncio.to_thread(ipa.download, url, dest, sha256, expect, **extra)
+        info = None
+        for i, cand in enumerate(candidates):
+            try:
+                info = await asyncio.to_thread(ipa.download, cand["url"], dest, cand.get("sha256"), expect, **extra)
+                # `key` reste celle de la première IPA de la release (celle que new_release() et _unchanged()
+                # comparent), même si une suivante a été installée : sinon la même release serait retéléchargée en boucle
+                break
+            except ipa.PlatformRejected:
+                if i == len(candidates) - 1:
+                    raise      # aucune IPA de la release ne convient à cet appareil
         if unchanged_sha:
             _LINK_CHECKED[app["id"]] = time.time()
         if info is None:
@@ -361,11 +417,12 @@ async def refresh_source(app: dict, force: bool = False) -> bool:
     except ipa.OsTooOld as e:
         if not dest.exists():
             raise
-        # TV trop ancienne pour cette version : app installée intacte, version non retéléchargée à chaque
-        # passage, et reprise dès que la TV est mise à jour (_lift_os_block)
+        # appareil trop ancien pour cette version : app installée intacte, version non retéléchargée à chaque
+        # passage, et reprise dès que l'appareil est mis à jour (_lift_os_block)
         db.update("apps", app["id"], bad_tag=tag, bad_key=key, update_tag=tag, update_notes=notes or None,
                   update_block=f"tvos:{e.min_os}")
-        params = dict(name=app["name"], tag=_link_label(app, tag), need=e.min_os, have=e.have)
+        system, who = _os_words(e.family)
+        params = dict(name=app["name"], tag=_link_label(app, tag), need=e.min_os, have=e.have, system=system, who=who)
         db.log(notifier.text("update_blocked_os", "fr", **params), "warn", app_id=app["id"])
         await notify(notifier.text("update_blocked_os", **params), "default", "update", app=app["name"])
         return False
@@ -392,17 +449,36 @@ async def refresh_source(app: dict, force: bool = False) -> bool:
         hold.unlink(missing_ok=True)
     db.update("apps", app["id"], source_tag=tag, source_key=key, version=info["version"],
               bundle_id=info["bundle_id"], bad_tag=None, bad_key=None, bad_reason=None,
-              source_sha256=info.get("sha256"),
-              notes=notes or None, update_tag=None, update_notes=None, update_block=None)
+              source_sha256=info.get("sha256"), source_published_at=published,
+              notes=notes or None, update_tag=None, update_notes=None, update_block=None, **ipa_columns(info))
     return True
+
+
+def app_ids_used(app: dict) -> int:
+    """App IDs que l'app consomme sur le compte : un, plus un par extension (widget, partage…).
+    Estimation tirée de l'IPA ; un compte gratuit en crée 10 par période de 7 jours."""
+    n = 1
+    for w in (app.get("warnings") or "").split(","):
+        if w.startswith("appex:") and w[6:].isdigit():
+            n += int(w[6:])
+    return n
+
+
+def ipa_columns(info: dict) -> dict:
+    """Colonnes de l'app tirées de l'IPA (plateforme, familles d'appareils, limites du compte gratuit)."""
+    return dict(platform=info.get("platform"),
+                ui_family=",".join(str(n) for n in info.get("ui_family") or []) or None,
+                warnings=",".join(info.get("warnings") or []) or None)
 
 
 async def _beta_hint(app: dict) -> tuple[str, str | None]:
     """Canal stable sans release : indique si le canal beta, lui, en a une (texte, tag)."""
     try:
         prefixes, prereleases = ipa.release_rule({**app, "channel": "beta"})
+        device = _device_of(app)
+        kw = {"family": device["family"]} if device and device.get("family") not in (None, "tvos") else {}
         found = await asyncio.to_thread(ipa.latest_github, app["source"], prefixes, prereleases,
-                                        app.get("asset_name"))
+                                        app.get("asset_name"), **kw)
     except Exception:  # noqa: BLE001 - simple indication
         return "", None
     return (f" ; une version beta existe ({found['tag']}) : choisis le canal Beta", found["tag"]) if found else ("", None)
@@ -418,8 +494,11 @@ class NoRelease(RuntimeError):
 
 def _latest(app: dict) -> dict | None:
     prefixes, prereleases = ipa.release_rule(app)
+    device = _device_of(app)
+    # famille de l'appareil : choisit l'IPA iOS ou tvOS quand une release publie les deux
+    kw = {"family": device["family"]} if device and device.get("family") not in (None, "tvos") else {}
     return ipa.latest_github(app["source"], prefixes, prereleases, app.get("asset_name"),
-                             app.get("pinned_tag") or None)
+                             app.get("pinned_tag") or None, **kw)
 
 
 def _release_error(app: dict, e: Exception) -> None:
@@ -467,6 +546,8 @@ async def new_release(app: dict) -> bool:
     differs = tag != app["source_tag"] or (bool(key) and app.get("source_key") not in (None, key))
     if not differs:
         _note_update(app, None, None, None)
+        return False
+    if _older_than_installed(app, found):
         return False
     if _rejected(app, tag, key):
         if not _blocked_by_os(app) and app.get("update_block") != "rollback":
@@ -607,7 +688,7 @@ def _reusable_signature(app: dict, original, signed, now: float) -> float | None
         exp = ipa.profile_expiry(signed)
     except Exception:  # noqa: BLE001 - fichier partiel ou corrompu
         return None
-    if not exp or exp - now < (settings.renew_before_hours() + 24) * 3600:
+    if not exp or exp - now < (before_hours(app) + 24) * 3600:
         return None
     if app["expires_at"] and abs(exp - app["expires_at"]) < 120:
         return None  # c'est la signature déjà installée : on veut un nouveau profil
@@ -769,8 +850,9 @@ async def _preflight_os(device: dict, original) -> None:
     except Exception:  # noqa: BLE001
         pass
     if ipa.os_older(device.get("os_version"), need):
-        raise TvosTooOld(f"cette app demande tvOS {need} ou plus, « {device['name']} » est en tvOS "
-                         f"{device.get('os_version')} : mets l'Apple TV à jour ou choisis une version plus ancienne")
+        system, who = _os_words(device.get("family"))
+        raise TvosTooOld(f"cette app demande {system} {need} ou plus, « {device['name']} » est en {system} "
+                         f"{device.get('os_version')} : mets {who} à jour ou choisis une version plus ancienne")
 
 
 async def _fall_back(app_id: int, first: Exception, deliver, signed) -> float:
@@ -846,6 +928,8 @@ async def _renew(app_id: int, trigger: str) -> None:
             device = db.row("SELECT * FROM devices WHERE id = ?", device["id"])
         else:
             await devices.check_reachable(device)
+        if devices.is_mobile(device):
+            await _devmode_banner(device)
 
         updated = await refresh_source(app, force=trigger in FORCE_UPDATE)
         cur = db.row("SELECT * FROM apps WHERE id = ?", app_id) or app
@@ -879,15 +963,20 @@ async def _renew(app_id: int, trigger: str) -> None:
                 def lock_state(state: str) -> None:
                     _phase(app_id, "queued" if state == "waiting" else "signing")
 
-                await plume.ensure_device(email, device["udid"], device["name"], on_lock=lock_state)
+                # iPhone / iPad : la plateforme est précisée à Apple ; une Apple TV garde l'appel d'origine
+                plat = {"platform": "ios"} if devices.is_mobile(device) else {}
+                await plume.ensure_device(email, device["udid"], device["name"], on_lock=lock_state, **plat)
                 db.log(f"{app['name']} : signature avec {email}", app_id=app_id, journal=not retry)
                 if await plume.sign(email, original, signed, on_lock=lock_state):
-                    db.log(notifier.text("cert_revoked", "fr", email=email, name=app["name"]), "warn", app_id=app_id)
+                    # plusieurs révocations en 7 jours : un autre outil partage l'Apple ID et les deux se révoquent
+                    # en boucle
+                    kind = "cert_revoke_loop" if note_revocation(email) >= REVOKE_LOOP else "cert_revoked"
+                    params = dict(email=email, name=app["name"], times=REVOKE_LOOP)
+                    db.log(notifier.text(kind, "fr", **params), "warn", app_id=app_id)
                     # bandeau durable dans l'interface (une notification peut ne pas être configurée)
                     settings.raw_set("revocation_notice", json.dumps({"email": email, "app": app["name"],
                                                                       "at": time.time()}))
-                    await notify(notifier.text("cert_revoked", email=email, name=app["name"]), "default", "account",
-                                 app=app["name"])
+                    await notify(notifier.text(kind, **params), "default", "account", app=app["name"])
                     # les autres apps tvsign du compte, signées avec le certificat révoqué, sont à refaire
                     # tout de suite plutôt qu'au prochain contrôle périodique
                     await _guarded("contrôle des certificats", _check_certificates(email))
@@ -907,8 +996,13 @@ async def _renew(app_id: int, trigger: str) -> None:
                            deadline=(since or time.time()) + wait_cap)
                     if "waiting" not in logged:
                         logged.add("waiting")
-                        db.log(f"{app['name']} : installation en attente, l'app est sans doute ouverte sur "
-                               f"« {device['name']} » ; elle se terminera dès sa fermeture", "warn", app_id=app_id)
+                        if devices.is_mobile(device):
+                            # iOS remplace une app ouverte : si l'installation attend, c'est autre chose
+                            db.log(f"{app['name']} : installation en attente sur « {device['name']} » "
+                                   "(appareil verrouillé, occupé ou presque plein ?)", "warn", app_id=app_id)
+                        else:
+                            db.log(f"{app['name']} : installation en attente, l'app est sans doute ouverte sur "
+                                   f"« {device['name']} » ; elle se terminera dès sa fermeture", "warn", app_id=app_id)
                 else:
                     _phase(app_id, step, percent=percent)
 
@@ -933,20 +1027,21 @@ async def _renew(app_id: int, trigger: str) -> None:
                       cert_serial=_serials(signed, email), installed_ipa=done["source_sha256"],
                       verified_at=verified_at, installed_bundle=bundle,
                       installed_version=done.get("version"), installed_tag=done.get("source_tag"))
-        if expires - now <= settings.renew_before_hours() * 3600 + CHECK_INTERVAL:
+        if expires - now <= before_hours(app, device) * 3600 + CHECK_INTERVAL:
             # profil déjà dans la fenêtre de renouvellement (réglage au maximum, profil plus court que prévu) :
             # sans ce délai, la boucle re-signerait et réinstallerait à chaque passage
             fields["next_attempt_at"] = now + 6 * 3600
             db.log(f"{app['name']} : le profil obtenu expire le {_fmt(expires)}, dans la fenêtre de renouvellement "
-                   f"({settings.renew_before_hours():g} h) : prochain essai dans 6 h", "warn", app_id=app_id)
+                   f"({before_hours(app, device):g} h) : prochain essai dans 6 h", "warn", app_id=app_id)
         if done and not done.get("account_email"):
             # fige le compte : un autre compte = autre équipe = autre bundle ID (2e copie).
             # Pas d'écrasement d'un compte choisi pendant l'opération.
             fields["account_email"] = email
         db.update("apps", app_id, **fields)
         _OUTCOME[app_id] = ("ok", None)
+        _ABSENT.discard(app_id)
         db.log(f"{app['name']} : renouvelée ({trigger}), valable jusqu'au {_fmt(expires)}, "
-               f"prochain renouvellement auto le {_fmt(expires - settings.renew_before_hours() * 3600)}",
+               f"prochain renouvellement auto le {_fmt(expires - before_hours(app, device) * 3600)}",
                app_id=app_id)
         if was_pending and done.get("source_sha256") == cur.get("source_sha256"):
             notes = (cur.get("notes") or "").strip()
@@ -973,6 +1068,7 @@ async def _renew(app_id: int, trigger: str) -> None:
         e = _as_limit(e)
         now = time.time()
         transient = is_transient(e)
+        (_ABSENT.add if isinstance(e, devices.Unreachable) else _ABSENT.discard)(app_id)
         reconnect = isinstance(e, plume.SessionExpired)
         exp = app["expires_at"]
         optional = _optional_update(app, trigger, was_ok, now)
@@ -985,7 +1081,7 @@ async def _renew(app_id: int, trigger: str) -> None:
             # TV). La mise à jour est retentée plus tard, avec recul, sans jamais repousser le renouvellement
             # obligatoire (pas plus tard que l'ouverture de sa fenêtre) ; le message est montré sur la carte.
             fields["next_attempt_at"] = min(fields["next_attempt_at"],
-                                            max(now + 60, exp - settings.renew_before_hours() * 3600))
+                                            max(now + 60, exp - before_hours(app) * 3600))
             db.update("apps", app_id, status="ok", last_error=None, update_error=str(e)[:500], **fields)
             _OUTCOME[app_id] = ("skipped", str(e))
             waiting = transient or fields["needs_action"] in ("session", "pairing")
@@ -1013,7 +1109,7 @@ async def _renew(app_id: int, trigger: str) -> None:
 def _optional_update(app: dict, trigger: str, was_ok: bool, now: float) -> bool:
     """Mise à jour facultative : l'app installée reste valable bien au-delà de la fenêtre de renouvellement."""
     exp = app["expires_at"]
-    return bool(trigger in UPDATE_TRIGGERS and was_ok and exp and exp - now > settings.renew_before_hours() * 3600)
+    return bool(trigger in UPDATE_TRIGGERS and was_ok and exp and exp - now > before_hours(app) * 3600)
 
 
 def urgent(app: dict, now: float) -> bool:
@@ -1022,10 +1118,12 @@ def urgent(app: dict, now: float) -> bool:
     return not exp or exp - now < 24 * 3600
 
 
-def due(app: dict, now: float) -> bool:
+def due(app: dict, now: float, ignore_retry: bool = False) -> bool:
+    """L'app doit-elle être renouvelée ? ignore_retry : sans tenir compte du délai d'attente après un
+    échec (appareil réapparu sur le réseau)."""
     if not app["enabled"] or app["id"] in _RUNNING:
         return False
-    if app["next_attempt_at"] and app["next_attempt_at"] > now:
+    if app["next_attempt_at"] and app["next_attempt_at"] > now and not ignore_retry:
         return False
     if not urgent(app, now) and not settings.in_renew_window(now):
         return False        # renouvellement non urgent : on attend la plage horaire choisie
@@ -1033,7 +1131,39 @@ def due(app: dict, now: float) -> bool:
         # échec (même loin de l'expiration : nouvelle version, TV en veille…) ou essai interrompu
         # par un redémarrage : on réessaie, au rythme de next_attempt_at
         return True
-    return app["expires_at"] - now < settings.renew_before_hours() * 3600
+    return app["expires_at"] - now < before_hours(app) * 3600
+
+
+async def _devmode_banner(device: dict) -> None:
+    """Vérifie le mode développeur avant un renouvellement. Information seulement : l'app déjà
+    installée doit rester renouvelée, l'interface affiche la bannière."""
+    try:
+        on = await devices.check_devmode(device)
+    except Exception as e:  # noqa: BLE001 - un échec ici ne doit pas empêcher le renouvellement
+        db.log(f"« {device['name']} » : mode développeur non vérifié ({e})", "warn")
+        return
+    if on is False:
+        if device["id"] not in _DEVMODE_LOGGED:
+            _DEVMODE_LOGGED.add(device["id"])
+            db.log(f"« {device['name']} » : mode développeur désactivé, les apps signées ne s'y lanceront pas "
+                   "(Réglages › Confidentialité et sécurité › Mode développeur)", "warn")
+    else:
+        _DEVMODE_LOGGED.discard(device["id"])
+
+
+def note_revocation(email: str, now: float | None = None) -> int:
+    """Note une révocation de certificat du compte ; renvoie le nombre de révocations des 7 derniers
+    jours. Trois ou plus : un autre outil de sideload partage l'Apple ID et les deux se révoquent
+    en boucle."""
+    now = now or time.time()
+    key = f"revoked:{email}"
+    try:
+        times = [t for t in json.loads(settings.raw_get(key) or "[]") if now - t < REVOKE_WINDOW]
+    except (ValueError, TypeError):
+        times = []
+    times.append(now)
+    settings.raw_set(key, json.dumps(times))
+    return len(times)
 
 
 def window_view(app: dict, now: float, before_hours: float) -> dict:
@@ -1092,13 +1222,15 @@ def account_slots(apps: list[dict], devices_: list[dict], accounts: list[dict], 
 
 
 def add_warnings(app: dict) -> list[str]:
-    """Avertissements à l'ajout d'une app : « slots_full » si ce compte a déjà 3 apps actives sur cette TV."""
+    """Avertissements à l'ajout d'une app : les limites du compte gratuit vues dans l'IPA (« appex:2 »,
+    « push »… : colonne warnings) et « slots_full » si ce compte a déjà 3 apps actives sur cet appareil."""
+    found = [w for w in (app.get("warnings") or "").split(",") if w]
     if not app.get("device_id"):
-        return []
+        return found
     default = plume.default_account()
     same = [a for a in db.rows("SELECT * FROM apps WHERE enabled = 1 AND device_id = ?", app["device_id"])
             if _same_account(a["account_email"] or default, app["account_email"] or default)]
-    return ["slots_full"] if len(same) > MAX_ACTIVE_APPS else []
+    return found + (["slots_full"] if len(same) > MAX_ACTIVE_APPS else [])
 
 
 # ---------- reprise après une action de l'utilisateur ----------
@@ -1298,6 +1430,8 @@ def _log_quietly(message: str, level: str = "error", app_id: int | None = None) 
         db.log(message, level, app_id=app_id)
     except Exception as e:  # noqa: BLE001
         print(f"[{level}] {message} (journal indisponible : {e})", flush=True)
+
+
 def suspended_for(expected_at: float | None, now: float, tolerance: float = 180.0) -> float:
     """Secondes de retard d'un passage de la boucle sur l'heure prévue (0 si dans la tolérance) : l'horloge murale
     a avancé sans que la boucle tourne, donc le PC était en veille ou hibernation, ou le processus arrêté."""
@@ -1322,6 +1456,44 @@ def _duration(seconds: float) -> str:
     if hours < 48:
         return f"{hours} h {minutes:02d} min"
     return f"{hours // 24} j {hours % 24} h"
+
+
+async def presence_check() -> None:
+    """iPhone / iPad : sont-ils de retour sur le réseau ? Un téléphone qui rentre à la maison est
+    renouvelé tout de suite, sans attendre le prochain passage ni la fin du délai après échec.
+    Rien ne se passe (pas même une recherche mDNS) tant qu'aucune app de téléphone n'est due."""
+    now = time.time()
+    todo = []
+    for app in db.rows("SELECT a.* FROM apps a JOIN devices d ON d.id = a.device_id "
+                       "WHERE a.enabled = 1 AND d.family IN ('ios', 'ipados') "
+                       "AND d.pairing_lost = 0 AND d.legacy_pairing = 0"):
+        if not due(app, now, ignore_retry=True):
+            continue
+        waiting = app["next_attempt_at"] and app["next_attempt_at"] > now
+        if waiting and app["id"] not in _ABSENT:
+            continue        # échec sans rapport avec la présence : le délai habituel s'applique
+        todo.append(app)
+    if not todo:
+        return
+    found = await plume.discover(4)
+    seen = {d["udid"].lower(): d for d in found if d.get("kind") == "paired" and d.get("udid")}
+    for device_id in dict.fromkeys(a["device_id"] for a in todo):
+        device = db.row("SELECT * FROM devices WHERE id = ?", device_id)
+        entry = seen.get(((device or {}).get("pairing_udid") or "").lower())
+        if not entry:
+            continue
+        db.update("devices", device_id, last_seen=time.time(), last_ip=entry.get("ip"),
+                  last_port=entry.get("port"))
+        for app in [a for a in todo if a["device_id"] == device_id]:
+            app = db.row("SELECT * FROM apps WHERE id = ?", app["id"])
+            now = HEALTH["last_loop_at"] = time.time()
+            if not app or app["id"] in _RUNNING or STOPPING or not due(app, now, ignore_retry=True):
+                continue
+            if app["last_attempt_at"] and now - app["last_attempt_at"] < PRESENCE_MIN_GAP:
+                continue
+            db.log(f"« {device['name']} » est de retour sur le réseau : renouvellement de {app['name']}",
+                   app_id=app["id"])
+            await renew(app["id"], "présence")
 
 
 async def _guarded(what: str, coro) -> None:
@@ -1410,6 +1582,23 @@ async def tick(now: float, last_account_check: float, last_release_check: float)
     return last_account_check, last_release_check
 
 
+async def _sleep_watching() -> None:
+    """Attente entre deux passages ; si l'on suit des iPhone / iPad, regarde de temps en temps s'ils
+    sont revenus sur le réseau (PRESENCE_MINUTES, 0 : jamais)."""
+    end = time.monotonic() + CHECK_INTERVAL
+    step = PRESENCE_MINUTES * 60
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            return
+        if step <= 0 or left <= step:
+            await asyncio.sleep(left)
+            return
+        await asyncio.sleep(step)
+        if not STOPPING:
+            await _guarded("détection des appareils", presence_check())
+
+
 async def loop() -> None:
     last_account_check = last_release_check = 0.0
     expected_at = None
@@ -1433,7 +1622,7 @@ async def loop() -> None:
             HEALTH["loop_error"] = str(e)
             _log_quietly(f"boucle de renouvellement : {e}")
         expected_at = HEALTH["next_check_at"] = time.time() + CHECK_INTERVAL
-        await asyncio.sleep(CHECK_INTERVAL)
+        await _sleep_watching()
 
 
 async def supervise() -> None:

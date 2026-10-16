@@ -140,6 +140,15 @@ MIGRATIONS = [
     ("apps", "bad_reason", "TEXT"),          # pourquoi cette release est refusée (affiché sur la carte)
     ("apps", "on_tv", "INTEGER"),            # app trouvée (1) ou non (0) sur l'Apple TV à la dernière vérification
     ("apps", "on_tv_checked_at", "REAL"),    # date de cette vérification
+    # iPhone / iPad : famille de l'appareil (tvos | ios | ipados | visionos), tvos pour l'existant
+    ("devices", "family", "TEXT NOT NULL DEFAULT 'tvos'"),
+    ("devices", "dev_mode", "INTEGER"),      # mode développeur : 1 activé, 0 désactivé, NULL inconnu
+    ("devices", "dev_mode_at", "REAL"),
+    ("devices", "renew_before_hours", "REAL"),   # délai de renouvellement propre à l'appareil (sinon réglage)
+    ("apps", "platform", "TEXT"),            # DTPlatformName de l'IPA (appletvos, iphoneos…)
+    ("apps", "ui_family", "TEXT"),           # UIDeviceFamily de l'IPA, ex. « 1,2 »
+    ("apps", "warnings", "TEXT"),            # limites du compte gratuit détectées dans l'IPA (codes séparés par des virgules)
+    ("apps", "source_published_at", "TEXT"), # date de publication de la release installée (jamais de retour en arrière)
 ]
 
 
@@ -168,8 +177,12 @@ def snapshot(dest) -> None:
 def migrate(conn: sqlite3.Connection) -> None:
     """Crée les tables manquantes et ajoute les colonnes de MIGRATIONS (sans rien supprimer)."""
     conn.executescript(SCHEMA)
-    for table, col, kind in _pending(conn):
+    todo = _pending(conn)
+    for table, col, kind in todo:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {kind}")
+    if ("apps", "platform", "TEXT") in todo:
+        # avant l'arrivée des iPhone/iPad, toute app suivie était une app tvOS
+        conn.execute("UPDATE apps SET platform = 'appletvos' WHERE platform IS NULL")
 
 
 def init() -> None:

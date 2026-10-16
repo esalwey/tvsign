@@ -3,6 +3,7 @@ mod pairing;
 mod store;
 mod tunnel;
 mod unicast;
+mod usb;
 
 pub use discovery::{
     DiscoveredDevice, MANUAL_PAIRING_SERVICE, REMOTE_PAIRING_SERVICE, ServiceKind, discover,
@@ -15,3 +16,4 @@ pub use tunnel::{
     locate_via,
 };
 pub use unicast::{DIRECT_TIMEOUT, Hint, MDNS_PORT, discover_at};
+pub use usb::{UsbDeviceInfo, UsbPairing, pair_usb, select_device};

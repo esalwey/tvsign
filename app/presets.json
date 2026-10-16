@@ -5,6 +5,7 @@
       "name": "NuvioTV",
       "repo": "esalwey/NuvioTV",
       "asset": "NuvioTV.ipa",
+      "platform": "appletvos",
       "channels": {
         "stable": {
           "tag_prefixes": ["tvos-v"],

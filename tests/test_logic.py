@@ -238,8 +238,12 @@ class Api(unittest.TestCase):
         self.assertEqual((r.status_code, r.json()["detail"]), (400, "not_an_ipa"))
 
     def test_not_tvos(self):
-        r = self.add(make_ipa("iphoneos"))
-        self.assertEqual((r.status_code, r.json()["detail"]), (400, "not_tvos:iphoneos"))
+        # sans appareil choisi, l'IPA est comparée à une Apple TV ; la matrice plateforme x famille
+        # (iPhone, iPad, Vision Pro) est dans test_ios.py
+        for platform, code in (("iphoneos", "not_tvos:iphoneos"), ("xros", "not_tvos:xros"),
+                               ("watchos", "not_tvos:watchos")):
+            r = self.add(make_ipa(platform))
+            self.assertEqual((r.status_code, r.json()["detail"]), (400, code))
         self.assertEqual(db.rows("SELECT id FROM apps WHERE bundle_id = 'com.example.tv'"), [])
 
     def test_add_duplicate_patch_delete(self):
