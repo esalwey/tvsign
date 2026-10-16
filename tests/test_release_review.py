@@ -37,6 +37,7 @@ from test_devices import Calls, make_app, make_device  # noqa: E402
 from test_hotfix import NEVER_SIGNED_IN, NOT_WINDOWS, SMS_403  # noqa: E402
 from test_ios import HEADERS, add_device, make_ipa  # noqa: E402
 from test_updates import make_ipa as make_tv_ipa, sha  # noqa: E402
+from test_web import i18n  # noqa: E402
 
 STORE = PLUME_HOME / "PlumeImpactor"
 HOUR = 3600
@@ -827,6 +828,90 @@ class VersionStrings(unittest.TestCase):
         self.assertEqual(in_docker, in_config)
         self.assertEqual(in_config, in_windows + "-dev")
         self.assertRegex(in_windows, r"^\d+\.\d+\.\d+$")
+
+
+# ---------- la documentation parle comme l'interface ----------
+
+@unittest.skipUnless(shutil.which("node"), "Node.js absent")
+class DocsMatchTheInterface(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ui = i18n()
+        cls.readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        cls.guide = (ROOT / "windows" / "README-windows.md").read_text(encoding="utf-8")
+        cls.en, cls.fr = cls.readme.split("\n## Français", 1)
+
+    def test_the_labels_the_docs_quote_are_the_labels_of_the_interface(self):
+        for key, where in (("pair_manual", "readme"), ("sign_out_all", "readme"), ("replace_ipa", "readme"),
+                           ("test_connection", "readme"), ("st_not_on_tv", "readme"), ("update_check", "guide")):
+            en, fr = self.ui[key][1], self.ui[key][0]
+            doc_en, doc_fr = ((self.en, self.fr) if where == "readme"
+                              else self.guide.split("\n## Français", 1))
+            self.assertIn(en.rstrip("?"), doc_en, key)
+            self.assertIn(fr, doc_fr, key)
+
+    def test_no_name_left_over_from_older_wording(self):
+        for stale in ("Apple TV section", "section Apple TV", "Settings › New versions", "Réglages › Nouvelles versions",
+                      "tvsign-setup-1.0.0.exe", "App Distante", "provider you chose", "fournisseur de votre choix",
+                      "Se déconnecter partout", "Test de connexion", "Try *Renew now*", "Essayer *Renouveler",
+                      'alt="tvOS 26+"', "From version 1.0.1", "including one issued before this version"):
+            for name, text in (("README", self.readme), ("guide", self.guide)):
+                self.assertNotIn(stale, text, f"{name}: {stale}")
+
+    def test_the_default_certificate_policy_is_described_as_it_is(self):
+        self.assertNotIn("Signing **revokes the certificate", self.readme)
+        self.assertNotIn("La signature **révoque le certificat créé par", self.readme)
+        self.assertIn("By default tvsign only replaces its own", self.en)
+        self.assertIn("Par défaut, tvsign ne remplace que ses propres", self.fr)
+
+    def test_the_readme_opens_with_the_two_ways_in_and_the_smart_app_control_page(self):
+        for text, title, anchor in ((self.en, "### Quick start", "windows-blocks-the-installer-smart-app-control-antivirus"),
+                                    (self.fr, "### Démarrage rapide", "windows-bloque-linstalleur-smart-app-control-antivirus")):
+            self.assertIn(title, text)
+            self.assertIn("install.sh --install", text.split(title, 1)[1][:1500])
+            self.assertIn(anchor, text.split(title, 1)[1][:1500])
+        # et ces ancres existent dans le guide
+        self.assertIn("#### Windows blocks the installer (Smart App Control, antivirus)", self.guide)
+        self.assertIn("#### Windows bloque l'installeur (Smart App Control, antivirus)", self.guide)
+
+    def test_the_quit_wait_is_the_same_in_the_guide_and_the_installer(self):
+        iss = (ROOT / "windows" / "installer" / "tvsign.iss").read_text(encoding="utf-8")
+        self.assertRegex(iss, r"en\.QuitWait=.*up to 5 minutes")
+        self.assertIn("gets up to 5 minutes to finish first", self.guide)
+        self.assertIn("dispose de 5 minutes au plus", self.guide)
+
+    def test_iphone_support_is_called_experimental_in_both_documents(self):
+        self.assertIn("treat it as experimental", self.readme)
+        self.assertIn("support is **experimental**", self.guide)
+        self.assertIn("est **expérimentale**", self.guide)
+
+    def test_what_leaves_the_machine_and_how_to_go_back_are_written_down(self):
+        for title in ("### What leaves your machine", "### Ce qui sort de votre machine", "**Going back to an older version.**",
+                      "**Revenir à une version plus ancienne.**"):
+            self.assertIn(title, self.readme)
+        self.assertIn("**Going back to an older version.**", self.guide)
+        self.assertIn("**Revenir à une version plus ancienne.**", self.guide)
+
+    def test_the_badge_says_what_tvos_26_is(self):
+        self.assertIn('alt="NuvioTV: tvOS 26+"', self.readme)
+
+    def test_the_changelog_covers_this_release(self):
+        log = (ROOT / "docs" / "CHANGELOG.md").read_text(encoding="utf-8")
+        version = (ROOT / "windows" / "version.txt").read_text(encoding="utf-8").strip()
+        self.assertTrue(log.startswith("# Changelog"))
+        self.assertIn(f"## {version}", log)
+        self.assertLess(log.index(f"## {version}"), log.index("## 1.0.1"))
+        for word in ("iPhone and iPad", "Several Apple TVs", "Going back to 1.0.x", "Apple account full", "TZ"):
+            self.assertIn(word, log)
+        self.assertNotIn("provider", log)
+
+    def test_the_imported_certificate_stays_a_secondary_route(self):
+        section = self.en.split("### Signing with an imported certificate (advanced)", 1)[1].split("###", 1)[0]
+        self.assertIn("never needs this", section)
+        self.assertIn("does not recommend or contact any signing service", section)
+        html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('<details class="details avance" id="edit-advanced">', html)       # closed unless an imported certificate is in use
+        self.assertIn('<div id="backup-certs-row" hidden>', html)
 
 
 if __name__ == "__main__":

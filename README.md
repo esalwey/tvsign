@@ -6,7 +6,7 @@
 <p align="center">
   <img alt="Docker amd64 / arm64" src="https://img.shields.io/badge/docker-amd64%20%C2%B7%20arm64-2f6bff?style=flat-square&logo=docker&logoColor=white">
   <img alt="Windows 10 / 11" src="https://img.shields.io/badge/windows-10%20%C2%B7%2011-111318?style=flat-square">
-  <img alt="tvOS 26+" src="https://img.shields.io/badge/tvOS-26%2B-000?style=flat-square&logo=apple">
+  <img alt="NuvioTV: tvOS 26+" src="https://img.shields.io/badge/NuvioTV-tvOS%2026%2B-000?style=flat-square&logo=apple">
   <img alt="iOS / iPadOS 17+" src="https://img.shields.io/badge/iOS%20%C2%B7%20iPadOS-17%2B-000?style=flat-square&logo=apple">
   <a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-555?style=flat-square"></a>
 </p>
@@ -16,6 +16,18 @@
 ---
 
 ## English
+
+### Quick start
+
+- **A Windows PC that stays on (the simplest way):** download `tvsign-setup-<version>.exe` from the
+  [Releases page](https://github.com/esalwey/tvsign/releases), run it and follow the wizard. The installer
+  is not code-signed yet: SmartScreen asks for a confirmation (*More info → Run anyway*), and on Windows 11
+  with **Smart App Control** turned on it cannot run at all, see
+  [Windows blocks the installer](windows/README-windows.md#windows-blocks-the-installer-smart-app-control-antivirus).
+- **A NAS, a Raspberry Pi or any Linux box:** `sh install.sh --install` (it needs Docker), then open
+  `http://<host>:8765`. Details in [Install](#install).
+- In both cases: a dedicated free Apple ID, the Apple TV (or iPhone / iPad) on the same network, and a
+  machine that stays on. The wizard walks through the rest.
 
 ### What it is
 
@@ -52,6 +64,9 @@ host or distribute any app content.
   server (`ani.jkcoxson.com` by default, `ani2.stikstore.app` as automatic fallback, changeable in
   Settings), `api.github.com` for releases.
 - A correct clock (NTP).
+- A system version the app can run on: each app has its own minimum (`MinimumOSVersion`), which tvsign
+  checks against the device; the suggested NuvioTV app needs tvOS 26 or later. iPhone and iPad need
+  iOS / iPadOS 17 or later for the wireless renewal.
 - Not supported: Docker Desktop on Windows/macOS (use the Windows edition), 32-bit ARM, TrueNAS CORE.
 
 No `NET_ADMIN`, no `/dev/net/tun` and no root are needed: the encrypted tunnel to the device runs
@@ -124,16 +139,18 @@ bridge of the TV's LAN, not a NATed network. Unprivileged LXC is fine: no TUN de
    see below), and the app to keep installed.
 
 The wizard says "all set" only once the first install has actually succeeded; until then it shows
-the live state of the install (and the reason if it failed). Signing **revokes the certificate
-another tool (AltStore, Sideloadly, Xcode) created with the same Apple ID**, which makes that
-tool's apps stop launching: use an Apple ID dedicated to tvsign. The machine running tvsign must
-stay awake and on the network (a PC or NAS that sleeps renews nothing); only the Apple TV may sleep.
+the live state of the install (and the reason if it failed). By default tvsign only replaces its own
+certificates: if the Apple ID already holds 2, signing stops with an "Apple account full" message until
+you revoke one at developer.apple.com or allow it in Settings › Certificates. AltStore, SideStore and
+Sideloadly can still revoke tvsign's certificate, which makes its apps stop launching: use an Apple ID
+dedicated to tvsign. The machine running tvsign must stay awake and on the network (a PC or NAS that
+sleeps renews nothing); only the Apple TV may sleep.
 
 The Diagnostics page re-runs the environment checks at any time.
 
 ### Several Apple TVs
 
-Pair every TV once (Apple TV section › Pair). To keep the same app on a second TV, open the app's
+Pair every TV once (Devices › Pair). To keep the same app on a second TV, open the app's
 **Settings**, choose the TV under "Same app on another Apple TV" and press *Add to this TV*: a
 separate card is created for that TV, with its own status, signature and expiry (the downloaded
 file is reused, and both TVs use the same Apple ID and the same App ID). Adding the same app twice
@@ -146,7 +163,7 @@ Symptoms: *No Apple TV waiting to be paired*, or renewals failing with "unreacha
 is on. The Diagnostics page says whether the cause looks like a Docker bridge network or a blocked
 multicast, and whether the TV still answers directly.
 
-- **Pairing:** in the pair dialog, open *The TV isn't found? Enter its address*, type the TV's IP
+- **Pairing:** in the pair dialog, open *TV not found? Enter its address*, type the TV's IP
   address (Apple TV: Settings › Network) and press *Search at this address*.
 - **Already paired TVs:** tvsign remembers each TV's last address and queries it directly before
   browsing the network, so renewals keep working when multicast is filtered. If the TV gets a new
@@ -160,7 +177,7 @@ multicast, and whether the TV still answers directly.
 
 - **App cards** show the state of each app. tvsign checks (read-only) that an app is still on the
   Apple TV when you press **Test connection** (the periodic check, every `TVSIGN_INSTALL_CHECK_HOURS`,
-  also reinstalls an app that disappeared); an app seen missing shows "Not found on the TV" with a
+  also reinstalls an app that disappeared); an app seen missing shows "Not found on the device" with a
   **Reinstall** button. A refused update (changed app identifier, bad checksum) shows its reason with
   **Retry this version** and, for a changed identifier, **Accept this change**.
 - **Renew all** (header, with two apps or more) renews the active apps one after the other.
@@ -181,6 +198,14 @@ iPhones and iPads (**iOS / iPadOS 17 or later**) are kept alive like an Apple TV
 your Apple ID and reinstalls over Wi-Fi before the 7 days are up. **Status: new. The renewal path is
 the Apple TV one (same tunnel, same installer), but the one-time USB pairing step has not been
 validated on every device and iOS release yet: treat it as experimental and report what you see.**
+
+**What you need first.** The one-time pairing needs a computer with a USB port and the `plumesign` tool.
+On Windows that is the Windows edition (`plumesign.exe` is in its install folder; install iTunes or the
+Apple Devices app for the USB driver). On macOS or Linux the releases carry no binary yet: build it
+(`cargo build --release -p plumesign` in `vendor/Impactor`, Rust required) or, on Linux, copy it out of the
+Docker image (`docker create --name t ghcr.io/esalwey/tvsign:1 && docker cp t:/usr/local/bin/plumesign .
+&& docker rm t`). If you only have a NAS and no such computer, an iPhone or iPad is the harder route
+today; an Apple TV needs none of this.
 
 **One-time setup, per device**
 
@@ -251,7 +276,8 @@ never put it in a synced or network-shared folder in clear.
 - The archive is **not encrypted**. On Windows the browser's Downloads folder is often synced by
   OneDrive: choose a folder that is not, or move the file to a safe place right away.
 - Imported certificates (see *Signing with an imported certificate*) are not in the archive unless
-  you tick *Include imported certificates and their private keys*.
+  you tick *Include imported certificates and their private keys* (the box only appears when there is
+  one).
 - Or back up the whole data folder with the container stopped (Hyper Backup, Appdata Backup, restic…).
 - Never run the old and the new instance at the same time after a move.
 
@@ -265,7 +291,16 @@ Tags: `:1` (recommended, stays on major version 1), `:1.2`, `:1.2.3`, `:latest`,
 branch, for testers). `:1` never moves to a new major version: to go to 2.x, change the tag in
 `docker-compose.yml` (`ghcr.io/esalwey/tvsign:2`) before pulling. The database is copied before any schema change. Avoid updating during a
 renewal: `stop_grace_period: 5m` and `TVSIGN_SHUTDOWN_DRAIN_SECONDS` (240) let an install in
-progress finish before the container stops. Watchtower or Diun work but are optional.
+progress finish before the container stops. Watchtower or Diun work but are optional. What changed in each
+release: [docs/CHANGELOG.md](docs/CHANGELOG.md).
+
+**Going back to an older version.** The database of 1.1 holds more than 1.0.x knows. 1.0.x ignores the
+extra columns and starts normally, with your apps, accounts and pairings, but it also ignores the
+per-app settings of 1.1: an app signed with an imported certificate would be signed again with the Apple
+ID (and use a free-account slot), and a pinned version, "new versions only when I ask" and held-back
+updates are forgotten. Before going back, switch such apps to the Apple ID and clear the pins. tvsign
+copies the database before changing its schema (`tvsign.db.pre-migrate-<time>` next to it, kept 30 days):
+with tvsign stopped, putting that copy back restores the state from before the upgrade.
 
 tvsign looks once a day for a newer release of itself (one request to the GitHub API, nothing else
 is sent) and shows a dismissible banner with the right instruction for your edition. It never
@@ -277,7 +312,9 @@ at a fork.
 
 1. Download `tvsign-setup-<version>.exe` from the Releases page of this repository and run it. It
    installs for your Windows account only, no administrator password. If Windows says *Windows
-   protected your PC*, click **More info → Run anyway**: the installer is not code-signed yet.
+   protected your PC*, click **More info → Run anyway**: the installer is not code-signed yet. On
+   Windows 11 with Smart App Control turned on there is no *Run anyway*:
+   [read this first](windows/README-windows.md#windows-blocks-the-installer-smart-app-control-antivirus).
 2. Keep “Start tvsign with Windows” ticked. Closing the window does not quit tvsign: it keeps
    running next to the clock (tray icon) and renews your apps.
 3. On the first pairing, Windows may ask about **plumesign** in the firewall: allow it on
@@ -320,6 +357,20 @@ The full guide (French) is [windows/README-windows.md](windows/README-windows.md
 - Imported certificates (an advanced, optional route) are stored encrypted and never returned by the
   API; see *Signing with an imported certificate*.
 
+### What leaves your machine
+
+- **Apple** (`gsa.apple.com`, `developerservices2.apple.com`): the Apple ID sign-in and the signing
+  requests, as with any tool that signs with a free Apple ID.
+- **The anisette server** (`ani.jkcoxson.com`, `ani2.stikstore.app` as fallback, or one you run
+  yourself): a third party that supplies the device data Apple asks for at sign-in. Your Apple ID
+  password is not sent to it.
+- **GitHub** (`api.github.com` and the release downloads): the apps you follow, and once a day one
+  request to look for a new release of tvsign itself (`TVSIGN_UPDATE_CHECK=off` or the Settings switch
+  turns that one off). The only thing it carries is `tvsign/<version>` as User-Agent.
+- **The notification services you add** (ntfy, Discord, Telegram, Gotify, a webhook): messages that name
+  your Apple ID and your apps.
+- Nothing else: no analytics, no telemetry, no account with tvsign.
+
 ### Configuration
 
 Everything is optional. The main variables: `TZ`, `PUID`, `PGID`, `TVSIGN_PORT` (8765),
@@ -356,7 +407,8 @@ Update control, in each app's Settings and on its card:
 - **New versions**: installed automatically (default), or only when you ask. When off, the app is
   still renewed before it expires; the card shows “Update available” with the release notes and an
   **Install now** button.
-- **Pinned version** (GitHub): follow one release tag only.
+- **Pinned version** (GitHub): follow one release tag only. A tag that does not exist in the
+  repository is reported on the app's card (and in the log); the app keeps its installed version.
 - **Previous version**: the last installed IPA is kept; the button reinstalls it and skips the
   version you left until another release comes out.
 - If a new version cannot be signed or installed, tvsign tries the previous one and skips the
@@ -368,8 +420,8 @@ Update control, in each app's Settings and on its card:
 - A release that needs a newer tvOS than your Apple TV runs (`MinimumOSVersion`) is held back, and
   installed by itself once the TV is updated; you get a notification. Adding an app that needs a newer
   tvOS than the chosen Apple TV is refused.
-- An uploaded app is updated with **Replace IPA** (card, Settings, or the “IPA missing” message after
-  a restore): its history, Apple TV and account are kept.
+- An uploaded app is updated with **Replace the IPA** (card, Settings, or the “IPA missing” message
+  after a restore): its history, Apple TV and account are kept.
 
 Notifications: Settings → Notifications holds a list of destinations: **ntfy**, a generic **JSON
 webhook** (Home Assistant, n8n, Node-RED: `title`, `message`, `event`, `priority`, `time`, `app`),
@@ -403,8 +455,8 @@ Logs: the access log is off (the page polls every 5 s); `TVSIGN_ACCESS_LOG=1` tu
   with a growing delay (45 minutes at most, 10 near expiry) and alerts at 24 h and 6 h.
 - **The app is on the Apple TV but does not open.** Its profile may have expired (check its card),
   its certificate may have been revoked by another tool on the same Apple ID (tvsign re-signs it at
-  the next check), or the installation may still be waiting because the app is open. Try *Renew
-  now*, then restart the Apple TV. The app appears in the home screen a few seconds after the
+  the next check), or the installation may still be waiting because the app is open. Press **Renew**
+  on its card, then restart the Apple TV. The app appears in the home screen a few seconds after the
   installation reports success.
 - **Apple sign-in errors.** Check the clock (Diagnostics), the anisette server (the default,
   `ani.jkcoxson.com`, is shared and falls back to `ani2.stikstore.app`: a temporary outage is retried
@@ -434,7 +486,7 @@ self-signed certificate needs `PLUMESIGN_ANISETTE_INSECURE=1`.
 
 Signing in to Apple needs "anisette" data, produced by an anisette-v3 server. Since 12 October 2026
 Apple refuses the data of the servers that generate it as Android (error `-80045` at sign-in, then
-`HTTP 503` pages), which includes the old default `ani.sidestore.app`. From version 1.0.1:
+`HTTP 503` pages), which includes the old default `ani.sidestore.app`. tvsign handles it as follows:
 
 - tvsign uses `https://ani.jkcoxson.com`, which serves Windows anisette, and switches to
   `https://ani2.stikstore.app` by itself when it does not answer. **Leave the Settings field empty**
@@ -506,9 +558,9 @@ App IDs. Free a slot (**Pause** an app, or remove it from the Apple TV) then pre
 ### Signing with an imported certificate (advanced)
 
 The free Apple ID is the default and the recommended route. If you already hold a signing certificate
-and its provisioning profile, from your own Apple Developer account or from a provider you chose
-yourself, an app can use them instead: app settings → **Advanced** → *Method* → *Imported
-certificate*. tvsign does not recommend or contact any service.
+and its provisioning profile, for example from your own Apple Developer account, an app can use them
+instead: app settings → **Advanced** → *Method* → *Imported certificate*. tvsign never needs this, and
+it does not recommend or contact any signing service.
 
 - Import a `.p12` (with its password) and a `.mobileprovision` **for the app's device**. Nothing is
   saved until every check passes: neither file expired, the profile made for tvOS (Apple TV) or iOS
@@ -561,8 +613,8 @@ Settings › Security changes the password without asking for the old one.) If t
 `TVSIGN_PASSWORD_FILE` that cannot be read (wrong path, a root-only secret while tvsign runs as
 `PUID`) is reported in the log and in Diagnostics: the preset password is **not** applied then.
 
-Sign out only ends the session of the browser you click it in (a copied cookie stops working, including one issued before this version);
-**Sign out everywhere** also ends all the others. Backups no longer contain the admin password hash.
+Sign out only ends the session of the browser you click it in (a copied cookie stops working);
+**Sign out everywhere** also ends all the others. Backups do not contain the admin password hash.
 
 ### Pairing identity
 
@@ -575,6 +627,19 @@ Building from source: see [docs/building.md](docs/building.md).
 ---
 
 ## Français
+
+### Démarrage rapide
+
+- **Un PC Windows qui reste allumé (le plus simple) :** téléchargez `tvsign-setup-<version>.exe` depuis la
+  [page des versions](https://github.com/esalwey/tvsign/releases), lancez-le et suivez l'assistant.
+  L'installeur n'est pas encore signé numériquement : SmartScreen demande une confirmation
+  (*Informations complémentaires → Exécuter quand même*), et sous Windows 11 avec **Smart App Control**
+  activé il ne peut pas s'exécuter du tout, voir
+  [Windows bloque l'installeur](windows/README-windows.md#windows-bloque-linstalleur-smart-app-control-antivirus).
+- **Un NAS, un Raspberry Pi ou une machine Linux :** `sh install.sh --install` (Docker est nécessaire),
+  puis ouvrez `http://<hôte>:8765`. Détails dans [Installation](#installation).
+- Dans les deux cas : un Apple ID gratuit dédié, l'Apple TV (ou l'iPhone / l'iPad) sur le même réseau et
+  une machine qui reste allumée. L'assistant guide le reste.
 
 ### Ce que c'est
 
@@ -613,6 +678,9 @@ n'héberge ni ne distribue aucun contenu.
   anisette (`ani.jkcoxson.com` par défaut, `ani2.stikstore.app` en repli automatique, modifiable dans
   les Réglages), `api.github.com`.
 - Une horloge à l'heure (NTP).
+- Une version du système que l'app peut utiliser : chaque app a son propre minimum
+  (`MinimumOSVersion`), que tvsign compare à l'appareil ; l'app NuvioTV suggérée demande tvOS 26 ou plus
+  récent. Un iPhone ou un iPad demande iOS / iPadOS 17 ou plus récent pour le renouvellement sans fil.
 - Non pris en charge : Docker Desktop sous Windows/macOS (prendre l'édition Windows), ARM 32 bits,
   TrueNAS CORE.
 
@@ -690,17 +758,19 @@ n'est nécessaire.
    installée.
 
 L'assistant n'affiche « C'est prêt » qu'une fois la première installation réussie ; d'ici là il
-montre l'avancement réel (et la raison en cas d'échec). La signature **révoque le certificat créé par
-un autre outil (AltStore, Sideloadly, Xcode) avec le même Apple ID**, ce qui empêche les apps de cet
-outil de se lancer : prendre un Apple ID dédié à tvsign. La machine qui fait tourner tvsign doit
-rester allumée et connectée au réseau (un PC ou un NAS en veille ne renouvelle rien) ; seule
+montre l'avancement réel (et la raison en cas d'échec). Par défaut, tvsign ne remplace que ses propres
+certificats : si l'Apple ID en a déjà 2, la signature s'arrête avec le message « Compte Apple plein »
+jusqu'à ce que vous en révoquiez un sur developer.apple.com ou que vous l'autorisiez dans Réglages ›
+Certificats. AltStore, SideStore et Sideloadly peuvent en revanche révoquer le certificat de tvsign, ce
+qui empêche ses apps de se lancer : prendre un Apple ID dédié à tvsign. La machine qui fait tourner
+tvsign doit rester allumée et connectée au réseau (un PC ou un NAS en veille ne renouvelle rien) ; seule
 l'Apple TV peut être en veille.
 
 La page Diagnostic relance les vérifications à tout moment.
 
 ### Plusieurs Apple TV
 
-Appairer chaque TV une fois (section Apple TV › Appairer). Pour garder la même app sur une seconde
+Appairer chaque TV une fois (Appareils › Appairer). Pour garder la même app sur une seconde
 TV, ouvrir les **Réglages** de l'app, choisir la TV sous « La même app sur une autre Apple TV » puis
 *Ajouter sur cette TV* : une fiche séparée est créée pour cette TV, avec son état, sa signature et
 son échéance (le fichier téléchargé est repris ; les deux TV utilisent le même Apple ID et le même
@@ -727,8 +797,8 @@ pont ou à un multicast bloqué, et si la TV répond encore en direct.
 ### Utiliser l'interface web
 
 - Les **cartes d'app** montrent l'état de chaque app. tvsign vérifie (en lecture seule) qu'une app est
-  toujours sur l'Apple TV au **Test de connexion** (le contrôle périodique, toutes les `TVSIGN_INSTALL_CHECK_HOURS`,
-  réinstalle aussi une app disparue) ; une app vue absente affiche « Introuvable sur la TV » avec un bouton **Réinstaller**.
+  toujours sur l'Apple TV à **Tester la connexion** (le contrôle périodique, toutes les `TVSIGN_INSTALL_CHECK_HOURS`,
+  réinstalle aussi une app disparue) ; une app vue absente affiche « Introuvable sur l'appareil » avec un bouton **Réinstaller**.
   Une mise à jour refusée (identifiant d'app changé, empreinte
   fausse) affiche sa raison avec **Réessayer cette version** et, pour un identifiant changé,
   **Accepter ce changement**.
@@ -752,6 +822,15 @@ tvsign signe avec votre Apple ID et réinstalle par le Wi-Fi avant la fin des 7 
 nouveau. Le renouvellement est celui de l'Apple TV (même tunnel, même installateur), mais
 l'appairage USB initial n'a pas encore été validé sur tous les appareils et versions d'iOS :
 considérez-le comme expérimental et signalez ce que vous constatez.**
+
+**À prévoir d'abord.** L'appairage, une seule fois, demande un ordinateur avec un port USB et l'outil
+`plumesign`. Sous Windows, c'est l'édition Windows (`plumesign.exe` est dans son dossier d'installation ;
+installez iTunes ou l'app Appareils Apple pour le pilote USB). Sous macOS ou Linux, les versions publiées
+n'ont pas encore de binaire : compilez-le (`cargo build --release -p plumesign` dans `vendor/Impactor`,
+Rust nécessaire) ou, sous Linux, copiez-le hors de l'image Docker (`docker create --name t
+ghcr.io/esalwey/tvsign:1 && docker cp t:/usr/local/bin/plumesign . && docker rm t`). Si vous n'avez
+qu'un NAS et aucun ordinateur de ce genre, un iPhone ou un iPad est aujourd'hui la voie la plus
+difficile ; une Apple TV n'a besoin de rien de tout cela.
 
 **Mise en place, une fois par appareil**
 
@@ -829,7 +908,8 @@ partager, à ne jamais mettre en clair dans un dossier synchronisé ou partagé 
 - L'archive **n'est pas chiffrée**. Sous Windows, le dossier Téléchargements du navigateur est souvent
   synchronisé par OneDrive : choisir un dossier qui ne l'est pas, ou déplacer le fichier aussitôt.
 - Les certificats importés (voir *Signature avec un certificat importé*) ne sont pas dans l'archive,
-  sauf si vous cochez *Inclure les certificats importés et leurs clés privées*.
+  sauf si vous cochez *Inclure les certificats importés et leurs clés privées* (la case n'apparaît que
+  s'il y en a un).
 - Ou sauvegarder tout le dossier de données, conteneur arrêté (Hyper Backup, Appdata Backup, restic…).
 - Après un déménagement, ne jamais faire tourner l'ancienne et la nouvelle instance en même temps.
 
@@ -840,11 +920,20 @@ docker compose pull && docker compose up -d
 ```
 
 Tags : `:1` (conseillé, reste en version majeure 1), `:1.2`, `:1.2.3`, `:latest`, `:edge` (branche
-main, pour les testeurs). `:1` ne passe jamais à une autre version majeure : pour aller en 2.x, change le tag
+main, pour les testeurs). `:1` ne passe jamais à une autre version majeure : pour aller en 2.x, changer le tag
 dans `docker-compose.yml` (`ghcr.io/esalwey/tvsign:2`) avant le pull. La base est copiée avant tout changement de schéma. Éviter de mettre à jour
 pendant un renouvellement : `stop_grace_period: 5m` et `TVSIGN_SHUTDOWN_DRAIN_SECONDS` (240) laissent
 finir une installation en cours avant l'arrêt du conteneur. Watchtower ou Diun fonctionnent mais
-restent facultatifs.
+restent facultatifs. Ce qui change à chaque version : [docs/CHANGELOG.md](docs/CHANGELOG.md) (en anglais).
+
+**Revenir à une version plus ancienne.** La base de la 1.1 contient plus que ce que connaît la 1.0.x. La
+1.0.x ignore les colonnes en plus et démarre normalement, avec vos apps, comptes et appairages, mais elle
+ignore aussi les réglages par app de la 1.1 : une app signée avec un certificat importé serait de nouveau
+signée avec l'Apple ID (et prendrait une place du compte gratuit), et une version épinglée, « nouvelles
+versions seulement sur demande » et les mises à jour mises de côté sont oubliées. Avant de revenir en
+arrière, repassez ces apps sur l'Apple ID et retirez les épingles. tvsign copie la base avant de changer
+son schéma (`tvsign.db.pre-migrate-<heure>` à côté d'elle, gardée 30 jours) : tvsign arrêté, remettre
+cette copie rétablit l'état d'avant la mise à jour.
 
 tvsign cherche une fois par jour s'il existe une version plus récente de lui-même (une requête à
 l'API GitHub, rien d'autre n'est envoyé) et affiche une bannière qu'on peut écarter, avec la bonne
@@ -858,7 +947,9 @@ vise un fork.
 1. Télécharger `tvsign-setup-<version>.exe` depuis la page Releases de ce dépôt et le lancer. Il
    s'installe pour votre seul compte Windows, sans mot de passe administrateur. Si Windows affiche
    *Windows a protégé votre ordinateur*, cliquer sur **Informations complémentaires → Exécuter
-   quand même** : l'installeur n'est pas encore signé numériquement.
+   quand même** : l'installeur n'est pas encore signé numériquement. Sous Windows 11 avec Smart App
+   Control activé, il n'y a pas de bouton *Exécuter quand même* :
+   [lire d'abord ceci](windows/README-windows.md#windows-bloque-linstalleur-smart-app-control-antivirus).
 2. Laisser coché « Démarrer tvsign avec Windows ». Fermer la fenêtre ne quitte pas tvsign : il
    continue près de l'horloge (icône de la zone de notification) et renouvelle vos apps.
 3. Au premier appairage, Windows peut poser une question sur **plumesign** dans le pare-feu : l'autoriser
@@ -904,6 +995,20 @@ Le guide complet est [windows/README-windows.md](windows/README-windows.md).
 - Les certificats importés (voie avancée et facultative) sont stockés chiffrés et jamais renvoyés par
   l'API ; voir *Signature avec un certificat importé*.
 
+### Ce qui sort de votre machine
+
+- **Apple** (`gsa.apple.com`, `developerservices2.apple.com`) : la connexion de l'Apple ID et les demandes
+  de signature, comme avec tout outil qui signe avec un Apple ID gratuit.
+- **Le serveur anisette** (`ani.jkcoxson.com`, `ani2.stikstore.app` en repli, ou le vôtre) : un tiers qui
+  fournit les données d'appareil qu'Apple demande à la connexion. Le mot de passe de votre Apple ID ne
+  lui est pas envoyé.
+- **GitHub** (`api.github.com` et les téléchargements de releases) : les apps que vous suivez, et une fois
+  par jour une requête pour chercher une nouvelle version de tvsign lui-même (`TVSIGN_UPDATE_CHECK=off`
+  ou l'interrupteur des Réglages la coupe). Elle ne porte que `tvsign/<version>` comme User-Agent.
+- **Les services de notification que vous ajoutez** (ntfy, Discord, Telegram, Gotify, un webhook) : des
+  messages qui citent votre Apple ID et vos apps.
+- Rien d'autre : ni statistiques, ni télémétrie, ni compte chez tvsign.
+
 ### Configuration
 
 Tout est facultatif. Variables principales : `TZ`, `PUID`, `PGID`, `TVSIGN_PORT` (8765),
@@ -944,7 +1049,8 @@ Contrôle des mises à jour, dans les Réglages de chaque app et sur sa carte :
 - **Nouvelles versions** : installées automatiquement (par défaut), ou seulement sur demande. Coupé,
   l'app est quand même renouvelée avant son expiration ; la carte affiche « Mise à jour disponible »
   avec les notes de version et un bouton **Installer maintenant**.
-- **Version épinglée** (GitHub) : ne suivre qu'un seul tag de release.
+- **Version épinglée** (GitHub) : ne suivre qu'un seul tag de release. Un tag qui n'existe pas dans le
+  dépôt est signalé sur la carte de l'app (et au journal) ; l'app garde sa version installée.
 - **Version précédente** : la dernière IPA installée est gardée ; le bouton la réinstalle et ignore la
   version quittée jusqu'à la prochaine release.
 - Si une nouvelle version ne peut pas être signée ou installée, tvsign essaie la précédente et ignore
@@ -996,8 +1102,8 @@ Journaux : le journal d'accès est coupé (la page interroge le serveur toutes l
   à 24 h et 6 h.
 - **L'app est sur l'Apple TV mais ne s'ouvre pas.** Son profil a peut-être expiré (voir sa carte), son
   certificat a peut-être été révoqué par un autre outil sur le même Apple ID (tvsign la re-signe au
-  contrôle suivant), ou l'installation attend encore parce que l'app est ouverte. Essayer *Renouveler
-  maintenant*, puis redémarrer l'Apple TV. L'app apparaît sur l'écran d'accueil quelques secondes
+  contrôle suivant), ou l'installation attend encore parce que l'app est ouverte. Toucher **Renouveler**
+  sur sa carte, puis redémarrer l'Apple TV. L'app apparaît sur l'écran d'accueil quelques secondes
   après que l'installation annonce son succès.
 - **Erreurs de connexion Apple.** Vérifier l'horloge (Diagnostic), le serveur anisette (celui par
   défaut, `ani.jkcoxson.com`, est partagé et repasse sur `ani2.stikstore.app` : une panne passagère
@@ -1029,8 +1135,7 @@ accepté ; en `https://` avec un certificat auto-signé, il faut `PLUMESIGN_ANIS
 
 La connexion à Apple a besoin de données « anisette », produites par un serveur anisette-v3. Depuis le
 12 octobre 2026, Apple refuse les données des serveurs qui les génèrent comme Android (erreur `-80045`
-à la connexion, puis pages `HTTP 503`), dont l'ancien serveur par défaut `ani.sidestore.app`. À partir
-de la version 1.0.1 :
+à la connexion, puis pages `HTTP 503`), dont l'ancien serveur par défaut `ani.sidestore.app`. tvsign procède ainsi :
 
 - tvsign utilise `https://ani.jkcoxson.com`, qui fournit des données anisette Windows, et bascule tout
   seul sur `https://ani2.stikstore.app` quand il ne répond pas. **Laissez le champ des Réglages vide**
@@ -1112,9 +1217,9 @@ ou suppression sur l'Apple TV) puis touchez **Renouveler**.
 ### Signature avec un certificat importé (avancé)
 
 L'Apple ID gratuit reste la voie par défaut et conseillée. Si vous avez déjà un certificat de
-signature et son profil de provisionnement, issus de votre propre compte Apple Developer ou d'un
-fournisseur de votre choix, une app peut les utiliser à la place : réglages de l'app → **Avancé** →
-*Méthode* → *Certificat importé*. tvsign ne recommande ni ne contacte aucun service.
+signature et son profil de provisionnement, par exemple ceux de votre propre compte Apple Developer,
+une app peut les utiliser à la place : réglages de l'app → **Avancé** → *Méthode* → *Certificat
+importé*. tvsign n'en a jamais besoin, et il ne recommande ni ne contacte aucun service de signature.
 
 - Importez un `.p12` (avec son mot de passe) et un `.mobileprovision` **pour l'appareil de l'app**.
   Rien n'est enregistré avant que toutes les vérifications passent : aucun des deux fichiers expiré,
@@ -1173,8 +1278,8 @@ en `PUID`) est signalé dans le journal et dans le diagnostic : le mot de passe 
 **pas** appliqué.
 
 « Se déconnecter » ne ferme que la session du navigateur utilisé (un cookie copié cesse de
-fonctionner, y compris s'il date d'avant cette version) ; **Se déconnecter partout** ferme aussi toutes les autres. Les sauvegardes ne
-contiennent plus l'empreinte du mot de passe administrateur.
+fonctionner) ; **Déconnecter partout** ferme aussi toutes les autres. Les sauvegardes ne contiennent
+pas l'empreinte du mot de passe administrateur.
 
 ### Identité d'appairage
 

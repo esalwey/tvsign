@@ -20,14 +20,14 @@ On Windows, tvsign is a small application with its own window and an icon next t
 
 Installation is for your Windows account only, in `%LOCALAPPDATA%\Programs\tvsign`. No administrator password is needed, except for the optional firewall rule in step 4.
 
-To **update**, run the new installer: it replaces the application and keeps your apps, Apple TV pairings and settings. tvsign also tells you when a new version is out (a notice in the window and a notification near the clock, once per version; it can be switched off in Settings › New versions).
+To **update**, run the new installer: it replaces the application and keeps your apps, Apple TV pairings and settings. tvsign also tells you when a new version is out (a notice in the window and a notification near the clock, once per version; it can be switched off in Settings › Check for tvsign updates).
 
 #### Check your download
 
 Each release publishes `SHA256SUMS.txt`. In PowerShell, in the download folder:
 
 ```powershell
-Get-FileHash .\tvsign-setup-1.0.0.exe -Algorithm SHA256
+Get-FileHash .\tvsign-setup-<version>.exe -Algorithm SHA256
 ```
 
 The hash must be the one listed for that file in `SHA256SUMS.txt`. If it differs, do not run the file.
@@ -98,6 +98,8 @@ The tvsign **Diagnostics** page shows how many Apple TVs are visible on the netw
 
 ### Pair an iPhone or an iPad (iOS / iPadOS 17 or later)
 
+iPhone and iPad support is **experimental**: renewing is done like for an Apple TV, but the one-time USB pairing has not been checked on every device and iOS release yet. Please report what you see.
+
 An iPhone shows no code: pairing is done **once, over a USB cable**, then everything happens over Wi-Fi.
 
 1. Install Apple's USB driver if needed: **iTunes** or the **Apple Devices** app from the Microsoft Store (they install *Apple Mobile Device Service*). tvsign does not bundle it.
@@ -141,7 +143,7 @@ Right-click the tvsign icon:
 | **New version x.y.z: download** | Only when a newer release exists. Opens its page. |
 | **Start with Windows** | Ticked: tvsign starts quietly when you sign in. Keep it ticked. If you switched it off in Task Manager or Windows Settings, the menu says so and opens *Settings › Apps › Startup* for you. |
 | **Wake the PC for renewals** | Optional wake-up task, see section 5. |
-| **Quit** | Stops tvsign. **No renewal happens** until it is started again. A renewal in progress gets up to 4 minutes to finish first (the icon says so). |
+| **Quit** | Stops tvsign. **No renewal happens** until it is started again. A renewal in progress gets up to 5 minutes to finish first (the icon says so). |
 
 Labels follow the language chosen in tvsign.
 
@@ -156,6 +158,8 @@ To update:
 3. Your apps, Apple session, pairings and settings are **kept**: they live in `%LOCALAPPDATA%\tvsign`, which the installer does not touch. Before changing the database, tvsign makes a safety copy next to it.
 
 Preferably do it when no installation is running on the Apple TV.
+
+**Going back to an older version.** The database of 1.1 holds more than 1.0.x knows. 1.0.x ignores the extra columns and starts normally, but it also ignores the per-app settings of 1.1: an app signed with an imported certificate would be signed with the Apple ID again, and pinned versions and "new versions only when I ask" are forgotten. Switch such apps to the Apple ID first. Before changing the database tvsign keeps a copy next to it (`tvsign.db.pre-migrate-<time>`, 30 days): with tvsign quit, putting it back restores the state from before the upgrade.
 
 ### 7. Frequently asked questions
 
@@ -224,14 +228,14 @@ Sous Windows, tvsign est une petite application avec sa propre fenêtre et une i
 
 L'installation se fait pour votre seul compte Windows, dans `%LOCALAPPDATA%\Programs\tvsign`. Aucun mot de passe administrateur n'est demandé, sauf pour la règle de pare-feu facultative de l'étape 4.
 
-Pour **mettre à jour**, lancez le nouvel installeur : il remplace l'application et conserve vos apps, vos appairages Apple TV et vos réglages. tvsign vous prévient aussi quand une nouvelle version sort (un bandeau dans la fenêtre et une notification près de l'horloge, une fois par version ; désactivable dans Réglages › Nouvelles versions).
+Pour **mettre à jour**, lancez le nouvel installeur : il remplace l'application et conserve vos apps, vos appairages Apple TV et vos réglages. tvsign vous prévient aussi quand une nouvelle version sort (un bandeau dans la fenêtre et une notification près de l'horloge, une fois par version ; désactivable dans Réglages › Chercher les mises à jour de tvsign).
 
 #### Vérifier le téléchargement
 
 Chaque version publie `SHA256SUMS.txt`. Dans PowerShell, dans le dossier du téléchargement :
 
 ```powershell
-Get-FileHash .\tvsign-setup-1.0.0.exe -Algorithm SHA256
+Get-FileHash .\tvsign-setup-<version>.exe -Algorithm SHA256
 ```
 
 L'empreinte doit être celle de ce fichier dans `SHA256SUMS.txt`. Si elle diffère, ne lancez pas le fichier.
@@ -268,7 +272,7 @@ Par défaut, l'application ne demande pas de mot de passe : elle n'est joignable
 L'appairage ne se fait **qu'une seule fois**. Le PC et l'Apple TV doivent être sur **le même réseau** (même box, Wi-Fi ou câble).
 
 1. Allumez l'Apple TV.
-2. Sur l'Apple TV, ouvrez **Réglages > Télécommandes et appareils > App Distante**. Selon la version de tvOS, la dernière ligne peut s'appeler « App Télécommande et appareils ».
+2. Sur l'Apple TV, ouvrez **Réglages > Télécommandes et appareils > App Télécommande et appareils**. Selon la version de tvOS, la dernière ligne peut porter un autre nom.
 3. **Restez sur cet écran.** L'Apple TV n'accepte un nouvel appareil que tant que cet écran est affiché.
 4. Dans tvsign, cliquez sur **Appairer**, puis sur **Rechercher**. Votre Apple TV apparaît dans la liste. Sélectionnez-la.
 5. Un **code** s'affiche sur la TV. Saisissez-le dans tvsign.
@@ -301,6 +305,8 @@ Vérifiez aussi que votre réseau domestique est en profil **Privé** et non **P
 La page **Diagnostic** de tvsign indique combien d'Apple TV sont visibles sur le réseau. Désinstaller tvsign supprime la règle (Windows demande une confirmation), sauf lors d'une désinstallation **silencieuse** (`/VERYSILENT`) qui la laisse : supprimez-la vous-même dans un PowerShell administrateur avec `netsh advfirewall firewall delete rule name="tvsign plumesign"`. Réinstaller dans un autre dossier met à jour le chemin du programme de la règle.
 
 ### Appairer un iPhone ou un iPad (iOS / iPadOS 17 ou plus récent)
+
+La prise en charge de l'iPhone et de l'iPad est **expérimentale** : le renouvellement se fait comme pour une Apple TV, mais l'appairage USB initial n'a pas encore été vérifié sur tous les appareils et versions d'iOS. Signalez ce que vous constatez.
 
 Un iPhone n'affiche pas de code : l'appairage se fait **une seule fois par câble USB**, puis tout se passe en Wi-Fi.
 
@@ -345,7 +351,7 @@ Clic droit sur l'icône tvsign :
 | **Nouvelle version x.y.z : télécharger** | Seulement quand une version plus récente existe. Ouvre sa page. |
 | **Démarrer avec Windows** | Coché : tvsign se lance discrètement à l'ouverture de session. Gardez-le coché. Si vous l'avez désactivé dans le Gestionnaire des tâches ou les Paramètres Windows, le menu l'indique et ouvre *Paramètres › Applications › Démarrage*. |
 | **Réveiller le PC pour les renouvellements** | Tâche de réveil facultative, voir la section 5. |
-| **Quitter** | Arrête tvsign. **Plus aucun renouvellement** n'a lieu tant qu'il n'est pas relancé. Un renouvellement en cours dispose de 4 minutes pour se terminer (l'icône le signale). |
+| **Quitter** | Arrête tvsign. **Plus aucun renouvellement** n'a lieu tant qu'il n'est pas relancé. Un renouvellement en cours dispose de 5 minutes au plus pour se terminer (l'icône le signale). |
 
 Les libellés suivent la langue choisie dans tvsign.
 
@@ -360,6 +366,8 @@ Pour mettre à jour :
 3. Vos apps, votre session Apple, vos appairages et vos réglages sont **conservés** : ils sont dans `%LOCALAPPDATA%\tvsign`, que l'installeur ne touche pas. Avant de modifier la base, tvsign en fait une copie de sécurité à côté.
 
 Faites-le de préférence quand aucune installation n'est en cours sur l'Apple TV.
+
+**Revenir à une version plus ancienne.** La base de la 1.1 contient plus que ce que connaît la 1.0.x. La 1.0.x ignore les colonnes en plus et démarre normalement, mais elle ignore aussi les réglages par app de la 1.1 : une app signée avec un certificat importé serait de nouveau signée avec l'Apple ID, et les versions épinglées et « nouvelles versions seulement sur demande » sont oubliées. Repassez d'abord ces apps sur l'Apple ID. Avant de modifier la base, tvsign en garde une copie à côté (`tvsign.db.pre-migrate-<heure>`, 30 jours) : tvsign fermé, la remettre rétablit l'état d'avant la mise à jour.
 
 ### 7. Questions fréquentes
 

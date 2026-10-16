@@ -1,7 +1,7 @@
 # Smoke test of the built Windows installer. Touches no Apple account and no Apple TV; installs into a
 # temporary folder (no autostart, no firewall rule), uses a temporary data folder and a non-default port.
 #
-#   powershell -ExecutionPolicy Bypass -File smoke.ps1 -Setup dist\installer\tvsign-setup-1.0.0.exe
+#   powershell -ExecutionPolicy Bypass -File smoke.ps1 -Setup dist\installer\tvsign-setup-<version>.exe
 #
 # 1. silent install                      2. the runtime DLLs sit beside plumesign.exe
 # 3. plumesign.exe --version, run from a copy of its folder with a bare PATH (only what ships beside it)
