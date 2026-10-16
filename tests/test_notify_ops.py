@@ -16,7 +16,6 @@ import unittest
 import urllib.error
 import zipfile
 from pathlib import Path
-from types import SimpleNamespace
 
 DATA = tempfile.mkdtemp(prefix="tvsign-test-g3-")
 os.environ.update(TVSIGN_DATA=DATA, TVSIGN_AUTH="none", TVSIGN_PLUMESIGN=str(Path(DATA) / "absent"))
