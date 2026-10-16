@@ -10,7 +10,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = os.environ.get("TVSIGN_VERSION", "1.0.1-dev")
+VERSION = os.environ.get("TVSIGN_VERSION", "1.1.0-dev")
 WINDOWS = os.name == "nt"
 FROZEN = bool(getattr(sys, "frozen", False))
 
