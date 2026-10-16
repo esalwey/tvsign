@@ -69,6 +69,11 @@ def _hours(value: float) -> None:
         raise ValueError("range:12:150")
 
 
+def _onoff(value: str) -> None:
+    if value.lower() not in ("on", "off", "1", "0", "true", "false", "yes", "no"):
+        raise ValueError("onoff_expected")
+
+
 def _language(value: str) -> None:
     if value not in ("auto", "en", "fr"):
         raise ValueError("language_expected")
@@ -99,6 +104,8 @@ PUBLIC: dict[str, Spec] = {
     # Ignorée quand il reste moins de 24 h, et pour un renouvellement lancé à la main.
     "renew_window_start": Spec("", str, ["TVSIGN_RENEW_WINDOW_START"], _hour),
     "renew_window_end": Spec("", str, ["TVSIGN_RENEW_WINDOW_END"], _hour),
+    # recherche quotidienne d'une nouvelle version de tvsign (GitHub) ; off : aucune requête
+    "update_check": Spec("on", str, ["TVSIGN_UPDATE_CHECK"], _onoff),
 }
 
 
@@ -132,6 +139,8 @@ def _convert(spec: Spec, raw):
         value = str(raw if raw is not None else "").strip()
     if spec.check:
         spec.check(value)
+    if spec.check is _onoff:
+        value = "off" if value.lower() in ("off", "0", "false", "no") else "on"    # l'interface ne connaît que on / off
     return value
 
 
@@ -295,6 +304,10 @@ def in_renew_window(now: float, window: tuple[int, int] | None = None, tz_hour: 
     if start == end:
         return True
     return start <= hour < end if start < end else hour >= start or hour < end
+
+
+def update_check() -> bool:
+    return str(get("update_check")).lower() not in ("off", "0", "false", "no")
 
 
 def next_window_start(ts: float, window: tuple[int, int] | None = None) -> float:

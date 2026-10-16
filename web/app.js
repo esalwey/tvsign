@@ -44,7 +44,8 @@ function apiError(detail, status) {
 
 // Réglage (clé de l'API) -> libellé du champ affiché, pour qu'une erreur de validation parle comme le formulaire.
 const LIBELLE_REGLAGE = { language: "language", renew_before_hours: "renew_before", anisette_url: "anisette_server",
-  renew_window_start: "set_lbl_renew_window_start", renew_window_end: "set_lbl_renew_window_end" };
+  renew_window_start: "set_lbl_renew_window_start", renew_window_end: "set_lbl_renew_window_end",
+  update_check: "update_check" };
 const libelleReglage = (k) => (k === "ntfy_url" ? "ntfy" : LIBELLE_REGLAGE[k] ? t(LIBELLE_REGLAGE[k]) : k);
 
 async function api(path, opts = {}) {
@@ -99,6 +100,10 @@ const CAUSES = [
   [/arrêté par le système|killed by the system/i, "c_oom"],
   [/ntfy/i, "c_ntfy"],
   [/maximum number of (installed )?(apps|app ?ids?)|too many (installed )?(apps|app ?ids?)|app ?id limit|limit of \d+ (apps|app ?ids)|limite du compte gratuit|reached the maximum number/i, "c_limit"],
+  [/limite de requêtes GitHub/i, "c_gh_rate"],
+  [/jeton GitHub refusé/i, "c_gh_token"],
+  [/dépôt GitHub introuvable/i, "c_gh_missing"],
+  [/demande tvOS/i, "c_tvos"],
   [/8220|no devices from which/i, "c_8220"],
   [/ancienne version de tvsign/i, "c_legacy"],
   [/appairage perdu|PAIRING_LOST|pairing record|not paired|No stored pairing/i, "c_lost"],
@@ -168,7 +173,7 @@ function flash(ton, titre, texte = "") {
 
 // ---------- rendu sans perte de focus ----------
 const CLES = ["data-renew", "data-toggle", "data-edit", "data-del-app", "data-refresh-dev", "data-del-dev", "data-check",
-  "data-select", "data-relogin", "data-logout", "data-team", "data-open", "data-key"];
+  "data-select", "data-relogin", "data-logout", "data-team", "data-open", "data-key", "data-update", "data-rollback", "data-dismiss-update", "data-replace"];
 function cleDe(el) {
   if (!el?.getAttribute) return null;
   for (const a of CLES) if (el.hasAttribute(a)) return [a, el.getAttribute(a)];
@@ -237,13 +242,54 @@ function etatApp(a, now, s) {
 }
 const COULEUR = { ok: "green", warn: "orange", err: "red", cours: "blue", neutre: "gray" };
 
+const redactUrl = (u) => { try { const x = new URL(u); return x.origin + x.pathname + (x.search ? "?…" : ""); } catch { return String(u).split("?")[0]; } };
+const tvOS = (a) => (STATE?.devices || []).find((d) => d.id === a.device_id)?.os_version || "?";
+
 function sourceTexte(a) {
   if (a.source_type === "upload") return t("src_uploaded");
   if (a.source_type === "github") {
     const canal = a.channel === "beta" ? ` · ${t("channel_beta_short")}` : "";
-    return `${esc(a.source)}${a.source_tag ? ` · <span class="mono">${esc(a.source_tag)}</span>` : ""}${canal}`;
+    const epingle = a.pinned_tag ? ` · ${esc(t("pinned_badge"))}` : "";
+    return `${esc(a.source)}${a.source_tag ? ` · <span class="mono">${esc(a.source_tag)}</span>` : ""}${canal}${epingle}`;
   }
   return t("src_direct_link");
+}
+
+// Mises à jour : échec d'une mise à jour facultative (l'app installée reste valable), version disponible mais
+// non installée, notes de version, lien dont le serveur ne dit pas s'il change.
+function noteMaj(a, now) {
+  let html = "";
+  if (a.update_error) {
+    const e = enClair(a.update_error);
+    const retry = a.next_attempt_at && a.next_attempt_at > now ? t("retry_at", { when: relatif(a.next_attempt_at, now) }) : "";
+    html += `<div class="probleme probleme--warn" role="group" aria-label="${esc(t("update_failed_t"))}">
+      <span class="probleme__ic">${ICONS.alerte}</span>
+      <div class="probleme__texte">
+        <p class="probleme__titre">${esc(t("update_failed_t"))}</p>
+        <p>${esc(t("update_failed", { why: e.titre + (e.conseil ? ". " + e.conseil : "") }))}</p>
+        ${retry ? `<p class="probleme__retry">${esc(retry)}</p>` : ""}
+      </div></div>`;
+  }
+  if (a.update_tag) {
+    const m = /^tvos:(.+)$/.exec(a.update_block || "");
+    const quoi = a.source_type === "url" ? t("update_new_file") : a.update_tag;
+    const pourquoi = m ? t("update_tvos", { min: m[1], have: tvOS(a) }) : a.update_block === "rollback" ? t("update_rolled_back") : t("update_manual");
+    html += `<div class="probleme probleme--info" role="group" aria-label="${esc(t("update_available_t", { tag: quoi }))}">
+      <span class="probleme__ic">${ICONS.app}</span>
+      <div class="probleme__texte">
+        <p class="probleme__titre">${esc(t("update_available_t", { tag: quoi }))}</p>
+        <p>${esc(pourquoi)}</p>
+        ${a.update_notes ? `<details class="details" data-key="notes-${a.id}"><summary>${t("release_notes")}</summary><pre class="log">${esc(a.update_notes)}</pre></details>` : ""}
+      </div>
+      ${m ? "" : `<button class="btn btn--petit" data-update="${a.id}" ${a.running ? "disabled" : ""}>${t("install_now")}</button>`}
+    </div>`;
+  } else if (a.notes) {
+    html += `<details class="details" data-key="notes-${a.id}"><summary>${esc(t("release_notes_v", { v: a.version || a.source_tag || "" }))}</summary><pre class="log">${esc(a.notes)}</pre></details>`;
+  }
+  if (a.untracked_link) {
+    html += `<p class="row__sub">${esc(t(a.auto_update === 0 ? "untracked_link_manual" : "untracked_link"))} <button class="lien lien--inline" data-update="${a.id}" ${a.running ? "disabled" : ""}>${t("check_now")}</button></p>`;
+  }
+  return html;
 }
 
 function jauge(a, now, s, ton) {
@@ -297,7 +343,8 @@ function problemeApp(a, now) {
     : e.cle === "c_no_account" ? `<button class="btn btn--petit" data-open="dlg-login" data-key="login-p-${a.id}">${t("connect")}</button>`
     : ["c_lost", "c_legacy"].includes(e.cle) ? `<button class="btn btn--petit" data-open="dlg-pair">${t("pair")}</button>`
     : e.cle === "c_certlimit" ? `<a class="btn btn--petit" href="#/settings">${t("settings")}</a>`
-    : ["c_no_tv", "c_source", "c_bundle", "c_digest"].includes(e.cle) ? `<button class="btn btn--petit" data-edit="${a.id}" data-key="edit-p-${a.id}">${t("settings")}</button>` : "";
+    : e.cle === "c_ipa_missing" && a.source_type === "upload" ? `<button class="btn btn--petit" data-replace="${a.id}">${t("replace_ipa")}</button>`
+    : ["c_no_tv", "c_source", "c_bundle", "c_digest", "c_gh_missing"].includes(e.cle) ? `<button class="btn btn--petit" data-edit="${a.id}" data-key="edit-p-${a.id}">${t("settings")}</button>` : "";
   const details = e.brut && (e.brut.length > 110 || e.connu)
     ? `<details class="details" data-key="err-${a.id}"><summary>${t("tech_details")}</summary><pre class="log">${esc(nettoyer(e.brut) || e.brut)}</pre></details>` : "";
   return `<div class="probleme" role="group" aria-label="${esc(t("last_problem"))}">
@@ -339,15 +386,18 @@ function carteApp(a, now, s) {
     ${jauge(a, now, s, ton)}
     ${noteApp(a, now)}
     ${problemeApp(a, now)}
+    ${noteMaj(a, now)}
     <dl class="meta">
       <div><dt>Apple TV</dt><dd>${a.device_id ? esc(a.device_name || "Apple TV") : `<span class="texte-err">${t("none_f")}</span>`}</dd></div>
       <div><dt>${t("account")}</dt><dd>${compte ? esc(compte) : t("default_account")}</dd></div>
       ${essai ? `<div><dt>${t("last_attempt")}</dt><dd>${essai}</dd></div>` : a.signed_at ? `<div><dt>${t("signed")}</dt><dd>${esc(relatif(a.signed_at, now))}</dd></div>` : ""}
-      ${a.bad_tag ? `<div><dt>${t("skipped_version")}</dt><dd class="mono">${esc(a.bad_tag)}</dd></div>` : ""}
+      ${a.bad_tag && !a.update_tag ? `<div><dt>${t("skipped_version")}</dt><dd class="mono">${esc(a.source_type === "url" ? redactUrl(a.bad_tag) : a.bad_tag)}</dd></div>` : ""}
     </dl>
     <div class="app__actions">
       <button class="row__action row__action--go" data-renew="${a.id}" ${a.running ? "disabled" : ""}>${a.running ? t("in_progress") : t("renew")}</button>
       <button class="row__action" data-toggle="${a.id}" data-enabled="${a.enabled}">${a.enabled ? t("pause") : t("resume")}</button>
+      ${a.can_rollback ? `<button class="row__action" data-rollback="${a.id}" data-nom="${esc(a.name)}" ${a.running ? "disabled" : ""}>${t("previous_version")}</button>` : ""}
+      ${a.source_type === "upload" ? `<button class="row__action" data-replace="${a.id}" ${a.running ? "disabled" : ""}>${t("replace_ipa")}</button>` : ""}
       <button class="row__action" data-edit="${a.id}">${t("settings")}</button>
       <button class="row__action row__action--danger" data-del-app="${a.id}" data-nom="${esc(a.name)}">${t("delete")}</button>
     </div>
@@ -355,7 +405,8 @@ function carteApp(a, now, s) {
 }
 // déclencheurs enregistrés par le serveur (en français) -> libellé traduit
 const trigger = (x) => ({ auto: t("tr_auto"), manuel: t("tr_manual"), ajout: t("tr_added"), "nouvelle version": t("tr_new_version"),
-  "nouvelle source": t("tr_new_source"), "nouvelle destination": t("tr_new_dest"),
+  "nouvelle source": t("tr_new_source"), "nouvelle destination": t("tr_new_dest"), "nouvelle IPA": t("tr_new_ipa"),
+  "mise à jour": t("tr_update"), "retour arrière": t("tr_rollback"),
   reconnexion: t("tr_reconnect"), appairage: t("tr_paired") }[x] || x);
 
 // ---------- synthèse globale ----------
@@ -431,6 +482,16 @@ function renderAlertes() {
     if (legacy.length) {
       html.push(`<div class="banner banner--info"><p><strong>${esc(tn("legacy_t", legacy.length, { names: legacy.map((d) => d.name).join(", ") }))}</strong>${t("legacy")}</p>
         <button class="btn btn--primary" data-open="dlg-pair">${t("pair")}</button></div>`);
+    }
+    if (s.update) {
+      const u = s.update;
+      html.push(`<div class="banner banner--info"><p><strong>${esc(t("self_update_t", { v: u.version }))}</strong>${esc(u.edition === "windows" ? t("self_update_windows") : t("self_update_docker", { major: String(u.version).split(".")[0] }))}</p>
+        ${u.url ? `<a class="btn" href="${esc(u.url)}" target="_blank" rel="noopener noreferrer">${t("release_page")}</a>` : ""}
+        <button class="btn" data-dismiss-update="1">${t("dismiss")}</button></div>`);
+    }
+    if (s.health?.release_check_error) {
+      const e = enClair(s.health.release_check_error);
+      html.push(`<div class="banner banner--info"><p><strong>${esc(t("release_check_t"))}</strong>${esc(e.titre)}${e.conseil ? ". " + esc(e.conseil) : ""}</p></div>`);
     }
     for (const d of s.devices.filter((x) => x.pairing_lost && !x.legacy_pairing)) {
       html.push(`<div class="banner"><p><strong>${esc(t("lost_t", { name: d.name }))}</strong>${t("lost")}</p>
@@ -631,8 +692,31 @@ document.addEventListener("click", async (ev) => {
   }
   if (d.edit) return openEdit(+d.edit);
   if (d.team) return openTeam(d.team);
-  if (!(d.renew || d.toggle || d.delApp || d.refreshDev || d.delDev || d.check || d.select || d.logout)) return;
+  if (d.replace) {
+    // le sélecteur de fichier est un <input> permanent (hors des sections redessinées) : un rendu de
+    // la carte pendant le choix du fichier ne perd donc pas l'envoi
+    REMPLACE_ID = +d.replace;
+    $("#replace-input").click();
+    return;
+  }
+  if (!(d.renew || d.toggle || d.delApp || d.refreshDev || d.delDev || d.check || d.select || d.logout
+      || d.update || d.rollback || d.dismissUpdate)) return;
   try {
+    if (d.dismissUpdate) {
+      await api("/api/update/dismiss", { method: "POST" });
+    }
+    if (d.update) {
+      await busy(b, "data-update", t("starting"), async () => {
+        const r = await api(`/api/apps/${d.update}/update`, { method: "POST" });
+        if (r.started === false) flash("info", t("already_running_t"), " " + t("already_running"));
+        else flash("info", t("update_started_t"), " " + t("update_started"));
+        await refresh();
+      });
+    }
+    if (d.rollback && confirm(t("confirm_rollback", { name: d.nom }))) {
+      await api(`/api/apps/${d.rollback}/rollback`, { method: "POST" });
+      flash("info", t("rollback_started_t"), " " + t("renew_started"));
+    }
     if (d.renew) {
       await busy(b, "data-renew", t("starting"), async () => {
         const r = await api(`/api/apps/${d.renew}/renew`, { method: "POST" });
@@ -677,6 +761,32 @@ document.addEventListener("click", async (ev) => {
     flash("err", t("action_failed"), ` ${c.titre}${c.conseil ? ". " + c.conseil : ""}`);
   }
   refresh();
+});
+
+// Remplacer l'IPA d'une app importée : depuis sa carte, la carte d'erreur « IPA absente » ou ses réglages.
+async function remplacerIPA(id, input) {
+  const fichier = input.files[0];
+  if (!fichier) return false;
+  const fd = new FormData();
+  fd.append("file", fichier);
+  flash("info", t("replacing"));
+  try {
+    await api(`/api/apps/${id}/ipa`, { method: "POST", body: fd });
+    flash("ok", t("ipa_replaced_t"), " " + t("ipa_replaced"));
+    return true;
+  } catch (e) {
+    flash("err", t("action_failed"), " " + e.message);
+    return false;
+  } finally {
+    input.value = "";
+    refresh();
+  }
+}
+let REMPLACE_ID = null;
+$("#replace-input").addEventListener("change", (e) => {
+  const input = e.target, id = REMPLACE_ID;
+  REMPLACE_ID = null;
+  if (id != null) remplacerIPA(id, input); else input.value = "";
 });
 
 $("#journal-bloc").addEventListener("change", (e) => {
@@ -851,7 +961,9 @@ function openEdit(id) {
   f.source_filter.value = a.source_filter || "";
   f.channel.value = a.channel === "beta" ? "beta" : "stable";
   f.source_url.value = a.source_type === "url" ? a.source || "" : "";
-  $$("#form-edit [data-for]").forEach((el) => (el.hidden = el.dataset.for !== a.source_type));
+  f.auto_update.value = a.auto_update === 0 ? "0" : "1";
+  f.pinned_tag.value = a.pinned_tag || "";
+  $$("#form-edit [data-for]").forEach((el) => (el.hidden = !el.dataset.for.split(" ").includes(a.source_type)));
   $("#edit-error").textContent = "";
   $("#dlg-edit").showModal();
 }
@@ -874,6 +986,8 @@ $("#form-edit").addEventListener("submit", async (ev) => {
     if (!/^https:\/\//.test(src)) return (err.textContent = t("https_only"));
     if (src !== a.source) body.source = src;
   }
+  if (a.source_type !== "upload" && (f.auto_update.value === "1") !== (a.auto_update !== 0)) body.auto_update = f.auto_update.value === "1";
+  if (a.source_type === "github" && f.pinned_tag.value.trim() !== (a.pinned_tag || "")) body.pinned_tag = f.pinned_tag.value.trim();
   if (!Object.keys(body).length) return f.closest("dialog").close();
   if (body.account_email && !confirm(t("confirm_account_change", { name: a.name, email: body.account_email }))) return;
   const btn = $("#edit-submit");
@@ -891,6 +1005,11 @@ $("#form-edit").addEventListener("submit", async (ev) => {
     btn.disabled = false;
     refresh();
   }
+});
+
+$("#pin-current").addEventListener("click", () => { if (EDIT?.source_tag) $("#form-edit").pinned_tag.value = EDIT.source_tag; });
+$("#edit-replace").addEventListener("change", async (e) => {
+  if (EDIT && await remplacerIPA(EDIT.id, e.target)) $("#dlg-edit").close();
 });
 
 // ---------- sessions interactives (PIN de la TV, code Apple) ----------
@@ -1281,12 +1400,30 @@ async function chargerReglages() {
     if (s.locked) label.insertAdjacentHTML("beforeend", `<span class="verrou" title="${esc(t("set_by_env", { env: s.env }))}">${esc(s.env)}</span>`);
   }
   $("#version").textContent = REGLAGES.version;
+  afficherMaj(REGLAGES.update);
   // des apps importées : sans leur .ipa dans la sauvegarde, elles sont à réimporter après une restauration
   const cb = $("#backup-uploads");
   cb.checked = (STATE?.apps || []).some((a) => a.source_type === "upload");
   $("#backup-export").href = "/api/backup/export" + (cb.checked ? "?uploads=true" : "");
   renderSecurite();
 }
+function afficherMaj(u) {
+  const el = $("#update-status");
+  if (!u) return;
+  el.textContent = !u.enabled ? t("update_status_off")
+    : u.error ? t("update_status_error", { why: enClair(u.error).titre })
+    : u.available ? t("update_status_new", { v: u.latest })
+    : u.checked_at ? t("update_status_current", { when: relatif(u.checked_at, maintenant()) })
+    : t("update_status_never");
+}
+$("#update-check").onclick = async (ev) => {
+  const b = ev.currentTarget, err = $("#reglages-error");
+  err.textContent = "";
+  await busy(b, "id", t("checking"), async () => {
+    try { afficherMaj(await api("/api/update/check", { method: "POST" })); await refresh(); }
+    catch (e) { err.textContent = e.message; }
+  });
+};
 function renderSecurite() {
   const a = REGLAGES.auth;
   const box = $("#securite");

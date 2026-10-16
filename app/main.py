@@ -13,12 +13,13 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import auth, backup, db, devices, diag, ipa, plume, proc, renew, settings
+from . import auth, backup, db, devices, diag, ipa, plume, proc, renew, selfupdate, settings
 from .config import MAX_UPLOAD_MB, ROOT, SHUTDOWN_DRAIN_SECONDS, TMP_DIR, VERSION
 from .proc import SESSIONS
+from .util import replace_retry
 
 
 @asynccontextmanager
@@ -77,6 +78,7 @@ async def validation_error(_: Request, exc: RequestValidationError):
 
 PUBLIC = {"/api/livez", "/api/auth/status", "/api/auth/login", "/api/setup", "/api/health", "/auth/launch"}
 UPLOADS = {"/api/apps", "/api/backup/import"}
+UPLOAD_ROUTES = re.compile(r"/api/apps/\d+/ipa")      # remplacement de l'IPA d'une app importée
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 HEADERS = {
     "X-Frame-Options": "DENY",
@@ -115,8 +117,11 @@ async def _guarded(request: Request, path: str, call_next):
         if request.headers.get("x-tvsign") != "1" or not auth.same_origin(request):
             return _deny(403, "csrf")
         length = request.headers.get("content-length")
-        limit = MAX_UPLOAD_MB * 1024 * 1024 if path in UPLOADS else 1024 * 1024
-        if length is None and path in UPLOADS:
+        upload = path in UPLOADS or bool(UPLOAD_ROUTES.fullmatch(path))
+        limit = MAX_UPLOAD_MB * 1024 * 1024 if upload else 1024 * 1024
+        # Sans Content-Length, une requête en morceaux (Transfer-Encoding: chunked) échappait à la limite :
+        # un corps de plusieurs Go sur une route publique (connexion) aurait été lu entièrement en mémoire.
+        if length is None and (upload or request.headers.get("transfer-encoding")):
             return _deny(411, "content_length_required")
         if length is not None and (not length.isdigit() or int(length) > limit):
             return _deny(413, f"too_large:{limit // (1024 * 1024)}")
@@ -184,7 +189,7 @@ def _client_ip(request: Request) -> str:
 
 
 class LoginBody(BaseModel):
-    password: str
+    password: str = Field(max_length=1024)      # borné : scrypt ne hache jamais des mégaoctets
 
 
 _LOGIN_LOCK = asyncio.Lock()
@@ -213,9 +218,9 @@ async def auth_login(request: Request, body: LoginBody):
 
 
 class SetupBody(BaseModel):
-    code: Optional[str] = None
-    password: Optional[str] = None
-    language: Optional[str] = None
+    code: Optional[str] = Field(None, max_length=64)
+    password: Optional[str] = Field(None, max_length=1024)
+    language: Optional[str] = Field(None, max_length=16)
 
 
 @app.post("/api/setup")
@@ -339,6 +344,9 @@ def state():
         # window_wait : il attend l'ouverture de la plage (window_at)
         a.update(renew.window_view(a, now, before))
         a["effective_account"] = a["account_email"] or default
+        a["can_rollback"] = renew.has_previous(a["id"])             # IPA précédente gardée : « version précédente »
+        a["update_pending"] = renew.pending_update(a)               # IPA téléchargée, pas encore installée
+        a["untracked_link"] = a["source_type"] == "url" and bool(a["source_tag"]) and not a["source_key"]
     health = renew.health(now)
     devices_ = db.rows("SELECT * FROM devices ORDER BY name")
     accounts_ = plume.accounts()
@@ -354,6 +362,7 @@ def state():
         "notifications": health["notifications"],
         "auth_disabled": not auth.enabled(),
         "health": health,
+        "update": selfupdate.available(),         # nouvelle version de tvsign à proposer (ou None)
         "apps": apps,
         "devices": devices_,
         "accounts": accounts_,
@@ -593,9 +602,18 @@ async def _check_source(source_type: str, source: str | None) -> str | None:
         try:
             # résolution DNS hors de la boucle d'événements : un résolveur lent ne gèle pas l'interface
             await asyncio.to_thread(ipa._check_url, source)
+        except ipa.UrlRejected as e:
+            raise HTTPException(400, e.code) from None
         except (ValueError, ConnectionError) as e:
             raise HTTPException(400, str(e)) from None
     return source
+
+
+def _check_min_os(device_id: int | None, info: dict) -> None:
+    """MinimumOSVersion de l'IPA contre le tvOS de l'Apple TV choisie (version inconnue : on laisse passer)."""
+    dev = db.row("SELECT os_version FROM devices WHERE id = ?", device_id) if device_id else None
+    if dev and ipa.os_older(dev["os_version"], info.get("min_os")):
+        raise HTTPException(400, f"tvos_too_old:{info['min_os']}")
 
 
 def _abort_add(app_id: int) -> None:
@@ -659,19 +677,26 @@ async def app_create(
                         raise HTTPException(413, f"too_large:{MAX_UPLOAD_MB}")
                     f.write(chunk)
         else:
-            await renew.refresh_source(db.row("SELECT * FROM apps WHERE id = ?", app_id))
+            try:
+                await renew.refresh_source(db.row("SELECT * FROM apps WHERE id = ?", app_id))
+            except ipa.SourceUnavailable as e:
+                raise HTTPException(400, e.code) from None
+            except ipa.OsTooOld as e:
+                raise HTTPException(400, f"tvos_too_old:{e.min_os}") from None
         try:
             info = ipa.app_info(dest)
         except (zipfile.BadZipFile, ValueError):
             raise HTTPException(400, "not_an_ipa") from None
         if info["platform"] != "appletvos":
             raise HTTPException(400, f"not_tvos:{info['platform'] or 'unknown'}")
+        _check_min_os(device_id, info)
         # même app, même compte : une 2e fiche signerait deux fois et les copies s'écraseraient sur la TV
         if db.row("SELECT id FROM apps WHERE id != ? AND bundle_id = ? AND COALESCE(account_email, '') = ?",
                   app_id, info["bundle_id"], account or ""):
             raise HTTPException(409, "already_added")
+        sha = await asyncio.to_thread(renew._sha256_file, dest)   # identité du fichier : version installée / en attente
         db.update("apps", app_id, name=info["name"], bundle_id=info["bundle_id"], version=info["version"],
-                  enabled=1)
+                  enabled=1, source_sha256=sha)
     except HTTPException:
         _abort_add(app_id)
         raise
@@ -695,6 +720,8 @@ class AppPatch(BaseModel):
     source: Optional[str] = None           # dépôt GitHub (owner/repo) ou URL https
     source_filter: Optional[str] = None    # préfixe de tag (github)
     channel: Optional[str] = None          # stable | beta (github)
+    auto_update: Optional[bool] = None     # false : renouveler seulement, ne pas installer les nouvelles versions
+    pinned_tag: Optional[str] = None       # github : seule cette version est suivie ("" : suivre la dernière)
 
 
 def app_or_404(app_id: int) -> dict:
@@ -708,10 +735,13 @@ def app_or_404(app_id: int) -> dict:
 async def app_patch(app_id: int, body: AppPatch):
     a = app_or_404(app_id)
     fields = body.model_dump(exclude_unset=True)
+    pin_in_request = "pinned_tag" in fields
     if fields.get("enabled") is None:
         fields.pop("enabled", None)          # null n'a pas de sens : ignoré
     else:
         fields["enabled"] = int(fields["enabled"])
+        if not fields["enabled"]:
+            renew._release_ok(a)             # en pause : sa recherche de version n'a plus lieu d'être signalée
     if "account_email" in fields:
         wanted = (fields["account_email"] or "").strip()
         if wanted:
@@ -727,6 +757,21 @@ async def app_patch(app_id: int, body: AppPatch):
             fields["asset_name"] = None
     if "channel" in fields:
         fields["channel"] = "beta" if fields["channel"] == "beta" else "stable"
+    if fields.get("auto_update") is None:
+        fields.pop("auto_update", None)
+    else:
+        fields["auto_update"] = int(fields["auto_update"])
+    pin_changed = False
+    if "pinned_tag" in fields:
+        pin = (fields["pinned_tag"] or "").strip()
+        if len(pin) > 200 or re.search(r"[\x00-\x1f\x7f]", pin):
+            raise HTTPException(400, "invalid_tag")
+        if pin and a["source_type"] != "github":
+            raise HTTPException(400, "pin_github_only")
+        fields["pinned_tag"] = pin or None
+        pin_changed = fields["pinned_tag"] != a["pinned_tag"]
+        if not pin_changed:
+            del fields["pinned_tag"]
     if "device_id" in fields and fields["device_id"] is not None:
         if not db.row("SELECT id FROM devices WHERE id = ?", fields["device_id"]):
             raise HTTPException(400, "unknown_device")
@@ -736,18 +781,36 @@ async def app_patch(app_id: int, body: AppPatch):
         fields["source_key"] = None
         fields["bad_tag"] = None
         fields["bad_key"] = None
+        fields.update(update_tag=None, update_notes=None, update_block=None, update_error=None)
+        renew._release_ok(a)               # l'ancienne source n'est plus cherchée : son échec ne compte plus
+        if "source" in fields and fields["source"] != a["source"]:
+            # autre dépôt ou autre lien : la version épinglée (tag de l'ancien dépôt) et la version précédente
+            # gardée (IPA de l'ancienne source) n'ont plus de sens
+            if not pin_in_request:
+                fields["pinned_tag"] = None
+            fields.update(prev_tag=None, prev_key=None, prev_version=None, prev_sha256=None)
+            try:
+                (renew.app_dir(app_id) / "original.prev.ipa").unlink(missing_ok=True)
+            except OSError:
+                pass
     dest_changed = "device_id" in fields or "account_email" in fields
     if dest_changed:
         # autre appareil/compte : la signature déjà prête ne convient plus
         (renew.app_dir(app_id) / "signed.ipa").unlink(missing_ok=True)
     if dest_changed or source_changed or fields.get("enabled") == 1:
         # l'utilisateur a agi : on repart de zéro (plus d'attente, ni d'action requise, ni de délai croissant)
-        fields.update(next_attempt_at=None, needs_action=None, fail_count=0)
+        fields.update(renew.CLEAR_BLOCK)
+    if pin_changed:
+        fields.update(update_tag=None, update_notes=None, update_block=None, update_error=None,
+                      bad_tag=None, bad_key=None)
     db.update("apps", app_id, **fields)
     if dest_changed:
         renew.rerun(app_id)    # un renouvellement en cours vise l'ancienne destination
     if source_changed:
         renew.spawn(app_id, "nouvelle source")
+    elif pin_changed:
+        # version épinglée (ou libérée) : appliquée tout de suite, la mise à jour auto coupée n'y change rien
+        renew.spawn(app_id, "mise à jour" if fields.get("pinned_tag") else "nouvelle version")
     return db.row("SELECT * FROM apps WHERE id = ?", app_id)
 
 
@@ -756,6 +819,111 @@ async def app_renew(app_id: int):
     app_or_404(app_id)
     renew.clear_block(app_id)
     return {"ok": True, "started": renew.spawn(app_id, "manuel")}
+
+
+@app.post("/api/apps/{app_id}/update")
+async def app_update(app_id: int):
+    """« Installer la mise à jour maintenant » : télécharge la version disponible (ou la version épinglée) et
+    l'installe, même si la mise à jour automatique est coupée ou si la version avait été écartée."""
+    a = app_or_404(app_id)
+    if a["source_type"] == "upload":
+        raise HTTPException(409, "not_followed")
+    renew.clear_block(app_id)
+    return {"ok": True, "started": renew.spawn(app_id, "mise à jour")}
+
+
+@app.post("/api/apps/{app_id}/rollback")
+async def app_rollback(app_id: int):
+    """Réinstalle la version précédente (dernière IPA installée avant la mise à jour). La version quittée
+    est ignorée jusqu'à une autre release, ou jusqu'à « Installer la mise à jour »."""
+    a = app_or_404(app_id)
+    if app_id in renew._RUNNING:
+        raise HTTPException(409, "app_busy")
+    if not renew.has_previous(app_id):
+        raise HTTPException(409, "no_previous")
+    try:
+        renew._swap_files(app_id)
+    except OSError:
+        raise HTTPException(409, "files_locked") from None      # fichier verrouillé (antivirus…) : rien n'a changé
+    d = renew.app_dir(app_id)
+    (d / "original.prev.ipa").unlink(missing_ok=True)            # la version quittée : retéléchargeable depuis la source
+    (d / "signed.ipa").unlink(missing_ok=True)
+    followed = a["source_type"] != "upload"
+    db.update("apps", app_id, source_tag=a["prev_tag"], source_key=a["prev_key"], version=a["prev_version"],
+              source_sha256=a["prev_sha256"], notes=None,
+              bad_tag=a["source_tag"] if followed else None, bad_key=a["source_key"] if followed else None,
+              update_tag=a["source_tag"] if followed else None, update_notes=a["notes"] if followed else None,
+              update_block="rollback" if followed else None, update_error=None,
+              prev_tag=None, prev_key=None, prev_version=None, prev_sha256=None, **renew.CLEAR_BLOCK)
+    db.log(f"{a['name']} : retour à la version précédente {a['prev_version'] or a['prev_tag'] or ''}".rstrip(),
+           app_id=app_id)
+    return {"ok": True, "started": renew.spawn(app_id, "retour arrière")}
+
+
+@app.post("/api/apps/{app_id}/ipa")
+async def app_replace_ipa(app_id: int, file: UploadFile = File(...)):
+    """Remplace l'IPA d'une app importée (nouvelle version, ou IPA absente après une restauration) en gardant
+    son historique, son Apple TV et son compte. Mêmes contrôles qu'à l'ajout, et même app (bundle ID)."""
+    a = app_or_404(app_id)
+    if a["source_type"] != "upload":
+        raise HTTPException(409, "not_an_upload")
+    if app_id in renew._RUNNING:
+        raise HTTPException(409, "app_busy")
+    tmp = TMP_DIR / f"replace-{app_id}-{int(time.time())}.ipa"
+    try:
+        limit, got = MAX_UPLOAD_MB * 1024 * 1024, 0
+        with open(tmp, "wb") as f:
+            while chunk := await file.read(1 << 20):
+                got += len(chunk)
+                if got > limit:
+                    raise HTTPException(413, f"too_large:{MAX_UPLOAD_MB}")
+                f.write(chunk)
+        try:
+            info = ipa.app_info(tmp)
+        except (zipfile.BadZipFile, ValueError):
+            raise HTTPException(400, "not_an_ipa") from None
+        if info["platform"] != "appletvos":
+            raise HTTPException(400, f"not_tvos:{info['platform'] or 'unknown'}")
+        if a["bundle_id"] and info["bundle_id"] != a["bundle_id"]:
+            raise HTTPException(400, f"bundle_mismatch:{a['bundle_id']}")
+        _check_min_os(a["device_id"], info)
+        sha = await asyncio.to_thread(renew._sha256_file, tmp)
+        if app_id in renew._RUNNING:                # un renouvellement a démarré pendant l'envoi
+            raise HTTPException(409, "app_busy")
+        d = renew.app_dir(app_id)
+        dest, prev, hold = d / "original.ipa", d / "original.prev.ipa", d / "original.hold"
+        keep = dest.exists() and not renew.pending_update(a) and a["source_sha256"] != sha
+
+        def put_in_place() -> None:
+            # copie éventuelle d'une grosse IPA et remplacements : hors de la boucle d'événements
+            try:
+                if keep:
+                    ipa.keep_copy(dest, hold)
+                replace_retry(tmp, dest)
+                if keep:
+                    replace_retry(hold, prev)
+            finally:
+                hold.unlink(missing_ok=True)
+
+        try:
+            await asyncio.to_thread(put_in_place)
+        except OSError:
+            raise HTTPException(409, "files_locked") from None
+        (d / "signed.ipa").unlink(missing_ok=True)
+        fields = dict(name=info["name"], version=info["version"], bundle_id=info["bundle_id"], source_sha256=sha,
+                      bad_tag=None, bad_key=None, update_error=None, **renew.CLEAR_BLOCK)
+        if keep:
+            fields.update(prev_tag=a["source_tag"], prev_key=a["source_key"], prev_version=a["version"],
+                          prev_sha256=a["source_sha256"])
+        if a["status"] == "error":
+            fields.update(status="pending", last_error=None)       # l'erreur « IPA absente » n'a plus lieu d'être
+        db.update("apps", app_id, **fields)
+    finally:
+        tmp.unlink(missing_ok=True)
+    db.log(f"IPA remplacée : {info['name']} {info['version']}", app_id=app_id)
+    if a["enabled"]:
+        renew.spawn(app_id, "nouvelle IPA")
+    return db.row("SELECT * FROM apps WHERE id = ?", app_id)
 
 
 @app.delete("/api/apps/{app_id}")
@@ -782,7 +950,21 @@ def settings_get(request: Request):
         "auth": {"enabled": auth.enabled(), "has_password": auth.has_password(),
                  "password_from_env": bool(auth.PASSWORD_ENV), "trusted": auth.trusted(request)},
         "version": VERSION,
+        "update": selfupdate.summary(),
     }
+
+
+@app.post("/api/update/check")
+async def update_check():
+    """Recherche immédiate d'une nouvelle version de tvsign (bouton des Réglages)."""
+    await selfupdate.check(force=True)
+    return selfupdate.summary()
+
+
+@app.post("/api/update/dismiss")
+def update_dismiss():
+    selfupdate.dismiss()
+    return {"ok": True}
 
 
 @app.patch("/api/settings")

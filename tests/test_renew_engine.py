@@ -565,7 +565,7 @@ class RenewRun(Base):
             if self.install_error:
                 raise self.install_error
 
-        async def refresh(app):
+        async def refresh(app, force=False):
             return False
         patches = [mock.patch.object(renew, "_phase", phase), mock.patch.object(devices, "check_reachable", check_reachable),
                    mock.patch.object(plume, "ensure_device", ensure_device), mock.patch.object(plume, "sign", sign),

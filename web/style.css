@@ -253,6 +253,12 @@ h3 { margin: 0; }
   border-color: color-mix(in srgb, var(--blue) 22%, transparent);
 }
 .probleme--info .probleme__ic, .probleme--info .probleme__titre { color: var(--blue-text); }
+.probleme--warn {
+  background: color-mix(in srgb, var(--orange) 9%, var(--surface));
+  border-color: color-mix(in srgb, var(--orange) 35%, transparent);
+}
+.probleme--warn .probleme__ic { color: var(--orange); }
+.probleme--warn .probleme__titre { color: var(--label); }
 .probleme + .probleme { margin-top: var(--sp-2); }
 
 .details { margin-top: var(--sp-2); font-size: var(--t-foot); }
