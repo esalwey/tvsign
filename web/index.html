@@ -195,7 +195,7 @@
             <p class="row__title" data-i18n="backup_export">Export a backup</p>
             <p class="row__sub" data-i18n="backup_export_sub">Database, Apple sessions, certificate keys and Apple TV pairings.</p>
             <label class="case"><input type="checkbox" id="backup-uploads"> <span data-i18n="backup_uploads">Include uploaded .ipa files</span></label>
-            <div><label class="case"><input type="checkbox" id="backup-certs"> <span data-i18n="backup_certs">Include imported certificates and their private keys</span></label></div>
+            <div id="backup-certs-row" hidden><label class="case"><input type="checkbox" id="backup-certs"> <span data-i18n="backup_certs">Include imported certificates and their private keys</span></label></div>
           </div>
           <div class="row__buttons"><button class="row__action row__action--go" id="backup-export" type="button" data-i18n="export">Export</button></div>
         </div>
@@ -377,7 +377,7 @@
           <p class="group__header espace" data-i18n="ic_title">Signing</p>
           <div class="list" role="radiogroup" data-i18n-aria="ic_method">
             <label class="row row--choix"><input type="radio" name="sign_mode" value="apple_id">
-              <span class="row__label"><span class="row__title" data-i18n="ic_apple_id">Apple ID (free, renews every 7 days)</span></span></label>
+              <span class="row__label"><span class="row__title" data-i18n="ic_apple_id">Apple ID (free, 7-day profile renewed automatically)</span></span></label>
             <label class="row row--choix"><input type="radio" name="sign_mode" value="certificate">
               <span class="row__label"><span class="row__title" data-i18n="ic_certificate">Imported certificate</span></span></label>
           </div>
@@ -413,7 +413,7 @@
 
   <!-- Feuille : destination de notification -->
   <dialog class="sheet" id="dlg-notif" aria-labelledby="t-notif-dlg">
-    <form id="form-notif" method="dialog">
+    <form id="form-notif" method="dialog" novalidate>
       <header class="sheet__bar">
         <button class="sheet__link" type="button" data-close data-i18n="cancel">Cancel</button>
         <h2 id="t-notif-dlg" data-i18n="notif_destination">Destination</h2>

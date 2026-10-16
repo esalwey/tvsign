@@ -417,6 +417,7 @@ def state():
         "auth_disabled": not auth.enabled(),
         "health": health,
         "update": selfupdate.available(),         # nouvelle version de tvsign à proposer (ou None)
+        "update_check": selfupdate.enabled(),     # la recherche quotidienne est active (l'assistant le dit)
         "apps": apps,
         "devices": devices_,
         "accounts": accounts_,

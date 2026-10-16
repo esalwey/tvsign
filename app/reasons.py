@@ -51,7 +51,7 @@ CAUSES: list[tuple[re.Pattern, str, str]] = [
     (re.compile(r"verrouillé depuis son démarrage|locked since (boot|it started)", re.I), "c_locked", "Device locked since it started"),
     (re.compile(r"l'installation n'avance plus|installation bloquée à \d+ % depuis \d+ min \(appareil", re.I), "c_stalled", "Installation stuck"),
     (re.compile(r"ouverte sur l'Apple TV|app ouverte sur la TV|installd ne progresse plus|installation (bloquée|en attente)", re.I), "c_app_open", "Installation stalled on the Apple TV"),
-    (re.compile(r"n'est plus installée|n'apparaît pas dans les apps", re.I), "c_not_installed", "App missing from the Apple TV"),
+    (re.compile(r"n'est plus installée|n'apparaît pas dans les apps", re.I), "c_not_installed", "App missing from the device"),
     (re.compile(r"plumesign trop ancien", re.I), "c_plumesign_old", "plumesign too old"),
     (re.compile(r"réseau ou Apple injoignable", re.I), "c_apple_net", "Apple temporarily unreachable"),
     (re.compile(r"identifiant d'app changé", re.I), "c_bundle", "New version refused: app identifier changed"),

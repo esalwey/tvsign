@@ -178,6 +178,7 @@ const EVENEMENTS = [
   [/^Appairage existant repris : (.+)$/, "ev_pairing_kept", ["name"]],
   [/^(.+) : téléchargement de (.+?)(?: \(fichier mis à jour sous le même nom\))?(?: \(empreinte SHA-256 vérifiée\))?$/, "ev_download", ["name", "tag"]],
   [/^(.+) : signature du (.+) réutilisée$/, "ev_sign_reused", ["name", "date"]],
+  [/^(.+) : signature avec le certificat importé « (.+) »$/, "ev_sign_cert", ["name", "cert"]],
   [/^(.+) : signature avec (.+)$/, "ev_sign", ["name", "email"]],
   [/^(.+) : installation sur « (.+) »$/, "ev_install", ["name", "tv"]],
   [/^(.+) : renouvelée \((.+)\), valable jusqu'au (.+), prochain renouvellement auto le (.+)$/, "ev_renewed", ["name", "trigger", "until", "next"]],
@@ -195,22 +196,59 @@ const EVENEMENTS = [
   [/^Certificat importé « (.+) » ajouté pour « (.+) », valable jusqu'au (.+)$/, "ev_cert_added", ["name", "tv", "until"]],
   [/^Certificat importé « (.+) » remplacé pour « (.+) », valable jusqu'au (.+)$/, "ev_cert_replaced", ["name", "tv", "until"]],
   [/^Certificat importé « (.+) » supprimé$/, "ev_cert_removed", ["name"]],
-  [/^(.+) : signature avec le certificat importé « (.+) »$/, "ev_sign_cert", ["name", "cert"]],
   [/^(.+) : installée avec le certificat importé \((.+)\), valable jusqu'au (.+) \(pas de renouvellement automatique.*\)$/, "ev_installed_cert", ["name", "trigger", "until"]],
   [/^Certificat importé « (.+) » : expire le (.+) \((.+)\), importe-en un nouveau$/, "ev_cert_expiring", ["name", "until", "apps"]],
   [/^Certificat importé « (.+) » révoqué \((.+)\) : (.+)$/, "ev_cert_revoked_ident", ["name", "why", "apps"]],
   [/^(.+) : aucun certificat importé pour « (.+) », la copie se signe avec l'Apple ID$/, "ev_cert_copy_apple", ["name", "tv"]],
+  // appairage d'un iPhone / iPad, mises à jour, retour arrière, appareils, anisette, restauration
+  [/^(iPhone|iPad|Apple TV|Apple Vision Pro) « (.+) » appairé en USB$/, "ev_usb_paired", ["kind", "name"]],
+  [/^Appairage USB annulé$/, "ev_usb_cancelled", []],
+  [/^Appairage USB échoué : (.+)$/, "ev_usb_failed", ["why"]],
+  [/^(iPhone|iPad|Apple TV|Apple Vision Pro) « (.+) » : fichier d'appairage importé$/, "ev_pairing_imported", ["kind", "name"]],
+  [/^Appairage de (.+) annulé$/, "ev_pair_cancelled", ["name"]],
+  [/^Appairage de (.+) échoué : (.+)$/, "ev_pair_failed", ["name", "why"]],
+  [/^Infos de (.+) non récupérées pour l'instant : (.+)$/, "ev_info_pending", ["name", "why"]],
+  [/^App ajoutée : (.+) \((.+)\), copie pour une autre Apple TV$/, "ev_app_copied", ["name", "id"]],
+  [/^IPA remplacée : (.+)$/, "ev_ipa_replaced", ["name"]],
+  [/^(.+) : version (.+) disponible \(mises à jour automatiques désactivées\)$/, "ev_update_available", ["name", "tag"]],
+  [/^(.+) : déjà à jour$/, "ev_up_to_date", ["name"]],
+  [/^(.+) : version (.+) installée$/, "ev_version_installed", ["name", "version"]],
+  [/^(.+) : retour à la version précédente(?: (.+))?$/, "ev_rollback", ["name", "version"]],
+  [/^(.+) : la version (.+) n'a pas pu être installée \((.+)\), nouvel essai avec la version précédente(?: (.+))?$/, "ev_fallback_try", ["name", "tag", "why", "prev"]],
+  [/^(.+) : la version (.+) n'a pas pu être installée \((.+)\) ; la version précédente est réinstallée et la nouvelle ignorée$/, "ev_fallback_done", ["name", "tag", "why"]],
+  [/^(.+) : la version épinglée « (.+) » est introuvable dans (.+?) \(.*\), version actuelle conservée$/, "ev_pin_missing", ["name", "tag", "repo"]],
+  [/^(.+) : mise à jour en attente, (.+)$/, "ev_update_hold", ["name", "why"]],
+  [/^(.+) : mise à jour impossible, (.+)$/, "ev_update_impossible", ["name", "why"]],
+  [/^(.+) : (tvOS|iOS|iPadOS) (\S+) sur .+, la version refusée \((?:tvOS|iOS|iPadOS) (\S+) minimum\) est de nouveau candidate$/, "ev_os_block_lifted", ["name", "system", "have", "need"]],
+  [/^(.+) : installation en attente sur « (.+) » \(.*\)$/, "ev_install_waiting_phone", ["name", "tv"]],
+  [/^(.+) : le profil obtenu expire le (.+), dans la fenêtre de renouvellement \((.+) h\) : prochain essai dans 6 h$/, "ev_profile_short", ["name", "date", "h"]],
+  [/^« (.+) » : mode développeur désactivé, les apps signées ne s'y lanceront pas \(.*\)$/, "ev_devmode_off", ["name"]],
+  [/^« (.+) » est de retour sur le réseau : renouvellement de (.+)$/, "ev_back_online", ["tv", "name"]],
+  [/^tvsign (.+) est disponible \(version installée : (.+)\)$/, "ev_tvsign_update", ["latest", "current"]],
+  [/^Connexion Apple (.+) échouée : (.+)$/, "ev_login_failed", ["email", "why"]],
+  [/^Connexion Apple (.+) annulée$/, "ev_login_cancelled", ["email"]],
+  [/^Compte Apple (.+) valide : reprise de (\d+) renouvellement\(s\) en attente$/, "ev_account_resume", ["email", "n"]],
+  [/^notification (.+) échouée : (.+)$/, "ev_notify_failed", ["dest", "why"]],
+  [/^serveur anisette (.+) en échec, essai avec (.+)$/, "ev_anisette_failover", ["from", "to"]],
+  [/^Serveur anisette (.+?) retiré, .*$/, "ev_anisette_removed", ["servers"]],
+  [/^Identité anisette Android abandonnée .*$/, "ev_anisette_android", []],
+  [/^Identité anisette réinitialisée \(.+\) : une nouvelle sera créée au prochain essai$/, "ev_anisette_reset", []],
+  [/^Équipe (.+) choisie pour (.+) : les prochaines signatures l'utilisent$/, "ev_team_chosen", ["team", "email"]],
+  [/^Restauration refusée \((.+?)\) : (.+)$/, "ev_restore_refused", ["code", "why"]],
 ];
 function evenementTexte(message) {
   const brut = String(message || "");
   if (typeof LANG !== "undefined" && LANG === "fr") return null;
+  // le motif le plus précis d'abord : « signature avec le certificat importé » avant « signature avec <compte> »
   for (const [re, k, noms] of EVENEMENTS) {
     const m = brut.match(re);
     if (!m) continue;
     const vars = {};
-    noms.forEach((n, i) => (vars[n] = m[i + 1]));
+    noms.forEach((n, i) => (vars[n] = m[i + 1] ?? ""));
     if (vars.trigger) vars.trigger = declencheur(vars.trigger);
-    return t(k, vars);
+    // la cause d'un échec est écrite en français par le serveur : en anglais, la cause connue
+    if (vars.why) vars.why = (k === "ev_login_failed" ? causeConnexion(vars.why) : enClair(vars.why)).titre;
+    return t(k, vars).replace(/ +/g, " ").trim();
   }
   return null;
 }

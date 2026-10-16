@@ -208,6 +208,68 @@ test("journal en français : rien n'est modifié", () => {
   langue("fr");
   eq(ev(`evenementTexte("App ajoutée : NuvioTV 1.0 (com.nuvio.tv)")`), null);
 });
+// Les lignes écrites par le serveur depuis la 1.1 (appairage USB, retour arrière, versions, anisette…), telles qu'il les écrit.
+test("journal en anglais : lignes du serveur de la 1.1", () => {
+  langue("en");
+  const e = (m) => ev(`evenementTexte(${JSON.stringify(m)})`);
+  const cas = [
+    ["iPad « iPad de Zoé » appairé en USB", "iPad “iPad de Zoé” paired over USB"],
+    ["Appairage USB annulé", "USB pairing cancelled"],
+    ["Appairage USB échoué : usbmuxd is not reachable (x)", "USB pairing failed: Apple's USB driver not found"],
+    ["iPhone « Mon iPhone » : fichier d'appairage importé", "iPhone “Mon iPhone”: pairing file imported"],
+    ["Appairage de Salon annulé", "Pairing of Salon cancelled"],
+    ["Infos de Salon non récupérées pour l'instant : Apple TV « Salon » introuvable sur le réseau (éteinte ou en veille ?)", "Details of Salon not read yet: Device unreachable"],
+    ["App ajoutée : Nuvio 1.0 (com.nuvio.tv), copie pour une autre Apple TV", "App added: Nuvio 1.0 (com.nuvio.tv), copy for another Apple TV"],
+    ["IPA remplacée : Nuvio 2.0", "IPA replaced: Nuvio 2.0"],
+    ["Nuvio : version v2.0 disponible (mises à jour automatiques désactivées)", "Nuvio: version v2.0 is available (automatic updates are off)"],
+    ["Nuvio : déjà à jour", "Nuvio: already up to date"],
+    ["Nuvio : version 2.0 installée", "Nuvio: version 2.0 installed"],
+    ["Nuvio : retour à la version précédente 1.0", "Nuvio: back to the previous version 1.0"],
+    ["Nuvio : retour à la version précédente", "Nuvio: back to the previous version"],
+    ["Nuvio : la version v2 n'a pas pu être installée (installd ne progresse plus depuis 30 min), nouvel essai avec la version précédente v1",
+      "Nuvio: version v2 could not be installed (Installation stalled on the Apple TV), trying the previous version v1"],
+    ["Nuvio : la version v2 n'a pas pu être installée (installd ne progresse plus depuis 30 min) ; la version précédente est réinstallée et la nouvelle ignorée",
+      "Nuvio: version v2 could not be installed (Installation stalled on the Apple TV); the previous version is installed again and the new one skipped"],
+    ["Nuvio : la version épinglée « v9 » est introuvable dans o/r (tag mal écrit, release supprimée ou sans IPA ?), version actuelle conservée",
+      "Nuvio: the pinned version “v9” does not exist in o/r, current version kept"],
+    ["Nuvio : mise à jour en attente, Apple TV « Salon » introuvable sur le réseau", "Nuvio: update on hold, Device unreachable"],
+    ["Nuvio : mise à jour impossible, limite du compte gratuit atteinte", "Nuvio: update not possible, Free account limit reached"],
+    ["Nuvio : tvOS 27.1 sur l'Apple TV, la version refusée (tvOS 27.0 minimum) est de nouveau candidate",
+      "Nuvio: tvOS 27.1, the refused version (tvOS 27.0 minimum) is a candidate again"],
+    ["Nuvio : installation en attente sur « iPhone » (appareil verrouillé, occupé ou presque plein ?)",
+      "Nuvio: installation on hold on “iPhone” (device locked, busy or nearly full?)"],
+    ["Nuvio : le profil obtenu expire le Sat 20 Oct 10:00, dans la fenêtre de renouvellement (60 h) : prochain essai dans 6 h",
+      "Nuvio: the profile obtained expires on Sat 20 Oct 10:00, inside the renewal window (60 h): next attempt in 6 h"],
+    ["« Salon » : mode développeur désactivé, les apps signées ne s'y lanceront pas (Réglages › Confidentialité et sécurité › Mode développeur)",
+      "“Salon”: Developer Mode is off, signed apps will not launch there (Settings › Privacy & Security › Developer Mode)"],
+    ["« iPhone de Zoé » est de retour sur le réseau : renouvellement de Gate", "“iPhone de Zoé” is back on the network: renewing Gate"],
+    ["tvsign 1.2.0 est disponible (version installée : 1.1.0)", "tvsign 1.2.0 is available (installed version: 1.1.0)"],
+    ["Connexion Apple a@b.c échouée : Error: Authentication SRP error -22406: Your Apple ID or password was entered incorrectly.",
+      "Apple sign-in of a@b.c failed: Apple ID or password refused"],
+    ["Connexion Apple a@b.c annulée", "Apple sign-in of a@b.c cancelled"],
+    ["Compte Apple a@b.c valide : reprise de 2 renouvellement(s) en attente", "Apple ID a@b.c valid: 2 waiting renewal(s) resumed"],
+    ["notification ntfy échouée : HTTP 404", "Notification to ntfy failed: HTTP 404"],
+    ["serveur anisette https://a.example en échec, essai avec https://b.example", "Anisette server https://a.example failed, trying https://b.example"],
+    ["Serveur anisette ani.sidestore.app retiré, remplacé par le serveur par défaut (https://ani.jkcoxson.com) : Apple refuse les données des serveurs anisette Android depuis le 12 octobre 2026 (erreur -80045)",
+      "Anisette server ani.sidestore.app removed: Apple refuses the data of Android anisette servers since 12 October 2026"],
+    ["Identité anisette réinitialisée (Apple refuse les données anisette : signature) : une nouvelle sera créée au prochain essai",
+      "Anisette identity reset (Apple refused the anisette data): a new one will be created at the next attempt"],
+    ["Équipe ABCDE12345 choisie pour a@b.c : les prochaines signatures l'utilisent", "Team ABCDE12345 chosen for a@b.c: the next signatures use it"],
+    ["Nuvio : signature avec le certificat importé « Mon cert »", "Nuvio: signing with the imported certificate “Mon cert”"],
+    ["Nuvio : signature avec a@b.c", "Nuvio: signing with a@b.c"],
+  ];
+  for (const [fr, en] of cas) eq(e(fr), en, fr);
+  ok(/^Android anisette identity dropped/.test(e("Identité anisette Android abandonnée (Apple refuse ses données depuis le 12 octobre 2026) : une identité Windows sera créée au prochain contact avec Apple")));
+  ok(/^Restore refused \(restore_failed\): /.test(e("Restauration refusée (restore_failed) : restauration annulée, rien n'a changé : [WinError 5]")));
+  for (const [, en] of cas) ok(!/[{}]/.test(en), en);
+});
+test("journal : chaque entrée a ses variables en français et en anglais", () => {
+  const motifs = ev("EVENEMENTS");
+  for (const [, k, noms] of motifs) {
+    const [fr, en] = I18N[k];
+    for (const n of noms) ok(fr.includes(`{${n}}`) && en.includes(`{${n}}`), `${k} : {${n}}`);
+  }
+});
 
 // ---------- diagnostic ----------
 test("détails de diagnostic traduits d'après leur code", () => {
@@ -246,6 +308,100 @@ test("la page charge errors.js entre i18n.js et app.js et #resume n'est plus tra
 });
 test("le titre de l'assistant est focalisable (focus clavier entre les étapes)", () => {
   ok(/id="wiz-titre" tabindex="-1"/.test(lire("app.js")));
+});
+
+// ---------- relecture de la 1.1 ----------
+// La feuille d'une destination de notification n'est pas validée par le navigateur : le serveur renvoie un webhook ou un
+// lien Discord sous la forme « ******** » (secret), qu'un champ type=url refusait (« Please enter a URL ») au moment
+// d'enregistrer les seuls événements ; un sujet ntfy sans « https:// » (« mon-sujet ») était refusé de la même façon.
+test("feuille des notifications : pas de validation du navigateur, le serveur valide", () => {
+  const html = lire("index.html");
+  ok(/<form id="form-notif"[^>]*\bnovalidate\b/.test(html), "form-notif sans novalidate");
+  const champs = lire("extras.js").match(/NOTIF_CHAMPS = \{[\s\S]*?\n\};/)[0];
+  ok(/webhook: \[\["url", "url", true/.test(champs) && /discord: \[\["url", "url", true/.test(champs));    // les champs secrets de type url
+  for (const f of ["form-reglages", "form-mdp"]) ok(!new RegExp(`<form id="${f}"(?![^>]*novalidate)`).test(html), f);
+});
+test("réglages : les certificats importés ne s'offrent à la sauvegarde que s'il y en a", () => {
+  ok(/<div id="backup-certs-row" hidden>/.test(lire("index.html")));
+  ok(/\$\("#backup-certs-row"\)\.hidden = !avecCerts/.test(lire("app.js")));
+});
+test("assistant : l'étape de l'appareil ne renvoie pas à une feuille qui n'est pas ouverte", () => {
+  ok(/<ol class="consigne">\$\{t\("pair_steps_wiz"\)\}<\/ol>/.test(lire("app.js")));
+  langue("en");
+  ok(!/this sheet/i.test(ev(`t("pair_steps_wiz")`)));
+  ok(/this sheet/i.test(ev(`t("pair_steps")`)));            // la feuille, elle, est ouverte
+});
+test("assistant : les textes de l'installation valent pour une Apple TV, un iPhone et un iPad", () => {
+  for (const l of ["fr", "en"]) {
+    langue(l);
+    for (const k of ["wiz_app_installed", "wiz_app_failed_hint", "wiz_skip_app_warning", "wiz_tv_done", "wiz_app_wait_phone", "wiz_done_open_phone"]) {
+      ok(!/Apple TV|la TV|the TV/.test(ev(`t(${JSON.stringify(k)})`)), `${l} ${k}`);
+    }
+  }
+  const { wiz_done_open_phone: [fr, en] } = { wiz_done_open_phone: I18N.wiz_done_open_phone };
+  ok(fr.includes("{device}") && en.includes("{device}"));
+  const app = lire("app.js");
+  ok(/estMobile\(premiere\.device_family\)/.test(app) && /phone_trust_t/.test(app) && /wiz_done_dev_t/.test(app));   // confiance + mode développeur
+});
+test("menus cités : « Appareils › Appairer », jamais une section « Apple TV »", () => {
+  for (const [k, [fr, en]] of Object.entries(I18N)) {
+    ok(!/section Apple TV|Apple TV section|écran principal › Apple TV|main screen › Apple TV|Apple TV › Appairer|Apple TV › Pair/.test(fr + " " + en), k);
+  }
+  langue("en");
+  ok(/main screen › Devices › Pair/.test(ev(`t("wiz_missing_tv")`)));
+  ok(/Devices section › Pair/.test(ev(`t("c_legacy_a")`)));
+});
+test("renouvellement : jamais « renouvelée tous les 7 jours », les profils durent 7 jours", () => {
+  for (const [k, [fr, en]] of Object.entries(I18N)) {
+    if (k === "ic_note") continue;          // « n'est pas renouvelée tous les 7 jours » : la négation est voulue
+    ok(!/renews? every 7 days|renewal every 7 days|renouvel\S* tous les 7 jours/i.test(fr + " " + en), k);
+  }
+  langue("en");
+  ok(/last 7 days and are renewed before they expire/.test(ev(`t("welcome_p3")`)));
+});
+test("certificats : le texte de l'assistant dit ce que fait le réglage par défaut", () => {
+  langue("en");
+  const t_ = ev(`t("wiz_account_revoke")`);
+  ok(/only replaces its own certificates/.test(t_) && /Apple account full/.test(t_) && /dedicated Apple ID/.test(t_), t_);
+  ok(!/revokes their certificate when it signs/.test(t_));
+  langue("fr");
+  ok(/ne remplace que ses propres certificats/.test(ev(`t("wiz_account_revoke")`)));
+});
+test("certificat importé : une voie facultative, aucun service de signature n'est évoqué", () => {
+  for (const [k, [fr, en]] of Object.entries(I18N)) {
+    if (!/^ic_|^c_ic_|^err_cert_|backup_certs/.test(k)) continue;
+    ok(!/provider|fournisseur|service de signature (de|d')/i.test(fr + " " + en) || /neither recommends|ne recommande/.test(fr + " " + en), k);
+  }
+  langue("en");
+  const note = ev(`t("ic_note")`);
+  ok(/optional/.test(note) && /supported route is the free Apple ID/.test(note) && /neither recommends nor contacts any signing service/.test(note), note);
+  ok(!/provider you chose/.test(note));
+  langue("fr");
+  ok(/ne recommande ni ne contacte aucun service de signature/.test(ev(`t("ic_note")`)));
+});
+test("canal « Bêtas aussi » : le même libellé partout", () => {
+  langue("en");
+  for (const k of ["err_no_release_beta", "c_no_release_a"]) ok(/Betas too/.test(ev(`t(${JSON.stringify(k)}, {n: "v1"})`)), k);
+  langue("fr");
+  for (const k of ["err_no_release_beta", "c_no_release_a"]) ok(/Bêtas aussi/.test(ev(`t(${JSON.stringify(k)}, {n: "v1"})`)), k);
+});
+test("version épinglée introuvable : la carte l'explique et renvoie aux réglages", () => {
+  const app = lire("app.js");
+  ok(/a\.update_block === "pin_missing"/.test(app) && /pin_missing_t/.test(app));
+  langue("en");
+  ok(/Pinned version not found: v9/.test(ev(`t("pin_missing_t", {tag: "v9"})`)));
+});
+test("pied de page des apps : un seul délai, ou la fourchette quand les appareils diffèrent", () => {
+  langue("en");
+  ok(/Automatic renewal 60 h before expiry\./.test(ev(`t("apps_footer", {h: 60, m: 45})`)));
+  ok(/Automatic renewal 60 to 96 h before expiry/.test(ev(`t("apps_footer_range", {h: 60, hp: 96, m: 45})`)));
+  ok(/Math\.min\(\.\.\.delais\)/.test(lire("app.js")));
+});
+test("le registre du texte de l'interface est le tutoiement partout", () => {
+  for (const k of ["pair_none_host_hint"]) {
+    const fr = I18N[k][0];
+    ok(!/\bvous\b|\bvotre\b|\bvos\b/i.test(fr), `${k} : ${fr}`);
+  }
 });
 
 console.log(`${faits - echecs}/${faits} contrôles web réussis`);

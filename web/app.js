@@ -220,8 +220,22 @@ function noteMaj(a, now) {
       </div>
       ${m ? "" : `<button class="btn btn--petit" data-update="${a.id}" ${a.running ? "disabled" : ""}>${t("install_now")}</button>`}
     </div>`;
-  } else if (a.notes) {
-    html += `<details class="details" data-key="notes-${a.id}"><summary>${esc(t("release_notes_v", { v: a.version || a.source_tag || "" }))}</summary><pre class="log">${esc(a.notes)}</pre></details>`;
+  } else {
+    if (a.update_block === "pin_missing") {
+      // la version épinglée n'existe pas (ou plus) : l'app garde sa version et ne suit plus rien tant que l'épingle est là
+      const titre = t("pin_missing_t", { tag: a.pinned_tag || "" });
+      html += `<div class="probleme probleme--info" role="group" aria-label="${esc(titre)}">
+      <span class="probleme__ic">${ICONS.alerte}</span>
+      <div class="probleme__texte">
+        <p class="probleme__titre">${esc(titre)}</p>
+        <p>${esc(t("pin_missing"))}</p>
+      </div>
+      <button class="btn btn--petit" data-edit="${a.id}" data-key="edit-pin-${a.id}" aria-label="${esc(t("settings") + " " + a.name)}">${t("settings")}</button>
+    </div>`;
+    }
+    if (a.notes) {
+      html += `<details class="details" data-key="notes-${a.id}"><summary>${esc(t("release_notes_v", { v: a.version || a.source_tag || "" }))}</summary><pre class="log">${esc(a.notes)}</pre></details>`;
+    }
   }
   if (a.untracked_link) {
     html += `<p class="row__sub">${esc(t(a.auto_update === 0 ? "untracked_link_manual" : "untracked_link"))} <button class="lien lien--inline" data-update="${a.id}" ${a.running ? "disabled" : ""}>${t("check_now")}</button></p>`;
@@ -511,9 +525,14 @@ function renderApps(s, now) {
   const h = s.health;
   $("#renew-all").hidden = s.apps.filter((a) => a.enabled && a.device_id).length < 2;     // une seule app : « Renouveler » suffit
   const retry = h?.retry_minutes ?? 45;
+  // délai de renouvellement : celui de l'appareil de chaque app (un iPhone ou un iPad : plus tôt qu'une Apple TV)
+  const actives = s.apps.filter((a) => a.enabled), suivies = actives.length ? actives : s.apps;
+  const delais = suivies.map((a) => Math.round(fenetreRenouv(a, s)));
+  const court = delais.length ? Math.min(...delais) : Math.round(s.renew_before_hours), long = delais.length ? Math.max(...delais) : court;
+  const pied = court === long ? t("apps_footer", { h: court, m: retry }) : t("apps_footer_range", { h: court, hp: long, m: retry });
   setHTML($("#apps"), s.apps.length
     ? `<div class="apps">${s.apps.map((a) => carteApp(a, now, s)).join("")}</div>
-       <p class="group__footer">${esc(t("apps_footer", { h: Math.round(s.renew_before_hours), m: retry }))}</p>`
+       <p class="group__footer">${esc(pied)}</p>`
     : `<div class="vide"><p>${t("apps_empty")}</p><button class="btn btn--primary" data-open="dlg-app">${t("add_app")}</button></div>`);
 }
 
@@ -1636,7 +1655,7 @@ const fait = (txt) => `<p class="statut"><span class="etat etat--ok">${esc(txt)}
 // Avancement réel de la première installation, d'après l'état de l'app (et non « ajoutée » = « installée »).
 function blocPremiereApp(a) {
   const e = etatPremiereApp(a), now = maintenant();
-  if (e === "installed") return fait(t("wiz_app_installed", { name: a.name, date: fmtDate(a.expires_at) })) + `<p class="assistant__texte">${t("wiz_app_more")}</p>`;
+  if (e === "installed") return fait(t("wiz_app_installed", { name: a.name, device: a.device_name || t("device"), date: fmtDate(a.expires_at) })) + `<p class="assistant__texte">${t("wiz_app_more")}</p>`;
   if (e === "failed") {
     const c = enClair(a.last_error);
     return `<div class="probleme" role="alert"><span class="probleme__ic">${ICONS.alerte}</span>
@@ -1647,8 +1666,10 @@ function blocPremiereApp(a) {
   }
   const libelle = e === "running" ? etatApp(a, now, STATE)[1] : t("wiz_app_queued");
   return `<p class="statut"><span class="etat etat--cours">${esc(t("wiz_app_installing", { name: a.name }))} ${esc(libelle)}</span></p>
-    ${noteApp(a, now)}<p class="assistant__texte">${t("wiz_app_wait")}</p>`;
+    ${noteApp(a, now)}<p class="assistant__texte">${attenteInstallation(a.device_family)}</p>`;
 }
+// Première installation : un iPhone ou un iPad doit rester déverrouillé, une Apple TV seulement allumée.
+const attenteInstallation = (famille) => t(estMobile(famille) ? "wiz_app_wait_phone" : "wiz_app_wait");
 
 const WIZ_RENDU = {
   welcome: () => `${titreEtape("welcome_title", t("welcome_text"))}
@@ -1700,7 +1721,7 @@ const WIZ_RENDU = {
     const ok = devs.filter((d) => !d.legacy_pairing && !d.pairing_lost);
     const legacy = devs.filter((d) => d.legacy_pairing);
     return `${titreEtape("wiz_tv_title", t("wiz_tv_text"))}
-      <ol class="consigne">${t("pair_steps")}</ol>
+      <ol class="consigne">${t("pair_steps_wiz")}</ol>
       ${legacy.length ? `<div class="banner banner--info"><p><strong>${esc(tn("legacy_t", legacy.length, { names: legacy.map((d) => d.name).join(", ") }))}</strong>${t("legacy")}</p></div>` : ""}
       ${ok.map((d) => fait(t("wiz_tv_done", { name: d.name }))).join("")}
       <div class="actions-form">
@@ -1714,7 +1735,7 @@ const WIZ_RENDU = {
     // l'ajout est en cours (téléchargement, validation) : jamais le formulaire ni « ajoutée » avant d'en connaître l'issue
     if (WIZ.adding) return `${titreEtape("wiz_app_title", "")}
       <p class="statut"><span class="etat etat--cours">${t("wiz_app_downloading")}</span></p>
-      <p class="assistant__texte">${t("wiz_app_wait")}</p>`;
+      <p class="assistant__texte">${attenteInstallation(tvs[0]?.family)}</p>`;
     if (a) return `${titreEtape("wiz_app_title", "")}${blocPremiereApp(a)}`;
     const choix = WIZ.preset, canal = WIZ.canal || (PRESETS?.[0]?.default_channel === "beta" ? "beta" : "stable");
     // seuls les préréglages qui conviennent à l'appareil (Apple TV : apps tvOS ; iPhone / iPad : apps iPhone)
@@ -1746,11 +1767,19 @@ const WIZ_RENDU = {
     if (manque.length) return `${titreEtape("wiz_done_title_partial", t("wiz_done_text_partial"))}
       <ul class="points">${manque.map((m) => `<li>${ICONS.alerte}<span>${esc(m)}</span></li>`).join("")}</ul>`;
     const h = Math.round(STATE?.renew_before_hours || 60);
+    const premiere = installees[0];
+    // iPhone / iPad : l'app s'installe mais ne se lance qu'après deux réglages faits sur l'appareil
+    const ouverture = estMobile(premiere.device_family)
+      ? `<li>${ICONS.phone}<span>${esc(t("wiz_done_open_phone", { name: premiere.name, device: premiere.device_name || t("device") }))}</span></li>
+        <li>${ICONS.cle}<span><strong>${esc(t("phone_trust_t"))}.</strong> ${esc(t("phone_trust"))}</span></li>
+        <li>${ICONS.alerte}<span><strong>${esc(t("wiz_done_dev_t"))}.</strong> ${esc(t("wiz_done_dev"))}</span></li>`
+      : `<li>${ICONS.tv}<span>${esc(t("wiz_done_open", { name: premiere.name }))}</span></li>`;
     return `${titreEtape("wiz_done_title", t("wiz_done_text"))}
       <ul class="points">
-        <li>${ICONS.tv}<span>${esc(t("wiz_done_open", { name: installees[0].name }))}</span></li>
+        ${ouverture}
         <li>${ICONS.cloche}<span>${t("wiz_done_p1")}</span></li>
         <li>${ICONS.boucle}<span>${esc(conseilEdition("wiz_done_p2", AUTH?.edition).replace("{h}", h))}</span></li>
+        ${STATE?.update_check ? `<li>${ICONS.ok}<span>${t("wiz_done_p3")}</span></li>` : ""}
       </ul>`;
   },
 };
@@ -1879,6 +1908,10 @@ async function chargerReglages() {
   // des apps importées : sans leur .ipa dans la sauvegarde, elles sont à réimporter après une restauration
   const cb = $("#backup-uploads");
   cb.checked = (STATE?.apps || []).some((a) => a.source_type === "upload");
+  // les certificats importés sont une voie secondaire : l'option n'apparaît que s'il y en a un à sauvegarder
+  const avecCerts = (STATE?.certs || []).length > 0;
+  $("#backup-certs-row").hidden = !avecCerts;
+  if (!avecCerts) $("#backup-certs").checked = false;
   renderSecurite();
   if (typeof chargerNotifs === "function") chargerNotifs();
 }
