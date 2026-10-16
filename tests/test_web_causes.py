@@ -15,7 +15,7 @@ def _read(name: str) -> str:
 
 
 def _causes() -> list[tuple[str, str]]:
-    src = _read("app.js")
+    src = _read("errors.js")
     block = src[src.index("const CAUSES = ["):src.index("];", src.index("const CAUSES = ["))]
     return re.findall(r'^\s*\[(/.*/[a-z]*), "(c_\w+)"\],\s*$', block, re.M)
 

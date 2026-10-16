@@ -1,0 +1,542 @@
+"""Côté serveur de l'interface web : fiches à moitié ajoutées, présence sur l'Apple TV, version refusée,
+remplacement d'IPA, codes d'erreur stables, dépôt GitHub collé en URL, migrations.
+
+    python -m unittest discover -s tests
+"""
+import asyncio
+import os
+import sqlite3
+import time
+import unittest
+from unittest import mock
+
+from test_logic import HEADERS, make_ipa  # noqa: F401 - prépare l'environnement (dossier de données temporaire)
+
+from fastapi.testclient import TestClient  # noqa: E402
+
+from app import db, diag, ipa, main, proc, renew, settings  # noqa: E402
+
+
+class Client(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ctx = TestClient(main.app)
+        cls.client = cls.ctx.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.ctx.__exit__(None, None, None)
+
+    def add_upload(self, content, name="a.ipa"):
+        return self.client.post("/api/apps", headers=HEADERS, data={"source_type": "upload"},
+                                files={"file": (name, content, "application/octet-stream")})
+
+    def listed(self):
+        return {a["id"]: a for a in self.client.get("/api/state").json()["apps"]}
+
+
+class HalfAddedApps(Client):
+    def test_row_is_hidden_while_the_ipa_is_downloaded_and_removed_on_failure(self):
+        seen = {}
+
+        async def fake_refresh(app):
+            seen["listed"] = app["id"] in {a["id"] for a in main.state()["apps"]}
+            seen["row"] = db.row("SELECT enabled, status FROM apps WHERE id = ?", app["id"])
+            raise RuntimeError("aucune IPA trouvée dans les releases")
+
+        with mock.patch.object(renew, "refresh_source", fake_refresh):
+            r = self.client.post("/api/apps", headers=HEADERS, data={"source_type": "github", "source": "owner/project"})
+        self.assertEqual(r.status_code, 400)
+        self.assertFalse(seen["listed"])
+        self.assertEqual((seen["row"]["enabled"], seen["row"]["status"]), (0, "adding"))
+        self.assertEqual(db.rows("SELECT id FROM apps WHERE source = 'owner/project'"), [])
+
+    def test_row_appears_complete_after_the_add(self):
+        async def fake_refresh(app):
+            dest = renew.app_dir(app["id"]) / "original.ipa"
+            dest.write_bytes(make_ipa(bundle="com.example.hidden"))
+            return True
+
+        with mock.patch.object(renew, "refresh_source", fake_refresh), mock.patch.object(renew, "spawn", lambda *a: True):
+            r = self.client.post("/api/apps", headers=HEADERS, data={"source_type": "github", "source": "owner/shown"})
+        self.assertEqual(r.status_code, 200, r.text)
+        a = self.listed()[r.json()["id"]]
+        self.assertEqual((a["enabled"], a["status"], a["bundle_id"]), (1, "pending", "com.example.hidden"))
+        self.client.delete(f"/api/apps/{a['id']}", headers=HEADERS)
+
+    def test_rows_left_by_an_interrupted_add_are_purged_at_startup(self):
+        app_id = db.execute("INSERT INTO apps (name, source_type, created_at, enabled, status) "
+                            "VALUES ('x', 'github', ?, 0, 'adding')", time.time())
+        self.assertNotIn(app_id, self.listed())
+        main._purge_half_added()
+        self.assertIsNone(db.row("SELECT id FROM apps WHERE id = ?", app_id))
+
+    def test_paused_app_without_bundle_is_not_hidden(self):
+        # une app mise en pause reste visible, même si son identifiant d'app a été effacé (version acceptée)
+        app_id = db.execute("INSERT INTO apps (name, source_type, created_at, enabled, status) "
+                            "VALUES ('pausée', 'github', ?, 0, 'ok')", time.time())
+        try:
+            self.assertIn(app_id, self.listed())
+        finally:
+            db.execute("DELETE FROM apps WHERE id = ?", app_id)
+
+
+class GithubSource(Client):
+    def test_normalize_repo(self):
+        for pasted, want in [
+            ("owner/project", "owner/project"),
+            ("https://github.com/owner/project", "owner/project"),
+            ("https://www.github.com/owner/project/", "owner/project"),
+            ("https://github.com/owner/project.git", "owner/project"),
+            ("https://github.com/owner/project/releases/tag/v1", "owner/project"),
+            ("http://github.com/owner/my.repo?tab=x", "owner/my.repo"),
+            ("git@github.com:owner/project.git", "owner/project"),
+            ("  owner/project.git  ", "owner/project"),
+            ("owner/project/", "owner/project"),
+        ]:
+            self.assertEqual(ipa.normalize_repo(pasted), want, pasted)
+        self.assertIsNone(ipa.normalize_repo(None))
+
+    def test_pasted_url_is_accepted_and_stored_as_owner_project(self):
+        self.assertEqual(asyncio.run(main._check_source("github", "https://github.com/o/p.git")), "o/p")
+        with self.assertRaises(main.HTTPException):
+            asyncio.run(main._check_source("github", "pas un dépôt"))
+
+
+class TvPresence(Client):
+    def setUp(self):
+        self.dev = db.execute("INSERT INTO devices (name, pair_identifier, created_at) VALUES ('Salon', ?, ?)",
+                              f"pid-{time.time()}", time.time())
+        self.app_id = db.execute(
+            "INSERT INTO apps (name, bundle_id, source_type, device_id, created_at, enabled, status, signed_at, expires_at) "
+            "VALUES ('Gate', 'com.example.gate', 'upload', ?, ?, 1, 'ok', ?, ?)",
+            self.dev, time.time(), time.time() - 3600, time.time() + 86400)
+
+    def tearDown(self):
+        db.execute("DELETE FROM apps WHERE id = ?", self.app_id)
+        db.execute("DELETE FROM devices WHERE id = ?", self.dev)
+
+    def verify(self, installed):
+        async def fake(device, bundle_id=None, **kw):
+            return installed
+
+        with mock.patch.object(main.devices, "installed_apps", fake):
+            return self.client.post(f"/api/devices/{self.dev}/verify", headers=HEADERS)
+
+    def test_installed_under_the_team_suffixed_identifier(self):
+        r = self.verify([{"bundle_id": "com.example.gate.ABCDE12345"}, {"bundle_id": "com.other"}])
+        self.assertEqual(r.json()["apps"], [{"app_id": self.app_id, "present": True}])
+        a = self.listed()[self.app_id]
+        self.assertIs(a["tv_present"], True)
+        self.assertTrue(a["tv_checked_at"])
+
+    def test_absent_from_the_tv(self):
+        r = self.verify([{"bundle_id": "com.example.gateway"}, {"bundle_id": "com.example.gate.extra"}, {"name": "sans identifiant"}])
+        self.assertEqual(r.json()["apps"], [{"app_id": self.app_id, "present": False}])
+        self.assertIs(self.listed()[self.app_id]["tv_present"], False)
+
+    def test_empty_listing_is_not_trusted(self):
+        # journal parasite ou TV à peine réveillée : aucune app listée ne veut pas dire « absente »
+        r = self.verify([])
+        self.assertEqual((r.status_code, r.json()["detail"]), (502, "tv_listing_empty"))
+        r = self.verify([{"name": "sans identifiant"}])
+        self.assertEqual(r.status_code, 502)
+        a = self.listed()[self.app_id]
+        self.assertIsNone(a["tv_present"])
+        self.assertIsNone(a["tv_checked_at"])
+
+    def test_check_is_stale_once_the_app_was_installed_again(self):
+        self.verify([{"bundle_id": "com.other"}])
+        self.assertIs(self.listed()[self.app_id]["tv_present"], False)
+        db.update("apps", self.app_id, signed_at=time.time() + 5)     # réinstallée depuis : le résultat ne vaut plus
+        a = self.listed()[self.app_id]
+        self.assertIsNone(a["tv_present"])
+        self.assertIsNone(a["tv_checked_at"])
+
+    def test_running_app_is_not_judged(self):
+        renew._RUNNING.add(self.app_id)
+        try:
+            self.assertEqual(self.verify([{"bundle_id": "com.other"}]).json()["apps"], [])
+        finally:
+            renew._RUNNING.discard(self.app_id)
+
+    def test_tv_unreachable_is_a_502_and_changes_nothing(self):
+        async def boom(device, bundle_id=None, **kw):
+            raise RuntimeError("TV injoignable")
+
+        with mock.patch.object(main.devices, "installed_apps", boom):
+            r = self.client.post(f"/api/devices/{self.dev}/verify", headers=HEADERS)
+        self.assertEqual(r.status_code, 502)
+        self.assertIsNone(self.listed()[self.app_id]["tv_present"])
+
+    def test_changing_the_destination_forgets_the_check(self):
+        self.verify([{"bundle_id": "com.other"}])
+        other = db.execute("INSERT INTO devices (name, pair_identifier, created_at) VALUES ('Chambre', ?, ?)",
+                           f"pid2-{time.time()}", time.time())
+        try:
+            with mock.patch.object(renew, "rerun", lambda *a: None):
+                self.client.patch(f"/api/apps/{self.app_id}", headers=HEADERS, json={"device_id": other})
+            self.assertIsNone(self.listed()[self.app_id]["tv_present"])
+        finally:
+            db.update("apps", self.app_id, device_id=self.dev)
+            db.execute("DELETE FROM devices WHERE id = ?", other)
+
+    def test_unknown_device(self):
+        r = self.client.post("/api/devices/999999/verify", headers=HEADERS)
+        self.assertEqual((r.status_code, r.json()["detail"]), (404, "unknown_device"))
+
+
+class RefusedVersion(Client):
+    def setUp(self):
+        self.app_id = db.execute(
+            "INSERT INTO apps (name, bundle_id, source_type, source, source_tag, created_at, enabled, status, bad_tag, bad_key, bad_reason) "
+            "VALUES ('Gate', 'com.example.gate', 'github', 'o/p', 'v1', ?, 1, 'ok', 'v2', 'k2', 'identifiant d''app changé (a vers b)')",
+            time.time())
+        self.spawned = []
+        self.patch = mock.patch.object(renew, "spawn", lambda app_id, trigger="manuel": self.spawned.append((app_id, trigger)) or True)
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        db.execute("DELETE FROM apps WHERE id = ?", self.app_id)
+
+    def test_reason_is_exposed_to_the_ui(self):
+        a = self.listed()[self.app_id]
+        self.assertEqual((a["bad_tag"], a["bad_reason"]), ("v2", "identifiant d'app changé (a vers b)"))
+
+    def test_retry_clears_the_refusal_and_looks_for_the_version_again(self):
+        r = self.client.post(f"/api/apps/{self.app_id}/retry-version", headers=HEADERS)
+        self.assertEqual(r.json(), {"ok": True, "started": True})
+        a = db.row("SELECT * FROM apps WHERE id = ?", self.app_id)
+        self.assertEqual((a["bad_tag"], a["bad_key"], a["bad_reason"], a["bundle_id"]), (None, None, None, "com.example.gate"))
+        self.assertEqual(self.spawned, [(self.app_id, "nouvelle version")])
+
+    def test_retry_of_an_app_in_error_is_a_normal_renewal(self):
+        db.update("apps", self.app_id, status="error")
+        self.client.post(f"/api/apps/{self.app_id}/retry-version", headers=HEADERS)
+        self.assertEqual(self.spawned, [(self.app_id, "manuel")])
+
+    def test_accepting_a_new_identifier_lifts_the_guard(self):
+        self.client.post(f"/api/apps/{self.app_id}/accept-version", headers=HEADERS)
+        a = db.row("SELECT * FROM apps WHERE id = ?", self.app_id)
+        self.assertEqual((a["bundle_id"], a["bad_tag"], a["bad_reason"]), (None, None, None))
+        self.assertEqual(self.spawned, [(self.app_id, "nouvelle version")])
+        self.assertIn(self.app_id, self.listed())             # toujours visible
+
+    def test_accepting_needs_a_refused_version(self):
+        db.update("apps", self.app_id, bad_tag=None, bad_key=None, bad_reason=None)      # app saine : appel parasite
+        r = self.client.post(f"/api/apps/{self.app_id}/accept-version", headers=HEADERS)
+        self.assertEqual((r.status_code, r.json()["detail"]), (409, "nothing_to_accept"))
+        self.assertEqual(db.row("SELECT bundle_id FROM apps WHERE id = ?", self.app_id)["bundle_id"], "com.example.gate")
+        self.assertEqual(self.spawned, [])
+
+    def test_accepting_is_refused_for_an_imported_app(self):
+        db.update("apps", self.app_id, source_type="upload")
+        r = self.client.post(f"/api/apps/{self.app_id}/accept-version", headers=HEADERS)
+        self.assertEqual((r.status_code, r.json()["detail"]), (409, "nothing_to_accept"))
+        self.assertEqual(db.row("SELECT bundle_id FROM apps WHERE id = ?", self.app_id)["bundle_id"], "com.example.gate")
+
+    def test_changing_the_source_forgets_the_refusal(self):
+        self.client.patch(f"/api/apps/{self.app_id}", headers=HEADERS, json={"source": "https://github.com/o/fork"})
+        a = db.row("SELECT * FROM apps WHERE id = ?", self.app_id)
+        self.assertEqual((a["source"], a["bad_tag"], a["bad_reason"]), ("o/fork", None, None))
+
+    def test_unknown_app(self):
+        self.assertEqual(self.client.post("/api/apps/999999/retry-version", headers=HEADERS).status_code, 404)
+        self.assertEqual(self.client.post("/api/apps/999999/accept-version", headers=HEADERS).status_code, 404)
+
+    def test_refresh_source_stores_the_reason(self):
+        async def run():
+            app = db.row("SELECT * FROM apps WHERE id = ?", self.app_id)
+            db.update("apps", self.app_id, bad_tag=None, bad_key=None, bad_reason=None, source_key="k1")
+            (renew.app_dir(self.app_id) / "original.ipa").write_bytes(make_ipa())
+            app = db.row("SELECT * FROM apps WHERE id = ?", self.app_id)
+            found = {"tag": "v2", "url": "https://example.org/a.ipa", "sha256": None, "key": "k2"}
+
+            def refuse(*a, **k):
+                raise renew.ipa.SourceRejected("identifiant d'app changé (a vers b)")
+
+            with mock.patch.object(renew, "_latest", lambda app: found), mock.patch.object(renew.ipa, "download", refuse), \
+                    mock.patch.object(renew, "notify", mock.AsyncMock()):
+                return await renew.refresh_source(app)
+
+        self.assertFalse(asyncio.run(run()))
+        a = db.row("SELECT bad_tag, bad_reason FROM apps WHERE id = ?", self.app_id)
+        self.assertEqual((a["bad_tag"], a["bad_reason"]), ("v2", "identifiant d'app changé (a vers b)"))
+
+
+class RenewAll(Client):
+    def test_renews_one_after_the_other_the_active_apps_that_have_a_tv(self):
+        ids = self.with_apps([("a", 1, True), ("b", 1, True), ("pausée", 0, True), ("sans tv", 1, False)])
+        self.addCleanup(main._RENEW_ALL_PENDING.clear)
+        order, spawned = [], []
+
+        async def fake_renew(app_id, trigger="manuel"):
+            order.append((app_id, trigger))
+
+        def fake_spawn(coro):
+            spawned.append(coro)
+            return coro
+
+        with mock.patch.object(renew, "renew", fake_renew), mock.patch.object(proc, "spawn", fake_spawn),                 mock.patch.object(renew, "STOPPING", False):
+            r = self.client.post("/api/apps/renew-all", headers=HEADERS)
+            self.assertEqual(r.json(), {"ok": True, "started": 2})
+            asyncio.run(spawned[0])
+        self.assertEqual(order, [(ids[0], "manuel"), (ids[1], "manuel")])
+
+    def with_apps(self, rows):
+        """Base vidée de ses apps, puis les fiches données ; remet tout en place à la fin."""
+        saved = db.rows("SELECT * FROM apps")
+        db.execute("DELETE FROM apps")
+        dev = db.execute("INSERT INTO devices (name, pair_identifier, created_at) VALUES ('TV', ?, ?)", f"q-{time.time()}", time.time())
+        ids = [db.execute("INSERT INTO apps (name, source_type, device_id, created_at, enabled, status) VALUES (?, 'upload', ?, ?, ?, 'ok')",
+                          n, dev if tv else None, time.time(), e) for n, e, tv in rows]
+
+        def restore():
+            db.execute("DELETE FROM apps")
+            for a in saved:
+                db.execute(f"INSERT INTO apps ({', '.join(a)}) VALUES ({', '.join('?' * len(a))})", *a.values())
+            db.execute("DELETE FROM devices WHERE id = ?", dev)
+
+        self.addCleanup(restore)
+        return ids
+
+    def test_nothing_to_renew(self):
+        self.with_apps([("pausée", 0, True), ("sans tv", 1, False)])
+        spawn = mock.Mock()
+        with mock.patch.object(proc, "spawn", spawn):
+            self.assertEqual(self.client.post("/api/apps/renew-all", headers=HEADERS).json(), {"ok": True, "started": 0})
+        spawn.assert_not_called()
+        self.assertFalse(main._RENEW_ALL_PENDING)
+
+    def test_an_app_already_renewing_is_left_out(self):
+        a, b = self.with_apps([("a", 1, True), ("b", 1, True)])
+        spawned = []
+        renew._RUNNING.add(a)
+        try:
+            with mock.patch.object(proc, "spawn", lambda coro: spawned.append(coro) or coro.close()):
+                self.assertEqual(self.client.post("/api/apps/renew-all", headers=HEADERS).json()["started"], 1)
+        finally:
+            renew._RUNNING.discard(a)
+            main._RENEW_ALL_PENDING.clear()
+        self.assertEqual(len(spawned), 1)
+
+    def test_a_restore_waits_for_the_queue_and_deleted_apps_are_skipped(self):
+        a, b = self.with_apps([("a", 1, True), ("b", 1, True)])
+        order, spawned = [], []
+
+        async def fake_renew(app_id, trigger="manuel"):
+            order.append(app_id)
+            db.execute("DELETE FROM apps WHERE id = ?", b)         # supprimée pendant la file
+
+        with mock.patch.object(renew, "renew", fake_renew), mock.patch.object(proc, "spawn", lambda coro: spawned.append(coro) or coro), \
+                mock.patch.object(renew, "STOPPING", False):
+            self.client.post("/api/apps/renew-all", headers=HEADERS)
+            # file non vide, même si rien ne tourne à cet instant : la restauration attend
+            r = self.client.post("/api/backup/import", headers=HEADERS, files={"file": ("b.zip", b"x", "application/zip")})
+            self.assertEqual((r.status_code, r.json()["detail"]), (409, "busy"))
+            asyncio.run(spawned[0])
+        self.assertEqual(order, [a])
+        self.assertFalse(main._RENEW_ALL_PENDING)
+
+
+class ReplaceIpa(Client):
+    def test_replace_keeps_the_app_and_installs_the_new_build(self):
+        r = self.add_upload(make_ipa(bundle="com.example.rep"))
+        app_id = r.json()["id"]
+        folder = renew.app_dir(app_id)
+        (folder / "signed.ipa").write_bytes(b"old signature")
+        spawned = []
+        try:
+            with mock.patch.object(renew, "spawn", lambda i, t="manuel": spawned.append((i, t)) or True):
+                new = self.client.post(f"/api/apps/{app_id}/ipa", headers=HEADERS,
+                                       files={"file": ("b.ipa", make_ipa(bundle="com.example.rep"), "application/octet-stream")})
+            self.assertEqual(new.status_code, 200, new.text)
+            self.assertFalse((folder / "signed.ipa").exists())
+            self.assertEqual(spawned, [(app_id, "nouvelle IPA")])
+            self.assertEqual(db.row("SELECT id FROM apps WHERE id = ?", app_id)["id"], app_id)
+        finally:
+            self.client.delete(f"/api/apps/{app_id}", headers=HEADERS)
+
+    def test_other_identifier_other_platform_other_kind(self):
+        app_id = self.add_upload(make_ipa(bundle="com.example.rep2")).json()["id"]
+        try:
+            post = lambda content: self.client.post(f"/api/apps/{app_id}/ipa", headers=HEADERS,   # noqa: E731
+                                                    files={"file": ("b.ipa", content, "application/octet-stream")})
+            self.assertEqual((post(make_ipa(bundle="com.example.autre")).status_code, post(make_ipa(bundle="com.example.autre")).json()["detail"]),
+                             (400, "bundle_mismatch:com.example.rep2"))
+            self.assertEqual(post(b"pas une ipa").json()["detail"], "not_an_ipa")
+            self.assertEqual(post(make_ipa("iphoneos", "com.example.rep2")).json()["detail"], "not_tvos:iphoneos")
+            db.update("apps", app_id, source_type="github")
+            self.assertEqual(post(make_ipa(bundle="com.example.rep2")).json()["detail"], "not_an_upload")
+        finally:
+            self.client.delete(f"/api/apps/{app_id}", headers=HEADERS)
+
+    def test_malformed_info_plist_is_not_an_ipa(self):
+        import io
+        import zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("Payload/Test.app/Info.plist", b"<plist><dict><key>CFBundleName</key>")      # XML tronqué
+        app_id = self.add_upload(make_ipa(bundle="com.example.rep3")).json()["id"]
+        try:
+            r = self.client.post(f"/api/apps/{app_id}/ipa", headers=HEADERS,
+                                 files={"file": ("b.ipa", buf.getvalue(), "application/octet-stream")})
+            self.assertEqual((r.status_code, r.json()["detail"]), (400, "not_an_ipa"))
+        finally:
+            self.client.delete(f"/api/apps/{app_id}", headers=HEADERS)
+
+    def test_renewal_started_during_the_upload_blocks_the_swap(self):
+        app_id = self.add_upload(make_ipa(bundle="com.example.rep4")).json()["id"]
+        original = (renew.app_dir(app_id) / "original.ipa").read_bytes()
+        real = main.ipa.app_info
+
+        def info_then_renewal_starts(path):
+            out = real(path)
+            renew._RUNNING.add(app_id)          # un renouvellement démarre pendant l'envoi
+            return out
+
+        try:
+            with mock.patch.object(main.ipa, "app_info", info_then_renewal_starts):
+                r = self.client.post(f"/api/apps/{app_id}/ipa", headers=HEADERS,
+                                     files={"file": ("b.ipa", make_ipa(bundle="com.example.rep4"), "application/octet-stream")})
+            self.assertEqual((r.status_code, r.json()["detail"]), (409, "app_busy"))
+            self.assertEqual((renew.app_dir(app_id) / "original.ipa").read_bytes(), original)
+        finally:
+            renew._RUNNING.discard(app_id)
+            self.client.delete(f"/api/apps/{app_id}", headers=HEADERS)
+
+    def test_upload_limit_applies_to_the_replacement_route(self):
+        self.assertTrue(main.UPLOAD_ROUTES.fullmatch("/api/apps/12/ipa"))
+        self.assertFalse(main.UPLOAD_ROUTES.fullmatch("/api/apps/12/renew"))
+
+
+class StableErrorCodes(Client):
+    def test_settings_errors_are_codes_per_field(self):
+        r = self.client.patch("/api/settings", headers=HEADERS, json={"renew_before_hours": 5, "ntfy_url": "ftp://x", "language": "de", "nope": 1})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.json()["detail"], {"renew_before_hours": "range:12:150", "ntfy_url": "url_expected",
+                                              "language": "language_expected", "nope": "unknown_setting"})
+        r = self.client.patch("/api/settings", headers=HEADERS, json={"renew_before_hours": "abc"})
+        self.assertEqual(r.json()["detail"], {"renew_before_hours": "number_expected"})
+
+    def test_setting_set_by_the_environment(self):
+        with mock.patch.dict(os.environ, {"TVSIGN_NTFY_URL": "https://ntfy.example.org/t"}):
+            r = self.client.patch("/api/settings", headers=HEADERS, json={"ntfy_url": "https://ntfy.sh/x"})
+        self.assertEqual(r.json()["detail"], {"ntfy_url": "set_by_env:TVSIGN_NTFY_URL"})
+
+    def test_notification_test(self):
+        post = lambda body: self.client.post("/api/settings/test-notification", headers=HEADERS, json=body)   # noqa: E731
+        self.assertEqual(post({"url": "ftp://x"}).json()["detail"], "url_expected")
+        with mock.patch.object(settings, "ntfy_url", lambda: ""):
+            self.assertEqual(post({}).json()["detail"], "url_expected")
+
+    def test_session_and_input(self):
+        self.assertEqual(self.client.get("/api/sessions/inconnue").json()["detail"], "session_expired")
+        self.assertEqual(self.client.post("/api/sessions/inconnue/answer", headers=HEADERS, json={"value": "1"}).json()["detail"], "session_expired")
+
+    def test_no_input_expected(self):
+        s = proc.Session.__new__(proc.Session)
+        s.id, s.state = "t1", "running"
+        proc.SESSIONS["t1"] = s
+        try:
+            r = self.client.post("/api/sessions/t1/answer", headers=HEADERS, json={"value": "1"})
+            self.assertEqual((r.status_code, r.json()["detail"]), (409, "no_input_expected"))
+        finally:
+            proc.SESSIONS.pop("t1", None)
+
+    def test_pairing_address_and_restore_busy(self):
+        r = self.client.post("/api/devices/pair", headers=HEADERS, json={"ip": "pas une ip!", "port": 1234, "name": "x"})
+        self.assertEqual(r.json()["detail"], "invalid_address")
+        renew._RUNNING.add(424242)
+        try:
+            r = self.client.post("/api/backup/import", headers=HEADERS, files={"file": ("b.zip", b"x", "application/zip")})
+            self.assertEqual((r.status_code, r.json()["detail"]), (409, "busy"))
+        finally:
+            renew._RUNNING.discard(424242)
+
+    def drop_pre_restore_copies(self):
+        # une restauration met l'ancien état de côté, nommé à la seconde : deux restaurations de suite se heurteraient
+        import shutil
+        from app.config import DATA_DIR
+        for d in DATA_DIR.glob("*.pre-restore-*"):
+            shutil.rmtree(d, ignore_errors=True) if d.is_dir() else d.unlink(missing_ok=True)
+
+    def test_restore_drops_half_added_apps(self):
+        from app import backup
+        self.addCleanup(self.drop_pre_restore_copies)
+        half = db.execute("INSERT INTO apps (name, source_type, created_at, enabled, status) VALUES ('moitié', 'upload', ?, 0, 'adding')",
+                          time.time())
+        folder = renew.app_dir(half)
+        (folder / "original.ipa").write_bytes(make_ipa())
+        archive = backup.export(True)
+        try:
+            with mock.patch.object(main.devices, "sync_store", mock.AsyncMock()), mock.patch.object(renew, "startup", lambda: None):
+                r = self.client.post("/api/backup/import", headers=HEADERS,
+                                     files={"file": ("b.zip", archive.read_bytes(), "application/zip")})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(db.rows("SELECT id FROM apps WHERE status IN ('adding', 'error') AND name = 'moitié'"), [])
+            self.assertNotIn("moitié", r.json()["missing_uploads"])
+            self.assertFalse(folder.exists())
+        finally:
+            archive.unlink(missing_ok=True)
+
+    def test_restore_does_not_flag_an_adding_upload_as_missing(self):
+        from app import backup
+        self.addCleanup(self.drop_pre_restore_copies)
+        half = db.execute("INSERT INTO apps (name, source_type, created_at, enabled, status) VALUES ('moitié2', 'upload', ?, 0, 'adding')",
+                          time.time())
+        archive = backup.export(False)          # sans les IPA : l'envoi n'y est pas
+        try:
+            counts = backup.restore(archive)
+            self.assertNotIn("moitié2", counts["missing_uploads"])
+            self.assertEqual(db.row("SELECT status FROM apps WHERE id = ?", half)["status"], "adding")
+        finally:
+            archive.unlink(missing_ok=True)
+            db.execute("DELETE FROM apps WHERE id = ?", half)
+
+    def test_no_french_literal_left_in_error_details(self):
+        import re
+        src = (main.ROOT / "app" / "main.py").read_text(encoding="utf-8")
+        for m in re.finditer(r'HTTPException\(\d+,\s*(f?"[^"]*")', src):
+            self.assertRegex(m.group(1), r'^f?"[a-z_]+(:\{[^}]*\})?"$', m.group(1))
+
+
+class EditionAndDiagnostics(Client):
+    def test_edition_in_auth_status(self):
+        self.assertEqual(self.client.get("/api/auth/status").json()["edition"], "windows" if os.name == "nt" else "docker")
+
+    def test_diagnostic_codes(self):
+        self.assertEqual(diag._disk()["code"], "free")
+        self.assertIn("code", diag._check("x", "ok"))
+        self.assertEqual(asyncio.run(diag._plumesign())["code"], "missing")      # plumesign absent des tests
+
+
+class Migrations(unittest.TestCase):
+    def test_new_columns_are_added_to_an_existing_database(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.row_factory = sqlite3.Row
+        # base de la 1.0.0 : aucune des colonnes ajoutées après coup
+        conn.executescript(db.SCHEMA)
+        before = {(t, c) for t, c, _ in db._pending(conn)}
+        for col in ("bad_reason", "on_tv", "on_tv_checked_at"):
+            self.assertIn(("apps", col), before)
+        for table, col, kind in db._pending(conn):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {kind}")
+        self.assertEqual(db._pending(conn), [])
+        conn.execute("INSERT INTO apps (name, source_type, created_at) VALUES ('ancienne', 'upload', 1)")
+        row = conn.execute("SELECT status, bad_reason, on_tv FROM apps").fetchone()
+        self.assertEqual((row["status"], row["bad_reason"], row["on_tv"]), ("pending", None, None))     # l'existant reste valide
+
+    def test_existing_rows_stay_visible(self):
+        db.init()
+        app_id = db.execute("INSERT INTO apps (name, source_type, created_at, enabled, status) VALUES ('ancienne', 'upload', ?, 1, 'pending')", time.time())
+        try:
+            self.assertIn(app_id, {a["id"] for a in main.state()["apps"]})
+        finally:
+            db.execute("DELETE FROM apps WHERE id = ?", app_id)
+
+
+if __name__ == "__main__":
+    unittest.main()

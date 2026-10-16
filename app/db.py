@@ -137,6 +137,9 @@ MIGRATIONS = [
     ("apps", "verified_at", "REAL"),         # dernière fois où l'app a été vue installée sur l'Apple TV
     ("apps", "installed_bundle", "TEXT"),    # bundle ID installé (celui de la signature, pas de l'IPA d'origine)
     ("devices", "host_hint", "TEXT"),        # adresse IP ou nom d'hôte saisi à la main (mDNS bloqué)
+    ("apps", "bad_reason", "TEXT"),          # pourquoi cette release est refusée (affiché sur la carte)
+    ("apps", "on_tv", "INTEGER"),            # app trouvée (1) ou non (0) sur l'Apple TV à la dernière vérification
+    ("apps", "on_tv_checked_at", "REAL"),    # date de cette vérification
 ]
 
 

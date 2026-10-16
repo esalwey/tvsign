@@ -949,9 +949,9 @@ class LoginSession(unittest.TestCase):
 
 
 def web_causes() -> list[tuple]:
-    """Les règles CAUSES de web/app.js (expression, clé), lues dans le fichier : les expressions simples de
+    """Les règles CAUSES de web/errors.js (expression, clé), lues dans le fichier : les expressions simples de
     JavaScript sont aussi des expressions régulières de Python."""
-    js = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+    js = (ROOT / "web" / "errors.js").read_text(encoding="utf-8")
     start = js.index("const CAUSES = [")
     block = js[start:js.index("\n];", start)]
     rules = []

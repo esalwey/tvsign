@@ -118,6 +118,12 @@ bridge of the TV's LAN, not a NATed network. Unprivileged LXC is fine: no TUN de
    (on the TV: Settings › Remotes and Devices › Remote App and Devices, then type the PIN), and the
    app to keep installed.
 
+The wizard says "all set" only once the first install has actually succeeded; until then it shows
+the live state of the install (and the reason if it failed). Signing **revokes the certificate
+another tool (AltStore, Sideloadly, Xcode) created with the same Apple ID**, which makes that
+tool's apps stop launching: use an Apple ID dedicated to tvsign. The machine running tvsign must
+stay awake and on the network (a PC or NAS that sleeps renews nothing); only the Apple TV may sleep.
+
 The Diagnostics page re-runs the environment checks at any time.
 
 ### Several Apple TVs
@@ -144,6 +150,25 @@ multicast, and whether the TV still answers directly.
 - The direct query is a plain unicast mDNS question to UDP 5353 on the TV; the tunnel itself is TCP to the
   ports the TV announces. Both must be allowed between tvsign and the TV. `TVSIGN_UNICAST_HINT=0`
   turns the direct query off.
+
+### Using the web UI
+
+- **App cards** show the state of each app. tvsign checks (read-only) that an app is still on the
+  Apple TV when you press **Test connection** (the periodic check, every `TVSIGN_INSTALL_CHECK_HOURS`,
+  also reinstalls an app that disappeared); an app seen missing shows "Not found on the TV" with a
+  **Reinstall** button. A refused update (changed app identifier, bad checksum) shows its reason with
+  **Retry this version** and, for a changed identifier, **Accept this change**.
+- **Renew all** (header, with two apps or more) renews the active apps one after the other.
+  An Apple TV can be renamed from its row. A GitHub repository can be pasted as a full address
+  (`https://github.com/owner/project`).
+- Errors are translated from stable codes (English and French). In English, the usual server log
+  lines are translated too; unknown ones stay as the server wrote them.
+- **Notifications**: Settings › Notifications explains ntfy and can generate a private topic. For
+  external monitoring (Uptime Kuma, Home Assistant…), `GET /api/health` answers 200 when all is
+  well and 503 otherwise, without signing in (details only with a session).
+- The UI warns when it is served over plain `http://` on the network: the Apple ID password and
+  codes then travel unencrypted. Use a VPN or an HTTPS reverse proxy (see Security). Added to a
+  phone's home screen, the page opens like an app (manifest and icon included).
 
 ### Backups
 
@@ -556,6 +581,13 @@ n'est nécessaire.
    enregistré), appairage de l'Apple TV (sur la TV : Réglages › Télécommandes et appareils › App
    Télécommande et appareils, puis saisir le code), et l'app à garder installée.
 
+L'assistant n'affiche « C'est prêt » qu'une fois la première installation réussie ; d'ici là il
+montre l'avancement réel (et la raison en cas d'échec). La signature **révoque le certificat créé par
+un autre outil (AltStore, Sideloadly, Xcode) avec le même Apple ID**, ce qui empêche les apps de cet
+outil de se lancer : prendre un Apple ID dédié à tvsign. La machine qui fait tourner tvsign doit
+rester allumée et connectée au réseau (un PC ou un NAS en veille ne renouvelle rien) ; seule
+l'Apple TV peut être en veille.
+
 La page Diagnostic relance les vérifications à tout moment.
 
 ### Plusieurs Apple TV
@@ -583,6 +615,27 @@ pont ou à un multicast bloqué, et si la TV répond encore en direct.
 - La requête directe est une simple question mDNS en unicast vers le port UDP 5353 de la TV ; le tunnel
   est en TCP vers les ports annoncés par la TV. Les deux doivent être autorisés entre tvsign et la TV.
   `TVSIGN_UNICAST_HINT=0` désactive la requête directe.
+
+### Utiliser l'interface web
+
+- Les **cartes d'app** montrent l'état de chaque app. tvsign vérifie (en lecture seule) qu'une app est
+  toujours sur l'Apple TV au **Test de connexion** (le contrôle périodique, toutes les `TVSIGN_INSTALL_CHECK_HOURS`,
+  réinstalle aussi une app disparue) ; une app vue absente affiche « Introuvable sur la TV » avec un bouton **Réinstaller**.
+  Une mise à jour refusée (identifiant d'app changé, empreinte
+  fausse) affiche sa raison avec **Réessayer cette version** et, pour un identifiant changé,
+  **Accepter ce changement**.
+- **Tout renouveler** (en-tête, à partir de deux apps) renouvelle les apps actives l'une après l'autre.
+  Une Apple TV se renomme depuis sa ligne. Un dépôt GitHub peut être collé en
+  adresse complète (`https://github.com/owner/projet`).
+- Les erreurs sont traduites à partir de codes stables (français et anglais). En anglais, les lignes
+  habituelles du journal du serveur sont traduites aussi ; les inconnues restent telles que le
+  serveur les a écrites.
+- **Notifications** : Réglages › Notifications explique ntfy et peut générer un sujet privé. Pour une
+  supervision externe (Uptime Kuma, Home Assistant…), `GET /api/health` répond 200 si tout va bien
+  et 503 sinon, sans connexion (le détail seulement avec une session).
+- L'interface avertit quand elle est servie en `http://` sur le réseau : le mot de passe de l'Apple ID
+  et les codes circulent alors en clair. Utiliser un VPN ou un reverse proxy HTTPS (voir Sécurité).
+  Ajoutée à l'écran d'accueil d'un téléphone, la page s'ouvre comme une app (manifeste et icône inclus).
 
 ### Sauvegardes
 

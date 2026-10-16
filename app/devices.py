@@ -459,6 +459,36 @@ def signed_bundle(app_dir: Path, app: dict) -> str | None:
     return app.get("installed_bundle")
 
 
+def is_on_tv(app: dict, apps: list[dict], app_dir: Path) -> bool:
+    """L'app figure dans la liste des apps de la TV : sous l'identifiant de sa dernière signature, ou, faute de
+    signature, sous celui de l'IPA (éventuellement suffixé de l'identifiant d'équipe Apple :
+    com.exemple.app.ABCDE12345)."""
+    signed = signed_bundle(app_dir, app)
+    if signed and _has_bundle(apps, signed):
+        return True
+    own = (app.get("bundle_id") or "").lower()
+    if not own:
+        return False
+    return any((x.get("bundle_id") or "").lower() == own
+               or (((x.get("bundle_id") or "").lower().startswith(own + "."))
+                   and re.fullmatch(r"[0-9a-z]{10}", (x.get("bundle_id") or "").lower()[len(own) + 1:]) is not None)
+               for x in apps)
+
+
+def record_presence(app: dict, apps: list[dict], app_dir: Path, now: float) -> bool:
+    """Contrôle à la demande (rien n'est signé ni installé) : note sur la fiche si l'app est sur la TV. Vue
+    présente, c'est la même constatation que celle d'après une installation (verified_at)."""
+    present = is_on_tv(app, apps, app_dir)
+    fields = dict(on_tv=int(present), on_tv_checked_at=now)
+    if present:
+        fields["verified_at"] = now
+        bundle = signed_bundle(app_dir, app)
+        if bundle:
+            fields["installed_bundle"] = bundle
+    db.update("apps", app["id"], **fields)
+    return present
+
+
 async def confirm_installed(device: dict, bundle_id: str | None) -> float | None:
     """Vérifie dans la liste des apps de la TV que l'app y est vraiment après l'installation.
     Renvoie l'heure de la vérification, None si elle n'a pas pu se faire (TV qui s'endort, plumesign
@@ -512,7 +542,8 @@ async def audit_installed(now: float | None = None) -> None:
             if not bundle:
                 continue
             if _has_bundle(apps, bundle):
-                db.update("apps", a["id"], verified_at=time.time(), installed_bundle=bundle)
+                db.update("apps", a["id"], verified_at=time.time(), installed_bundle=bundle,
+                          on_tv=1, on_tv_checked_at=time.time())
                 continue
             db.update("apps", a["id"], status="error", verified_at=None, next_attempt_at=None,
                       last_error=f"l'app n'est plus installée sur « {device['name']} » "

@@ -65,6 +65,9 @@ function champsNotif(type, cible) {
         ${cible && cible.locked && nom === "url" ? "readonly" : ""}></label>`).join("");
   $("#notif-aide").textContent = t("nh_" + type) + " " + t("nh_privacy")
     + (integree(cible) ? " " + t("nh_ntfy_builtin") : "");
+  // mode d'emploi de ntfy et sujet privé généré (le bouton remplit l'adresse)
+  $("#ntfy-etapes").hidden = type !== "ntfy";
+  $("#ntfy-sujet").textContent = "";
 }
 function evenementsNotif(actifs) {
   $("#notif-events").innerHTML = NOTIF_EVENTS.map((e) => `

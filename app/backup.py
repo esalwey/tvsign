@@ -269,7 +269,7 @@ def restore(archive: Path) -> dict:
                 # Apps importées dont l'IPA n'est pas dans la sauvegarde : inutilisables, on le dit tout de suite
                 # (sinon l'échec n'apparaît qu'à la fenêtre de renouvellement, des jours plus tard).
                 missing = []
-                for a in db.rows("SELECT id, name FROM apps WHERE source_type = 'upload'"):
+                for a in db.rows("SELECT id, name FROM apps WHERE source_type = 'upload' AND status != 'adding'"):
                     if not (IPA_DIR / str(a["id"]) / "original.ipa").exists():
                         missing.append(a["name"])
                         db.update("apps", a["id"], status="error", next_attempt_at=None,

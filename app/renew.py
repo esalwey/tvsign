@@ -220,7 +220,7 @@ async def _lift_os_block(app: dict) -> None:
             return
         have = _device_os(app)
     if not ipa.os_older(have, need):
-        fields = dict(bad_tag=None, bad_key=None, update_tag=None, update_notes=None, update_block=None)
+        fields = dict(bad_tag=None, bad_key=None, bad_reason=None, update_tag=None, update_notes=None, update_block=None)
         db.update("apps", app["id"], **fields)
         app.update(fields)
         db.log(f"{app['name']} : tvOS {have} sur l'Apple TV, la version refusée (tvOS {need} minimum) est de nouveau candidate",
@@ -357,7 +357,7 @@ async def refresh_source(app: dict, force: bool = False) -> bool:
         if tag and isinstance(e, ValueError) and not isinstance(e, json.JSONDecodeError) and key_known:
             # IPA invalide (pas une IPA, pas tvOS) : ne pas la retélécharger à chaque essai.
             # Le reste (coupure, réponse tronquée, JSON GitHub illisible) est passager : on réessaiera.
-            db.update("apps", app["id"], bad_tag=tag, bad_key=key)
+            db.update("apps", app["id"], bad_tag=tag, bad_key=key, bad_reason=str(e)[:500])
             db.log(f"{app['name']} : version {_link_label(app, tag)} inutilisable ({e}), version précédente conservée",
                    "warn", app_id=app["id"])
             await notify(notifier.text("update_refused", name=app["name"], tag=_link_label(app, tag), why=e),
@@ -369,7 +369,8 @@ async def refresh_source(app: dict, force: bool = False) -> bool:
     finally:
         hold.unlink(missing_ok=True)
     db.update("apps", app["id"], source_tag=tag, source_key=key, version=info["version"],
-              bundle_id=info["bundle_id"], bad_tag=None, bad_key=None, source_sha256=info.get("sha256"),
+              bundle_id=info["bundle_id"], bad_tag=None, bad_key=None, bad_reason=None,
+              source_sha256=info.get("sha256"),
               notes=notes or None, update_tag=None, update_notes=None, update_block=None)
     return True
 

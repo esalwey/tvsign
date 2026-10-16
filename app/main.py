@@ -27,6 +27,7 @@ from .util import replace_retry
 async def lifespan(_: FastAPI):
     db.init()
     settings.migrate()         # serveur anisette Android enregistré -> serveur par défaut
+    _purge_half_added()
     backup.prune_old()
     auth.init()
     renew.startup()            # un renouvellement interrompu ne reste pas « en cours »
@@ -55,6 +56,13 @@ async def lifespan(_: FastAPI):
         task.cancel()
     for s in SESSIONS.values():
         s.cancel()
+
+
+def _purge_half_added() -> None:
+    """Une app « en cours d'ajout » (téléchargement, validation) n'a de sens que pendant la requête :
+    après un arrêt en plein ajout, la fiche et son dossier sont retirés."""
+    for a in db.rows("SELECT id FROM apps WHERE status = 'adding'"):
+        _abort_add(a["id"])
 
 
 class UTF8JSON(JSONResponse):
@@ -186,6 +194,8 @@ def auth_status(request: Request):
         "authenticated": auth.authenticated(request),
         "onboarded": settings.raw_get("onboarded") == "1",
         "language": settings.get("language"),
+        # texte adapté à la machine : « windows » (application de bureau) ou « docker » (serveur, NAS)
+        "edition": "windows" if WINDOWS else "docker",
     }
 
 
@@ -332,12 +342,24 @@ def onboarding_complete():
 
 # ---------- état global ----------
 
+def tv_presence(a: dict) -> tuple[bool | None, float | None]:
+    """Résultat de la dernière vérification « l'app est-elle sur l'Apple TV ? ». Sans objet (None) si
+    elle n'a jamais eu lieu ou si l'app a été réinstallée depuis : le résultat serait périmé."""
+    at = a.get("on_tv_checked_at")
+    if a.get("on_tv") is None or not at:
+        return None, None
+    if a.get("signed_at") and at < a["signed_at"]:
+        return None, None
+    return bool(a["on_tv"]), at
+
+
 @app.api_route("/api/state", methods=["GET", "HEAD"])
 def state():
     now = time.time()
     before = settings.renew_before_hours()
+    # 'adding' : fiche créée pendant le téléchargement/la validation de l'IPA, pas encore une app
     apps = db.rows("SELECT a.*, d.name AS device_name FROM apps a LEFT JOIN devices d ON d.id = a.device_id "
-                   "ORDER BY a.name")
+                   "WHERE a.status != 'adding' ORDER BY a.name")
     default = plume.default_account()
     for a in apps:
         a["running"] = a["id"] in renew._RUNNING
@@ -352,6 +374,7 @@ def state():
         a["can_rollback"] = renew.has_previous(a["id"])             # IPA précédente gardée : « version précédente »
         a["update_pending"] = renew.pending_update(a)               # IPA téléchargée, pas encore installée
         a["untracked_link"] = a["source_type"] == "url" and bool(a["source_tag"]) and not a["source_key"]
+        a["tv_present"], a["tv_checked_at"] = tv_presence(a)
     health = renew.health(now)
     devices_ = db.rows("SELECT * FROM devices ORDER BY name")
     for d in devices_:
@@ -591,6 +614,29 @@ async def device_apps(device_id: int):
         raise HTTPException(502, str(e))
 
 
+@app.post("/api/devices/{device_id}/verify")
+async def device_verify(device_id: int):
+    """Les apps suivies sont-elles encore sur l'Apple TV ? (lecture seule : rien n'est signé ni installé)."""
+    device = device_or_404(device_id)
+    try:
+        listed = await devices.installed_apps(device, wait=False)
+    except devices.Busy:
+        raise HTTPException(409, "device_busy") from None
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, str(e))
+    listed = [x for x in listed if isinstance(x, dict) and x.get("bundle_id")]
+    if not listed:
+        # une liste vide n'est pas crédible (journal parasite, TV à peine réveillée) : on n'écrit rien
+        raise HTTPException(502, "tv_listing_empty")
+    now, out = time.time(), []
+    for a in db.rows("SELECT * FROM apps WHERE device_id = ? AND bundle_id IS NOT NULL AND status != 'adding'",
+                     device_id):
+        if a["id"] in renew._RUNNING:
+            continue        # installation en cours : l'absence ne dirait rien
+        out.append({"app_id": a["id"], "present": devices.record_presence(a, listed, renew.app_dir(a["id"]), now)})
+    return {"ok": True, "checked_at": now, "apps": out}
+
+
 class DevicePatch(BaseModel):
     name: Optional[str] = None
     host: Optional[str] = None      # adresse saisie à la main ; vide : la retirer
@@ -752,10 +798,11 @@ async def app_create(
             "AND COALESCE(device_id, 0) = ?", source_type, source, asset_name or "",
             (source_filter or "").strip(), account or "", device_id or 0):
         raise _already_added(device_id)      # avant tout téléchargement
-    # enabled = 0 tant que l'IPA n'est pas validée : la boucle de renouvellement ne voit pas l'app à moitié ajoutée
+    # enabled = 0 et status = 'adding' tant que l'IPA n'est pas validée : ni la boucle de renouvellement ni
+    # l'interface (/api/state) ne voient l'app à moitié ajoutée
     app_id = db.execute(
         "INSERT INTO apps (name, source_type, source, source_filter, channel, preset, asset_name, device_id, "
-        "account_email, created_at, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+        "account_email, created_at, enabled, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'adding')",
         file.filename if file else source, source_type, source,
         (source_filter or "").strip() or None, channel, preset, asset_name, device_id, account, time.time())
     try:
@@ -787,7 +834,7 @@ async def app_create(
             raise _already_added(device_id)
         sha = await asyncio.to_thread(renew._sha256_file, dest)   # identité du fichier : version installée / en attente
         db.update("apps", app_id, name=info["name"], bundle_id=info["bundle_id"], version=info["version"],
-                  enabled=1, source_sha256=sha)
+                  enabled=1, status="pending", source_sha256=sha)
     except HTTPException:
         _abort_add(app_id)
         raise
@@ -875,7 +922,7 @@ async def app_patch(app_id: int, body: AppPatch):
         fields["source_key"] = None
         fields["bad_tag"] = None
         fields["bad_key"] = None
-        fields.update(update_tag=None, update_notes=None, update_block=None, update_error=None)
+        fields.update(update_tag=None, update_notes=None, update_block=None, update_error=None, bad_reason=None)
         renew._release_ok(a)               # l'ancienne source n'est plus cherchée : son échec ne compte plus
         if "source" in fields and fields["source"] != a["source"]:
             # autre dépôt ou autre lien : la version épinglée (tag de l'ancien dépôt) et la version précédente
@@ -894,12 +941,13 @@ async def app_patch(app_id: int, body: AppPatch):
     if dest_changed:
         # autre appareil/compte : la signature déjà prête ne convient plus
         (renew.app_dir(app_id) / "signed.ipa").unlink(missing_ok=True)
+        fields["on_tv"] = fields["on_tv_checked_at"] = None     # la vérification visait l'ancienne TV
     if dest_changed or source_changed or fields.get("enabled") == 1:
         # l'utilisateur a agi : on repart de zéro (plus d'attente, ni d'action requise, ni de délai croissant)
         fields.update(renew.CLEAR_BLOCK)
     if pin_changed:
         fields.update(update_tag=None, update_notes=None, update_block=None, update_error=None,
-                      bad_tag=None, bad_key=None)
+                      bad_tag=None, bad_key=None, bad_reason=None)
     db.update("apps", app_id, **fields)
     if dest_changed:
         renew.rerun(app_id)    # un renouvellement en cours vise l'ancienne destination
@@ -997,6 +1045,58 @@ async def app_rollback(app_id: int):
     return {"ok": True, "started": renew.spawn(app_id, "retour arrière")}
 
 
+_RENEW_ALL_PENDING: set[int] = set()      # apps encore en file d'un « Tout renouveler » (une restauration doit attendre)
+
+
+async def _renew_all(ids: list[int]) -> None:
+    """Un à un : plumesign signe sous verrou, lancer tout d'un coup ne ferait qu'empiler des attentes."""
+    try:
+        for app_id in ids:
+            if renew.STOPPING:
+                break
+            try:
+                if db.row("SELECT id FROM apps WHERE id = ?", app_id):      # supprimée entre-temps : on passe
+                    await renew.renew(app_id, "manuel")
+            finally:
+                _RENEW_ALL_PENDING.discard(app_id)
+    finally:
+        _RENEW_ALL_PENDING.difference_update(ids)
+
+
+@app.post("/api/apps/renew-all")
+async def app_renew_all():
+    """Renouvelle maintenant toutes les apps actives qui ont une Apple TV, l'une après l'autre."""
+    ids = [a["id"] for a in db.rows("SELECT id FROM apps WHERE enabled = 1 AND device_id IS NOT NULL "
+                                    "AND status != 'adding' ORDER BY expires_at IS NULL, expires_at, id")
+           if a["id"] not in renew._RUNNING]
+    for app_id in ids:
+        renew.clear_block(app_id)
+    if ids:
+        _RENEW_ALL_PENDING.update(ids)
+        proc.spawn(_renew_all(ids))
+    return {"ok": True, "started": len(ids)}
+
+
+@app.post("/api/apps/{app_id}/retry-version")
+async def app_retry_version(app_id: int):
+    """Réessaie la version refusée (téléchargement raté jugé invalide, empreinte…) sans toucher à la source."""
+    a = app_or_404(app_id)
+    db.update("apps", app_id, bad_tag=None, bad_key=None, bad_reason=None, **renew.CLEAR_BLOCK)
+    return {"ok": True, "started": renew.spawn(app_id, "nouvelle version" if a["status"] == "ok" else "manuel")}
+
+
+@app.post("/api/apps/{app_id}/accept-version")
+async def app_accept_version(app_id: int):
+    """Accepte une version dont l'identifiant d'app a changé : l'ancien identifiant n'est plus exigé."""
+    a = app_or_404(app_id)
+    if a["source_type"] == "upload" or not (a["bad_tag"] or a["bad_reason"]):
+        # rien à accepter : effacer l'identifiant d'une app saine (ou importée, jamais retéléchargée) ferait perdre la protection
+        raise HTTPException(409, "nothing_to_accept")
+    db.update("apps", app_id, bundle_id=None, bad_tag=None, bad_key=None, bad_reason=None, **renew.CLEAR_BLOCK)
+    db.log("Changement d'identifiant d'app accepté", app_id=app_id)
+    return {"ok": True, "started": renew.spawn(app_id, "nouvelle version")}
+
+
 @app.post("/api/apps/{app_id}/ipa")
 async def app_replace_ipa(app_id: int, file: UploadFile = File(...)):
     """Remplace l'IPA d'une app importée (nouvelle version, ou IPA absente après une restauration) en gardant
@@ -1017,7 +1117,7 @@ async def app_replace_ipa(app_id: int, file: UploadFile = File(...)):
                 f.write(chunk)
         try:
             info = ipa.app_info(tmp)
-        except (zipfile.BadZipFile, ValueError):
+        except Exception:  # noqa: BLE001 - zip illisible, Info.plist mal formé (ExpatError), clé absente…
             raise HTTPException(400, "not_an_ipa") from None
         if info["platform"] != "appletvos":
             raise HTTPException(400, f"not_tvos:{info['platform'] or 'unknown'}")
@@ -1163,7 +1263,7 @@ async def backup_export(uploads: bool = False):
 
 @app.post("/api/backup/import")
 async def backup_import(file: UploadFile = File(...)):
-    if renew._RUNNING or proc.busy() or backup.RESTORING:
+    if renew._RUNNING or _RENEW_ALL_PENDING or proc.busy() or backup.RESTORING:
         raise HTTPException(409, "busy")
     tmp = TMP_DIR / f"import-{int(time.time())}.zip"
     try:
@@ -1176,7 +1276,7 @@ async def backup_import(file: UploadFile = File(...)):
                 f.write(chunk)
         # l'envoi a pu durer : un renouvellement a pu démarrer entre-temps. Aucun await entre cette
         # vérification et le drapeau : la boucle et l'API se mettent en retrait avant tout remplacement.
-        if renew._RUNNING or proc.busy() or backup.RESTORING:
+        if renew._RUNNING or _RENEW_ALL_PENDING or proc.busy() or backup.RESTORING:
             raise HTTPException(409, "busy")
         backup.RESTORING = True
         try:
@@ -1188,6 +1288,7 @@ async def backup_import(file: UploadFile = File(...)):
                 except ValueError as e:
                     raise HTTPException(400, str(e)) from None
             auth.load_revoked()
+            _purge_half_added()      # une sauvegarde faite pendant un ajout contient une fiche « en cours d'ajout »
             renew.startup()
             await devices.sync_store()
         except plume.Busy:

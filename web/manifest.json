@@ -1,0 +1,14 @@
+{
+  "name": "tvsign",
+  "short_name": "tvsign",
+  "description": "Signe et garde installées des apps tvOS sur ton Apple TV / Signs and keeps tvOS apps installed on your Apple TV",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#F2F2F7",
+  "theme_color": "#0063CC",
+  "icons": [
+    { "src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

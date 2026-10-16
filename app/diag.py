@@ -1,7 +1,8 @@
 """Environment diagnostics (onboarding and Settings › Diagnostics).
 
 Read-only checks: no Apple sign-in, no pairing, no connection to an Apple TV.
-Each check returns {id, status: ok|warn|error, detail, value}; the UI translates ids.
+Each check returns {id, status: ok|warn|error, detail, value, code}; the UI translates ids, and
+the code of the case that applies (the English detail stays as a fallback and in the support bundle).
 """
 import asyncio
 import email.utils
@@ -22,8 +23,8 @@ from .config import DATA_DIR, PASSWORD_FILE_ERROR, PLUMESIGN, VERSION, WINDOWS
 DEFAULT_ANISETTE = settings.DEFAULT_ANISETTE
 
 
-def _check(id_: str, status: str, detail: str = "", value=None) -> dict:
-    return {"id": id_, "status": status, "detail": detail, "value": value}
+def _check(id_: str, status: str, detail: str = "", value=None, code: str | None = None) -> dict:
+    return {"id": id_, "status": status, "detail": detail, "value": value, "code": code}
 
 
 def _head(url: str) -> tuple[int | None, float | None, str]:
@@ -46,10 +47,10 @@ def _head(url: str) -> tuple[int | None, float | None, str]:
 
 async def _plumesign() -> dict:
     if not PLUMESIGN.exists() and not shutil.which(str(PLUMESIGN)):
-        return _check("plumesign", "error", f"not found: {PLUMESIGN} (TVSIGN_PLUMESIGN)")
+        return _check("plumesign", "error", f"not found: {PLUMESIGN} (TVSIGN_PLUMESIGN)", code="missing")
     v = await plume.version()
     if not v:
-        return _check("plumesign", "error", f"{PLUMESIGN} does not answer --version")
+        return _check("plumesign", "error", f"{PLUMESIGN} does not answer --version", code="no_answer")
     return _check("plumesign", "ok", str(PLUMESIGN), v)
 
 
@@ -93,13 +94,14 @@ async def _mdns() -> dict:
     detail = f"{len(found)} announcement(s), {ours} paired with tvsign, {pairable} waiting to be paired"
     value = {"total": len(found), "ours": ours, "pairable": pairable, "bridge": False, "direct": 0}
     if found:
-        return _check("mdns", "ok", detail, value)
+        return _check("mdns", "ok", detail, value, code="found")
     value["bridge"] = _bridge_network()
     value["direct"] = await _direct_answers()
     if value["direct"]:
         # multicast does not get through, but the TV's known address answers: renewals work
-        return _check("mdns", "warn", f"{detail}; {value['direct']} Apple TV(s) answering directly at their address", value)
-    return _check("mdns", "warn", detail, value)
+        return _check("mdns", "warn", f"{detail}; {value['direct']} Apple TV(s) answering directly at their address", value,
+                      code="none")
+    return _check("mdns", "warn", detail, value, code="none")
 
 
 def _tcp(host: str, port: int = 443) -> str:
@@ -202,7 +204,7 @@ def _disk() -> dict:
     free = shutil.disk_usage(DATA_DIR).free
     gb = free / 1e9
     status = "ok" if gb >= 1 else "warn" if gb >= 0.2 else "error"
-    return _check("disk", status, f"{gb:.1f} GB free in {DATA_DIR}", round(gb, 2))
+    return _check("disk", status, f"{gb:.1f} GB free in {DATA_DIR}", round(gb, 2), code="free")
 
 
 def _loop() -> dict:
@@ -211,7 +213,8 @@ def _loop() -> dict:
     name = type(asyncio.get_running_loop()).__name__
     ok = "Proactor" in name
     return _check("event_loop", "ok" if ok else "error",
-                  name + ("" if ok else ": no subprocesses, start with \"python -m app\""))
+                  name + ("" if ok else ": no subprocesses, start with \"python -m app\""),
+                  code=None if ok else "no_subprocess")
 
 
 async def run_all() -> dict:
@@ -233,11 +236,11 @@ async def run_all() -> dict:
     )
     server_date = apple_date or gh_date
     if server_date is None:
-        clock = _check("clock", "warn", "no server date available to compare with")
+        clock = _check("clock", "warn", "no server date available to compare with", code="no_date")
     else:
         skew = time.time() - server_date
         status = "ok" if abs(skew) < 120 else "error"
-        clock = _check("clock", status, f"{skew:+.0f} s from Apple's clock", round(skew))
+        clock = _check("clock", status, f"{skew:+.0f} s from Apple's clock", round(skew), code="skew")
     checks = [plumesign_, mdns, apple, anis, github, clock, _disk(), _loop()]
     pw = _password_file()
     if pw:

@@ -1562,8 +1562,8 @@ class ReviewFixes(Base):
                     "set_lbl_renew_window_end"):
             self.assertRegex(i18n, rf'(?m)^\s+{key}: \["[^"]+",\s*"[^"]+"\]', key)
         self.assertIn("window_wait", js)
-        self.assertIn("libelleReglage", js)
-        self.assertIn('$("#backup-export").addEventListener("click"', js)
+        self.assertIn("libelleReglage", (ROOT / "web" / "errors.js").read_text(encoding="utf-8"))
+        self.assertIn('$("#backup-export").onclick', js)
 
     def test_anisette_service_uses_a_named_volume_and_a_pinned_image(self):
         compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")

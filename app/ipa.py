@@ -531,6 +531,7 @@ def _sha256_of(rel: dict, asset: dict) -> str | None:
     return None
 
 
+_REPO_URL = re.compile(r"^(?:https?://(?:www\.)?github\.com/|git@github\.com:)([\w.-]+)/([\w.-]+?)(?:\.git)?(?:/.*)?(?:[?#].*)?$", re.I)
 _REPO = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}", re.ASCII)
 
 
@@ -538,7 +539,10 @@ def normalize_repo(value: str | None) -> str | None:
     """« owner/projet » valide, ou None. Accepte aussi une adresse https://github.com/owner/projet
     (avec ou sans .git) collée telle quelle ; refuse les segments « . » et « .. »."""
     v = (value or "").strip()
-    v = re.sub(r"^https?://(www\.)?github\.com/", "", v, flags=re.I).rstrip("/")
+    m = _REPO_URL.match(v)
+    if m:       # adresse collée du navigateur (/releases/tag/…, ?tab=…, git@github.com:owner/projet)
+        v = f"{m[1]}/{m[2]}"
+    v = v.rstrip("/")
     if v.lower().endswith(".git"):
         v = v[:-4]
     if not _REPO.fullmatch(v):
