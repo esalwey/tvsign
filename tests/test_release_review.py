@@ -7,6 +7,7 @@ appairage repris du store, contrôle des apps installées, plateformes à la cop
 Sans plumesign, sans Apple TV, sans Internet.
 """
 import asyncio
+import collections
 import json
 import os
 import plistlib
@@ -793,6 +794,33 @@ class MigrationIsAtomic(unittest.TestCase):
         conn.commit()
         self.assertIsNone(conn.execute("SELECT platform FROM apps WHERE name = 'Phone'").fetchone()[0])
         conn.close()
+
+
+class OneMigrationList(unittest.TestCase):
+    """Les huit groupes ajoutaient chacun leurs colonnes : une seule liste ordonnée, chaque colonne une fois."""
+
+    def test_every_column_is_added_exactly_once(self):
+        seen = collections.Counter((table, col) for table, col, _ in db.MIGRATIONS)
+        self.assertEqual([k for k, n in seen.items() if n > 1], [])
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(db.SCHEMA)
+        for table, col, _ in db.MIGRATIONS:
+            names = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            self.assertTrue(names, f"table {table} absente du schéma de base")
+            self.assertNotIn(col, names, f"{table}.{col} est déjà dans le schéma de base")
+        conn.close()
+
+    def test_a_fresh_database_and_a_migrated_one_have_the_same_columns(self):
+        fresh = sqlite3.connect(":memory:")
+        fresh.row_factory = sqlite3.Row
+        db.migrate(fresh)
+        old = sqlite3.connect(":memory:")
+        old.row_factory = sqlite3.Row
+        old.executescript(MigrationIsAtomic.OLD)
+        db.migrate(old)
+        for table in ("apps", "devices", "events", "imported_certs"):
+            self.assertEqual({r["name"] for r in fresh.execute(f"PRAGMA table_info({table})")},
+                             {r["name"] for r in old.execute(f"PRAGMA table_info({table})")}, table)
 
 
 class LegacyAnisetteIsMentionedOnce(unittest.TestCase):

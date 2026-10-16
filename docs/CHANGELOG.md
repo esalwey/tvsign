@@ -33,9 +33,9 @@ defaults are not the ones of 1.0.
 - **Support**: a support bundle with the secrets masked, a paginated and downloadable journal, a diagnostics
   page that explains each failure, and English translations of the journal lines.
 - **Backups** are checked before anything is replaced, and a restore is all or nothing.
-- **Windows**: the PC is kept awake while a renewal runs (and an optional wake-up task), the installer can
-  create the firewall rule, quitting lets a renewal finish, and a new version is announced in the window and
-  by a notification.
+- **Windows**: the PC is kept awake while a renewal runs (and an optional wake-up task), the installer offers
+  to create the firewall rule (ticked by default; Windows asks for an administrator confirmation once),
+  quitting lets a renewal finish, and a new version is announced in the window and by a notification.
 - **Docker**: container logs rotate, the optional anisette server has its own volume, and the compose file
   reads `TZ`, `PUID` and `PGID` from a `.env` file.
 
@@ -50,6 +50,9 @@ defaults are not the ones of 1.0.
 - Once a day tvsign asks GitHub whether a newer tvsign exists (one request, nothing else is sent). Turn it
   off in Settings › Check for tvsign updates or with `TVSIGN_UPDATE_CHECK=off`.
 - An ntfy destination without a list of events receives all five kinds, including app updates.
+- Notifications follow the language you chose. With "Automatic" they use the last language shown in the
+  interface: English until you have opened it once, unless the server's `LANG` is French (they used to be
+  French).
 - The journal keeps the last 250 lines of each app; older ones are pruned at the first write after the upgrade.
 - Each app keeps the previous IPA next to the current one: expect one more IPA of disk per app.
 - New pairings are made under a name of their own (`tvsign-xxxxxxxx`); the ones you already have keep theirs.

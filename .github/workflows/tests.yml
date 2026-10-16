@@ -33,7 +33,7 @@ jobs:
           python -m pip install -r requirements.txt httpx pyflakes pefile
 
       - name: Static check
-        run: python -m pyflakes app tests windows/launcher windows/tools
+        run: python -m pyflakes app tests windows/launcher windows/tools scripts
 
       - name: Unit tests
         run: python -m unittest discover -s tests -v

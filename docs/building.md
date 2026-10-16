@@ -90,9 +90,16 @@ the tests that need Windows are skipped elsewhere):
 
 ```sh
 pip install -r requirements.txt httpx pyflakes pefile
-python -m pyflakes app tests windows/launcher windows/tools
+python -m pyflakes app tests windows/launcher windows/tools scripts
 python -m unittest discover -s tests
 ```
+
+`requirements.txt` includes `cryptography`: without it the tests of imported certificates are skipped
+(about 50 of them), so install it before trusting a green run. Node.js runs the checks of the web
+interface (`tests/web_check.js`); without it they are skipped too. `app/reasons.py` (the causes of
+failures in English, for the notifications) is generated from `web/errors.js` and `web/i18n.js` by
+`python scripts/sync-reasons.py`: run it after changing a cause or its English title, a test fails
+while the file is out of date.
 
 The Rust side of the sign-in (anisette servers, GrandSlam answers, two-factor decisions) has unit tests
 that need no network either:
