@@ -7,9 +7,9 @@ import re
 import shutil
 import time
 
-from . import backup, db, devices, families, ipa, notifier, plume, proc, selfupdate, settings, util
-from .config import (ACCOUNT_CHECK_HOURS, APP_WAIT_MINUTES, APPLE_BACKOFF_MINUTES, CHECK_INTERVAL, IPA_DIR,
-                     PRESENCE_MINUTES, RELEASE_CHECK_MINUTES, RENEW_TIMEOUT_MINUTES, RETRY_MINUTES,
+from . import backup, db, devices, families, imported_cert, ipa, notifier, plume, proc, selfupdate, settings, util
+from .config import (ACCOUNT_CHECK_HOURS, APP_WAIT_MINUTES, APPLE_BACKOFF_MINUTES, CERT_CHECK_HOURS, CHECK_INTERVAL,
+                     IPA_DIR, PRESENCE_MINUTES, RELEASE_CHECK_MINUTES, RENEW_TIMEOUT_MINUTES, RETRY_MINUTES,
                      UPDATE_WAIT_MINUTES, WINDOWS)
 
 # Arrêt du service en cours : plus aucun renouvellement ne démarre, ceux en cours peuvent finir.
@@ -35,7 +35,7 @@ CLEAR_BLOCK = dict(next_attempt_at=None, needs_action=None, fail_count=0, fail_k
 # Déclencheurs d'une mise à jour facultative : l'app installée reste valable, un échec ne la fait pas passer en erreur.
 UPDATE_TRIGGERS = ("nouvelle version", "mise à jour", "nouvelle IPA", "nouvelle source", "retour arrière")
 # Renouvellements qui re-signent toujours et appliquent la version demandée même si la mise à jour auto est coupée.
-FORCE_SIGN = ("manuel", "nouvelle destination", "nouvelle IPA", "retour arrière")
+FORCE_SIGN = ("manuel", "nouvelle destination", "nouvelle IPA", "retour arrière", "nouveau certificat")
 FORCE_UPDATE = ("mise à jour", "nouvelle source")
 _ABSENT: set[int] = set()               # apps dont le dernier échec vient d'un appareil absent du réseau
 _DEVMODE_LOGGED: set[int] = set()       # appareils dont le mode développeur désactivé est déjà au journal
@@ -106,8 +106,10 @@ async def notify(message: str, priority: str = "default", event: str = "fail", *
     return sent
 
 
-# Niveaux d'alerte croissants : on ne renotifie que si la situation s'aggrave.
-_LEVELS = ["fail", "24h", "6h", "expired"]
+# Niveaux d'alerte croissants : on ne renotifie que si la situation s'aggrave. « 7d » et « 1d » sont ceux d'une
+# app signée avec un certificat importé (pas de renouvellement tous les 7 jours : on prévient avant la fin du
+# certificat ou du profil) ; « 24h » et « 6h » ceux d'un compte Apple gratuit.
+_LEVELS = ["fail", "7d", "24h", "1d", "6h", "expired"]
 
 
 def _level(app: dict, now: float) -> str:
@@ -117,6 +119,8 @@ def _level(app: dict, now: float) -> str:
     left = exp - now
     if left <= 0:
         return "expired"
+    if imported_cert.is_cert(app):
+        return imported_cert.expiry_level(left) or "fail"
     if left < 6 * 3600:
         return "6h"
     if left < 24 * 3600:
@@ -138,6 +142,10 @@ def alert_state(app: dict, now: float) -> str | None:
     exp = app.get("expires_at")
     if exp and exp <= now:
         return "expired"
+    if exp and imported_cert.is_cert(app):
+        soon = imported_cert.expiry_level(exp - now)
+        if soon:
+            return soon         # « 7d » / « 1d » : rien n'a échoué, mais il faudra importer un nouveau certificat
     if app.get("status") != "error":
         return None
     lvl = _level(app, now)
@@ -160,6 +168,9 @@ async def alert(app: dict, reason: str, now: float, quiet_fail: bool = False) ->
         sent = await notify(notifier.text("renew_failed", name=name, reason=reason), "default", "fail", app=name)
     elif lvl == "expired":
         sent = await notify(notifier.text("expired", name=name, reason=reason), "urgent", "expiry", app=name)
+    elif lvl in ("7d", "1d"):
+        sent = await notify(notifier.text("import_expiring_failing", name=name, d=lvl[:-1], reason=reason), "high",
+                            "expiry", app=name)
     else:
         sent = await notify(notifier.text("expiring", name=name, h=lvl[:-1], reason=reason), "high", "expiry",
                             app=name)
@@ -592,7 +603,7 @@ _TEAM = re.compile(r"NO_TEAM|MULTIPLE_TEAMS|TEAM_NOT_FOUND")
 
 def failure_kind(exc: BaseException) -> str | None:
     """Action requise (session | pairing | limit | config) ou None si un nouvel essai a une chance de réussir."""
-    if isinstance(exc, NeedsAction):
+    if isinstance(exc, (NeedsAction, imported_cert.CertProblem)):
         return exc.kind
     if isinstance(exc, (plume.SessionExpired, plume.UnknownAccount)):
         return "session"
@@ -897,6 +908,18 @@ async def _fall_back(app_id: int, first: Exception, deliver, signed) -> float:
     return expires
 
 
+async def _certificate_refused(ident: dict, refused: Exception) -> None:
+    """L'installation d'une app signée avec un certificat importé échoue : si le refus de l'appareil parle du
+    certificat ou du profil (révoqué, expiré, appareil absent du profil, droits…), c'est lui qu'on met en cause, avec
+    sa solution, et non une panne de l'IPA. Une révocation est consignée : les autres apps qui l'utilisent suivent."""
+    problem = imported_cert.explain_install_failure(str(refused), ident)
+    if problem is None:
+        return
+    if problem.code == "revoked" and imported_cert.record_revoked(ident["id"], "installation refusée par l'appareil"):
+        await identity_revoked(imported_cert.row(ident["id"]) or ident, "installation refusée par l'appareil")
+    raise problem from refused
+
+
 async def _renew(app_id: int, trigger: str) -> None:
     app = db.row("SELECT * FROM apps WHERE id = ?", app_id)
     if not app:
@@ -910,11 +933,17 @@ async def _renew(app_id: int, trigger: str) -> None:
     was_ok = app["status"] == "ok"
     db.update("apps", app_id, status="running", last_error=None, last_attempt_at=started,
               last_trigger=trigger)
+    cert_mode = imported_cert.is_cert(app)      # signée avec un certificat importé : ni compte Apple ni session
+    ident = None
     try:
         device = db.row("SELECT * FROM devices WHERE id = ?", app["device_id"]) if app["device_id"] else None
         if not device:
             raise NeedsAction("aucune Apple TV associée", "config")
-        email = await _usable_account(app)
+        if cert_mode:
+            ident = imported_cert.require(app, device)      # CertProblem : rien à contacter, rien à signer
+            email = None
+        else:
+            email = await _usable_account(app)
 
         # 1. Apple TV joignable ? On échoue vite, avant tout appel à Apple.
         # Pas de report sur la seule présence d'un processus : tvOS garde en mémoire les apps
@@ -933,6 +962,8 @@ async def _renew(app_id: int, trigger: str) -> None:
 
         updated = await refresh_source(app, force=trigger in FORCE_UPDATE)
         cur = db.row("SELECT * FROM apps WHERE id = ?", app_id) or app
+        if cert_mode and cur.get("bundle_id") != app.get("bundle_id"):
+            ident = imported_cert.require(cur, device)      # identifiant d'app changé (version acceptée) : le profil le couvre-t-il ?
         was_pending = pending_update(cur)             # version téléchargée, jamais installée avec succès
         if trigger in ("nouvelle version", "mise à jour") and not updated and was_ok and not was_pending:
             # téléchargement raté, version refusée ou rien de nouveau : inutile de re-signer l'ancienne version
@@ -954,15 +985,24 @@ async def _renew(app_id: int, trigger: str) -> None:
         async def deliver() -> float:
             # 2. Signature (réutilise une signature récente jamais installée, sauf demande manuelle).
             expires = None if force else _reusable_signature(app, original, signed, time.time())
+            if expires and cert_mode:
+                expires = min(expires, ident["cert_not_after"] or expires)      # le certificat peut finir avant le profil
+
+            # « signature » seulement quand plumesign est à nous : une connexion Apple en attente du code
+            # 2FA tient le verrou jusqu'à 10 min, la file d'attente s'affiche comme telle
+            def lock_state(state: str) -> None:
+                _phase(app_id, "queued" if state == "waiting" else "signing")
+
             if expires:
                 db.log(f"{app['name']} : signature du {_fmt(signed.stat().st_mtime)} réutilisée", app_id=app_id,
                        journal=not retry)
+            elif cert_mode:
+                db.log(f"{app['name']} : signature avec le certificat importé « {ident['name']} »", app_id=app_id,
+                       journal=not retry)
+                with imported_cert.signing_files(ident["id"]) as files:
+                    await plume.sign_with_certificate(files, original, signed, on_lock=lock_state)
+                expires = imported_cert.signature_expiry(ident, signed)
             else:
-                # « signature » seulement quand plumesign est à nous : une connexion Apple en attente du code
-                # 2FA tient le verrou jusqu'à 10 min, la file d'attente s'affiche comme telle
-                def lock_state(state: str) -> None:
-                    _phase(app_id, "queued" if state == "waiting" else "signing")
-
                 # iPhone / iPad : la plateforme est précisée à Apple ; une Apple TV garde l'appel d'origine
                 plat = {"platform": "ios"} if devices.is_mobile(device) else {}
                 await plume.ensure_device(email, device["udid"], device["name"], on_lock=lock_state, **plat)
@@ -1007,7 +1047,12 @@ async def _renew(app_id: int, trigger: str) -> None:
                     _phase(app_id, step, percent=percent)
 
             _phase(app_id, "uploading")
-            await devices.install(device, [signed], on_event=on_event, wait_cap=wait_cap, app_name=app["name"])
+            try:
+                await devices.install(device, [signed], on_event=on_event, wait_cap=wait_cap, app_name=app["name"])
+            except Exception as refused:
+                if cert_mode:
+                    await _certificate_refused(ident, refused)
+                raise
             return expires
 
         try:
@@ -1027,22 +1072,27 @@ async def _renew(app_id: int, trigger: str) -> None:
                       cert_serial=_serials(signed, email), installed_ipa=done["source_sha256"],
                       verified_at=verified_at, installed_bundle=bundle,
                       installed_version=done.get("version"), installed_tag=done.get("source_tag"))
-        if expires - now <= before_hours(app, device) * 3600 + CHECK_INTERVAL:
+        if not cert_mode and expires - now <= before_hours(app, device) * 3600 + CHECK_INTERVAL:
             # profil déjà dans la fenêtre de renouvellement (réglage au maximum, profil plus court que prévu) :
             # sans ce délai, la boucle re-signerait et réinstallerait à chaque passage
             fields["next_attempt_at"] = now + 6 * 3600
             db.log(f"{app['name']} : le profil obtenu expire le {_fmt(expires)}, dans la fenêtre de renouvellement "
                    f"({before_hours(app, device):g} h) : prochain essai dans 6 h", "warn", app_id=app_id)
-        if done and not done.get("account_email"):
+        if done and not done.get("account_email") and not cert_mode:
             # fige le compte : un autre compte = autre équipe = autre bundle ID (2e copie).
             # Pas d'écrasement d'un compte choisi pendant l'opération.
             fields["account_email"] = email
         db.update("apps", app_id, **fields)
         _OUTCOME[app_id] = ("ok", None)
         _ABSENT.discard(app_id)
-        db.log(f"{app['name']} : renouvelée ({trigger}), valable jusqu'au {_fmt(expires)}, "
-               f"prochain renouvellement auto le {_fmt(expires - before_hours(app, device) * 3600)}",
-               app_id=app_id)
+        if cert_mode:
+            db.log(f"{app['name']} : installée avec le certificat importé ({trigger}), valable jusqu'au {_fmt(expires)} "
+                   "(pas de renouvellement automatique : l'app n'est signée à nouveau que pour une nouvelle version)",
+                   app_id=app_id)
+        else:
+            db.log(f"{app['name']} : renouvelée ({trigger}), valable jusqu'au {_fmt(expires)}, "
+                   f"prochain renouvellement auto le {_fmt(expires - before_hours(app, device) * 3600)}",
+                   app_id=app_id)
         if was_pending and done.get("source_sha256") == cur.get("source_sha256"):
             notes = (cur.get("notes") or "").strip()
             db.log(f"{app['name']} : version {done.get('version')} installée", app_id=app_id)
@@ -1102,8 +1152,9 @@ async def _renew(app_id: int, trigger: str) -> None:
             await account_down(e.email or app.get("account_email") or plume.default_account(), plume.REAUTH_REASON)
         # une panne banale (TV en veille, app ouverte, anisette, reconnexion à faire) loin de l'expiration ne
         # prévient pas : les niveaux 24h / 6h / expiré, eux, notifient toujours
+        # (un souci de certificat ou de profil importé a ses propres alertes : révocation, fin de validité)
         await alert(db.row("SELECT * FROM apps WHERE id = ?", app_id) or app, str(e), now,
-                    quiet_fail=transient or reconnect)
+                    quiet_fail=transient or reconnect or isinstance(e, imported_cert.CertProblem))
 
 
 def _optional_update(app: dict, trigger: str, was_ok: bool, now: float) -> bool:
@@ -1131,6 +1182,8 @@ def due(app: dict, now: float, ignore_retry: bool = False) -> bool:
         # échec (même loin de l'expiration : nouvelle version, TV en veille…) ou essai interrompu
         # par un redémarrage : on réessaie, au rythme de next_attempt_at
         return True
+    if imported_cert.is_cert(app):
+        return False        # certificat importé : pas de renouvellement tous les 7 jours, une nouvelle version seulement
     return app["expires_at"] - now < before_hours(app) * 3600
 
 
@@ -1173,6 +1226,8 @@ def window_view(app: dict, now: float, before_hours: float) -> dict:
     exp = app["expires_at"]
     base = exp - before_hours * 3600 if exp else None
     out = {"renew_at": base, "window_wait": False, "window_at": None}
+    if imported_cert.is_cert(app):
+        return {"renew_at": None, "window_wait": False, "window_at": None}     # rien à renouveler à date fixe
     if not exp or not app["enabled"] or urgent(app, now) or settings.renew_window() is None:
         return out
     limit = exp - 24 * 3600                 # au-delà, la plage ne s'applique plus
@@ -1214,7 +1269,8 @@ def account_slots(apps: list[dict], devices_: list[dict], accounts: list[dict], 
     for acc in accounts:
         per: dict[int, int] = {}
         for a in apps:
-            if a["enabled"] and a["device_id"] and _same_account(a["account_email"] or default, acc["email"]):
+            if (a["enabled"] and a["device_id"] and not imported_cert.is_cert(a)
+                    and _same_account(a["account_email"] or default, acc["email"])):
                 per[a["device_id"]] = per.get(a["device_id"], 0) + 1
         out[acc["email"]] = [{"device_id": d, "device_name": names.get(d), "apps": n, "max": MAX_ACTIVE_APPS}
                              for d, n in sorted(per.items())]
@@ -1225,11 +1281,11 @@ def add_warnings(app: dict) -> list[str]:
     """Avertissements à l'ajout d'une app : les limites du compte gratuit vues dans l'IPA (« appex:2 »,
     « push »… : colonne warnings) et « slots_full » si ce compte a déjà 3 apps actives sur cet appareil."""
     found = [w for w in (app.get("warnings") or "").split(",") if w]
-    if not app.get("device_id"):
-        return found
+    if not app.get("device_id") or imported_cert.is_cert(app):
+        return found        # un certificat importé n'a pas les limites du compte gratuit
     default = plume.default_account()
     same = [a for a in db.rows("SELECT * FROM apps WHERE enabled = 1 AND device_id = ?", app["device_id"])
-            if _same_account(a["account_email"] or default, app["account_email"] or default)]
+            if not imported_cert.is_cert(a) and _same_account(a["account_email"] or default, app["account_email"] or default)]
     return found + (["slots_full"] if len(same) > MAX_ACTIVE_APPS else [])
 
 
@@ -1261,7 +1317,7 @@ def _account_valid(email: str) -> None:
     plume.ALERTED.discard(email)
     default = plume.default_account()
     waiting = [a for a in db.rows("SELECT * FROM apps WHERE enabled = 1 AND status = 'error'")
-               if _same_account(a["account_email"] or default, email)
+               if not imported_cert.is_cert(a) and _same_account(a["account_email"] or default, email)
                and a["needs_action"] in (None, "session")]
     if waiting:
         n = _resume(waiting, "reconnexion")
@@ -1294,7 +1350,9 @@ async def _check_certificates(email: str) -> None:
         return
     default = plume.default_account()
     for app in db.rows("SELECT * FROM apps WHERE enabled = 1 AND status = 'ok'"):
-        if not _same_account(app["account_email"] or default, email) or app["id"] in _RUNNING:
+        if app["id"] in _RUNNING or imported_cert.is_cert(app):
+            continue        # un certificat importé n'est pas dans la liste de certificats du compte (voir _check_identities)
+        if not _same_account(app["account_email"] or default, email):
             continue
         signed = app_dir(app["id"]) / "signed.ipa"
         serials = app["cert_serial"] or (_serials(signed, email) if signed.exists() else None)
@@ -1341,6 +1399,96 @@ async def _check_accounts() -> None:
             await _check_certificates(email)
 
 
+# ---------- certificats importés : expiration et révocation ----------
+
+_IDENT_LOGGED: set[tuple[int, str]] = set()      # (certificat, niveau) déjà au journal : une ligne par épisode
+
+
+def _cert_apps(ident_id: int) -> list[dict]:
+    return db.rows("SELECT * FROM apps WHERE cert_id = ? AND sign_mode = 'certificate' AND enabled = 1 ORDER BY name",
+                   ident_id)
+
+
+async def identity_revoked(ident: dict, why: str) -> None:
+    """Un certificat importé est révoqué (réponse OCSP, ou l'appareil refuse son identité à l'installation) : les apps
+    qui l'utilisent passent en erreur avec la marche à suivre, et une alerte part, une seule par certificat."""
+    apps = _cert_apps(ident["id"])
+    message = imported_cert.problem_for({**ident, "revoked_at": ident.get("revoked_at") or time.time()}, None, None)[1]
+    now = time.time()
+    for a in apps:
+        if a["id"] not in _RUNNING:
+            db.update("apps", a["id"], status="error", last_error=message, needs_action="config", fail_kind="config",
+                      next_attempt_at=now + BLOCKED_RETRY_HOURS["config"] * 3600)
+    names = ", ".join(a["name"] for a in apps) or "aucune app"
+    db.log(f"Certificat importé « {ident['name']} » révoqué ({why}) : {names}", "error")
+    if ident.get("notified_level") != "revoked":
+        sent = await notify(notifier.text("import_revoked", name=ident["name"], apps=names), "urgent", "account")
+        if sent:
+            db.update("imported_certs", ident["id"], notified_level="revoked")
+
+
+async def check_identity(ident_id: int) -> imported_cert.Revocation | None:
+    """Contrôle OCSP d'un certificat importé (réseau : hors de la boucle d'événements). Consigne le résultat ;
+    None si le certificat n'est pas lisible ici. Une réponse indéterminée ne conclut rien."""
+    try:
+        found = await asyncio.to_thread(imported_cert.material_cert, ident_id)
+    except imported_cert.CertProblem:
+        found = None            # fichier scellé illisible ou module absent : les apps le signalent à la signature
+    if found is None:
+        return None
+    before = imported_cert.row(ident_id)
+    result = await asyncio.to_thread(imported_cert.check_revocation, *found)
+    imported_cert.record_check(ident_id, result)
+    after = imported_cert.row(ident_id)
+    if result.state == "revoked" and before and not before.get("revoked_at") and after:
+        await identity_revoked(after, "OCSP")
+    return result
+
+
+async def _check_revocations() -> None:
+    """Toutes les CERT_CHECK_HOURS heures, les certificats qu'une app utilise sont soumis à leur serveur OCSP."""
+    if CERT_CHECK_HOURS <= 0 or not imported_cert.AVAILABLE:
+        return
+    now = time.time()
+    for ident in imported_cert.rows():
+        if ident["revoked_at"] or (ident["checked_at"] and now - ident["checked_at"] < CERT_CHECK_HOURS * 3600):
+            continue
+        if not _cert_apps(ident["id"]) or STOPPING:
+            continue
+        await check_identity(ident["id"])
+
+
+async def _check_identities(now: float) -> None:
+    """Prévient une fois à 7 jours, une fois à 1 jour et une fois à l'expiration d'un certificat importé (celui du
+    plus tôt du certificat et du profil), avec la liste des apps concernées : c'est à l'utilisateur d'en importer un
+    nouveau, rien ne se renouvelle tout seul. Un certificat remplacé (nouvelle échéance) clôt l'épisode."""
+    for ident in imported_cert.rows():
+        apps = _cert_apps(ident["id"])
+        if not apps:
+            continue
+        level = "revoked" if ident["revoked_at"] else imported_cert.expiry_level((ident["expires_at"] or 0) - now)
+        if level is None:
+            if ident["notified_level"]:
+                db.update("imported_certs", ident["id"], notified_level=None)
+            _IDENT_LOGGED.difference_update({k for k in _IDENT_LOGGED if k[0] == ident["id"]})
+            continue
+        rank = imported_cert.LEVEL_RANK
+        if level == "revoked" or rank[level] <= rank.get(ident["notified_level"] or "", 0):
+            continue                # révoqué : alerte déjà partie à la découverte (identity_revoked)
+        names = ", ".join(a["name"] for a in apps)
+        until = notifier.fmt_time(ident["expires_at"])
+        if level != "expired" and (ident["id"], level) not in _IDENT_LOGGED:
+            _IDENT_LOGGED.add((ident["id"], level))
+            db.log(f"Certificat importé « {ident['name']} » : expire le {until} ({names}), importe-en un nouveau", "warn")
+        if level == "expired":
+            sent = await notify(notifier.text("import_expired", name=ident["name"], apps=names), "urgent", "expiry")
+        else:
+            sent = await notify(notifier.text("import_expiring", name=ident["name"], d=level[:-1], until=until,
+                                              apps=names), "high", "expiry")
+        if sent:
+            db.update("imported_certs", ident["id"], notified_level=level)
+
+
 async def _check_expired(now: float, skip: set | frozenset = frozenset()) -> None:
     """Signale une expiration même si aucun essai n'est en cours. `skip` : apps dont le renouvellement
     démarre à l'instant (leur échec alertera lui-même, une réussite ne doit rien signaler)."""
@@ -1352,7 +1500,10 @@ async def _check_expired(now: float, skip: set | frozenset = frozenset()) -> Non
             if app["id"] not in _EXPIRED_LOGGED:
                 _EXPIRED_LOGGED.add(app["id"])
                 db.log(f"{app['name']} : profil expiré le {_fmt(app['expires_at'])}", "error", app_id=app["id"])
-            await alert(app, app["last_error"] or "renouvellement pas encore réussi", now)
+            reason = "renouvellement pas encore réussi"
+            if imported_cert.is_cert(app):
+                reason = "certificat ou profil importé expiré : importe-en un nouveau (réglages de l'app › Avancé)"
+            await alert(app, app["last_error"] or reason, now)
 
 
 def startup() -> None:
@@ -1391,10 +1542,11 @@ def startup() -> None:
         except Exception:  # noqa: BLE001
             continue
         fields = {}
-        if exp and app["expires_at"] and abs(exp - app["expires_at"]) > 60:
+        cert_mode = imported_cert.is_cert(app)      # son échéance est celle du plus tôt du certificat et du profil
+        if exp and app["expires_at"] and abs(exp - app["expires_at"]) > 60 and not cert_mode:
             fields["expires_at"] = exp       # anciennes dates lues en heure locale au lieu d'UTC
         # le certificat signataire, plus précis que la liste du profil ; la liste ne sert qu'à défaut de valeur
-        serial = _serials(signed, app["account_email"] or plume.default_account(), exact=True)
+        serial = _serials(signed, None if cert_mode else app["account_email"] or plume.default_account(), exact=True)
         if not serial and not app["cert_serial"]:
             serial = _serials(signed)
         if serial and serial != app["cert_serial"]:
@@ -1528,6 +1680,10 @@ async def _installed_pass() -> None:
     await _guarded("vérification des apps installées", devices.audit_installed())
 
 
+async def _identity_pass() -> None:
+    await _guarded("contrôle des certificats importés", _check_revocations())
+
+
 async def _selfupdate_pass() -> None:
     await _guarded("recherche de mise à jour de tvsign", selfupdate.check())
 
@@ -1576,6 +1732,8 @@ async def tick(now: float, last_account_check: float, last_release_check: float)
     _background("selfupdate", _selfupdate_pass)         # une recherche par jour au plus (réseau : hors de la boucle)
     await _guarded("appairages des Apple TV", devices.check_store())
     _background("installed", _installed_pass)           # contrôle des apps présentes sur chaque TV (réseau : hors de la boucle)
+    _background("identities", _identity_pass)           # révocation des certificats importés (OCSP : réseau, hors de la boucle)
+    await _guarded("alertes des certificats importés", _check_identities(time.time()))
     # Les tâches lancées ci-dessus n'ont pas encore démarré (_RUNNING est vide pour elles) : sans cette
     # exclusion, une app expirée dont la re-signature démarre recevrait une alerte « EXPIRÉ » à tort.
     await _guarded("alertes d'expiration", _check_expired(time.time(), launched | set(_RUNNING)))
