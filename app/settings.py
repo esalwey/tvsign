@@ -65,12 +65,21 @@ def _language(value: str) -> None:
         raise ValueError("auto, en ou fr")
 
 
+def _cert_revoke(value: str) -> None:
+    if value not in ("never", "own", "any"):
+        raise ValueError("never, own ou any")
+
+
 PUBLIC: dict[str, Spec] = {
     "language": Spec("auto", str, ["TVSIGN_LANGUAGE"], _language),
     "ntfy_url": Spec("", str, ["TVSIGN_NTFY_URL"], _url),
     "renew_before_hours": Spec(60.0, float, ["TVSIGN_RENEW_BEFORE_HOURS"], _hours),
     # vide = serveur par défaut de plumesign (DEFAULT_ANISETTE, repli FALLBACK_ANISETTE)
     "anisette_url": Spec("", str, ["TVSIGN_ANISETTE_URL", "PLUMESIGN_ANISETTE_URL", "ANISETTE_URL_V3"], _anisette),
+    # Compte Apple plein (2 certificats de développement) : quels certificats plumesign peut révoquer.
+    # own = seulement ceux de cette installation (et les morts) ; never = aucun ; any = tous (Xcode,
+    # SideStore... compris : leurs apps cesseraient de se lancer).
+    "cert_revoke": Spec("own", str, ["TVSIGN_CERT_REVOKE", "PLUMESIGN_REVOKE"], _cert_revoke),
 }
 
 
@@ -220,3 +229,7 @@ def anisette_servers() -> list[str]:
     if custom and not same_server(custom, DEFAULT_ANISETTE):
         return [custom]
     return [DEFAULT_ANISETTE, FALLBACK_ANISETTE]
+
+
+def cert_revoke() -> str:
+    return get("cert_revoke")

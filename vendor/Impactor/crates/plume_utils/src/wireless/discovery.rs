@@ -168,8 +168,9 @@ fn best_address(service: &ResolvedService) -> Option<SocketAddr> {
         .collect();
     v4.sort();
 
-    if let Some(addr) = v4.first() {
-        return Some(SocketAddr::new(IpAddr::V4(*addr), port));
+    // 169.254.0.0/16 (auto-adresse sans DHCP) seulement en dernier recours : un vrai reseau local passe avant.
+    if let Some(addr) = pick_v4(&v4) {
+        return Some(SocketAddr::new(IpAddr::V4(addr), port));
     }
 
     // Link-local v6 is only routable with the scope id of the interface it was
@@ -189,9 +190,32 @@ fn best_address(service: &ResolvedService) -> Option<SocketAddr> {
     v6.into_iter().next().map(SocketAddr::V6)
 }
 
+/// Premiere adresse IPv4 (liste triee), en preferant celles qui ne sont pas link-local.
+fn pick_v4(sorted: &[Ipv4Addr]) -> Option<Ipv4Addr> {
+    sorted
+        .iter()
+        .find(|a| !a.is_link_local())
+        .or_else(|| sorted.first())
+        .copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_local_v4_is_only_a_last_resort() {
+        let list = [
+            Ipv4Addr::new(169, 254, 3, 4),
+            Ipv4Addr::new(192, 168, 1, 20),
+        ];
+        assert_eq!(pick_v4(&list), Some(Ipv4Addr::new(192, 168, 1, 20)));
+        assert_eq!(
+            pick_v4(&[Ipv4Addr::new(169, 254, 3, 4)]),
+            Some(Ipv4Addr::new(169, 254, 3, 4))
+        );
+        assert_eq!(pick_v4(&[]), None);
+    }
 
     #[test]
     fn trim_local_strips_mdns_suffix() {

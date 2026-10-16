@@ -145,6 +145,19 @@
         </div>
         <p class="group__footer" data-i18n="anisette_note">Used to sign in to Apple. Leave empty: tvsign uses ani.jkcoxson.com and switches to ani2.stikstore.app if it doesn't answer. A custom server must provide Windows anisette-v3 data (Apple refuses Android servers).</p>
       </section>
+
+      <section class="group">
+        <h2 class="group__header" data-i18n="certificates">Certificates</h2>
+        <div class="list">
+          <label class="field"><span data-i18n="cert_revoke_label">When the Apple account is full</span>
+            <select name="cert_revoke">
+              <option value="own" data-i18n="cert_revoke_own">Replace only tvsign's own certificates</option>
+              <option value="never" data-i18n="cert_revoke_never">Never revoke</option>
+              <option value="any" data-i18n="cert_revoke_any">Revoke any certificate (Xcode, SideStore…)</option>
+            </select></label>
+        </div>
+        <p class="group__footer" data-i18n="cert_revoke_note">A free Apple account holds 2 development certificates. Revoking one stops the apps signed with it from launching, including those of Xcode, SideStore or AltStore on your iPhone.</p>
+      </section>
       <p class="erreur" id="reglages-error" role="alert"></p>
       <div class="actions-form"><button class="btn btn--primary" id="reglages-submit" data-i18n="save">Save</button></div>
     </form>
@@ -319,6 +332,22 @@
         <p class="group__footer" data-i18n="login_note">Preferably use a dedicated Apple ID. The password is not stored: only the session token is.</p>
         <div id="login-session" aria-live="polite"></div>
         <p class="erreur" id="login-error" role="alert"></p>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Feuille : équipe de développeur d'un compte -->
+  <dialog class="sheet" id="dlg-team" aria-labelledby="t-team">
+    <form id="form-team" method="dialog">
+      <header class="sheet__bar">
+        <button class="sheet__link" type="button" data-close data-i18n="cancel">Cancel</button>
+        <h2 id="t-team" data-i18n="team_title">Developer team</h2>
+        <button class="sheet__link sheet__link--done" id="team-submit" value="ok" data-i18n="save" disabled>Save</button>
+      </header>
+      <div class="sheet__body">
+        <div id="team-list" aria-live="polite"></div>
+        <p class="group__footer" data-i18n="team_note">The team is part of the app's identifier: changing it installs a second copy of the app on the Apple TV.</p>
+        <p class="erreur" id="team-error" role="alert"></p>
       </div>
     </form>
   </dialog>

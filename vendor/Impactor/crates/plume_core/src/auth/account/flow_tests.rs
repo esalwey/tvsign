@@ -665,6 +665,7 @@ fn run_scenario(scenario: Scenario) -> Run {
         config,
         user_agent: USER_AGENT.to_string(),
         fresh_identity: false,
+        refresh_failed_at: None,
     };
 
     let prompts = Mutex::new(Vec::new());
@@ -990,10 +991,21 @@ fn a_wrong_password_is_apples_answer() {
 }
 
 #[test]
-fn a_wrong_code_ends_the_login_with_apples_message() {
-    let run = run(Apple::new(TwoFa::AlreadyPushed), vec![code("000000")]);
+fn a_wrong_code_is_asked_again() {
+    let run = run(Apple::new(TwoFa::AlreadyPushed), vec![code("000000"), code("123 456")]);
+    run.result.as_ref().unwrap();
+    assert_eq!(run.prompts.len(), 2);
+}
+
+#[test]
+fn wrong_codes_end_the_login_with_apples_message_after_three_retries() {
+    let run = run(
+        Apple::new(TwoFa::AlreadyPushed),
+        vec![code("000000"), code("000001"), code("000002"), code("000003")],
+    );
     let error = run.result.as_ref().unwrap_err();
     assert!(matches!(error, Error::AuthSrpWithMessage(-21669, _)), "{error}");
+    assert_eq!(run.prompts.len(), 4);
 }
 
 #[test]
@@ -1099,6 +1111,7 @@ fn open_session(
         config,
         user_agent: USER_AGENT.to_string(),
         fresh_identity,
+        refresh_failed_at: None,
     };
 
     TEST_GSA_HOST.with(|host| *host.borrow_mut() = Some(apple_url));

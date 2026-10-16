@@ -60,6 +60,12 @@ impl DeveloperSession {
             })
             .collect();
 
+        // Rien a activer : inutile d'envoyer un PATCH vide a Apple.
+        if capabilities_to_enable.is_empty() {
+            log::debug!("no capability to enable for {id}");
+            return Ok(());
+        }
+
         self.v1_update_app_id(team, id, capabilities_to_enable.clone())
             .await?;
 

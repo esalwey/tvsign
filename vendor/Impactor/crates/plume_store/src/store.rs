@@ -165,10 +165,10 @@ impl AccountStore {
         let adsid = s.adsid().clone();
         let xcode_gs_token = s.xcode_gs_token().clone();
 
-        let team_id = if teams_response.teams.is_empty() {
-            "".to_string()
-        } else {
-            teams_response.teams[0].team_id.clone()
+        // Sans equipe, le compte ne pourrait rien signer : on le dit maintenant plutot qu'au premier renouvellement.
+        let team_id = match teams_response.teams.first() {
+            Some(team) => team.team_id.clone(),
+            None => return Err(Error::NoTeam),
         };
 
         let account = GsaAccount::new(email, first_name, adsid, xcode_gs_token, team_id);

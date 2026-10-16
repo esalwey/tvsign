@@ -317,12 +317,39 @@ impl AnisetteData {
     }
 }
 
+/// Network delays: without them a silent connection blocks plumesign until tvsign kills it.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Apple's root certificate, for the calls to gsa.apple.com of the provisioning.
+const APPLE_ROOT: &[u8] = include_bytes!("./apple_root.der");
+
+/// True when the user explicitly accepts an anisette server with a self-signed certificate.
+fn anisette_insecure() -> bool {
+    std::env::var("PLUMESIGN_ANISETTE_INSECURE")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// Client of the anisette server: certificates are verified, except on an explicit opt-in
+/// (PLUMESIGN_ANISETTE_INSECURE=1) for a home server on self-signed https.
 fn make_reqwest() -> Result<Client, AnisetteError> {
+    let mut builder = ClientBuilder::new()
+        .http1_title_case_headers()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT);
+    if anisette_insecure() {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    Ok(builder.build()?)
+}
+
+/// Client of the calls to Apple (URL bag, start/finish provisioning): Apple's root added.
+fn make_apple_reqwest() -> Result<Client, AnisetteError> {
     Ok(ClientBuilder::new()
         .http1_title_case_headers()
-        .danger_accept_invalid_certs(true) // TODO: pin the apple certificate
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
+        .add_root_certificate(reqwest::Certificate::from_der(APPLE_ROOT)?)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
         .build()?)
 }
 
@@ -506,7 +533,7 @@ impl AnisetteClient {
         state: &AnisetteState,
         client_info: &str,
     ) -> Result<(String, String), AnisetteError> {
-        let http_client = make_reqwest()?;
+        let http_client = make_apple_reqwest()?;
         let resp = self
             .build_apple_request(state, http_client.get(lookup_url()), client_info)
             .send()
@@ -623,7 +650,7 @@ impl AnisetteClient {
                             .await?;
                     }
                     ProvisionInput::GiveStartProvisioningData => {
-                        let http_client = make_reqwest()?;
+                        let http_client = make_apple_reqwest()?;
                         let body_data = ProvisionBodyData {
                             header: Dictionary::new(),
                             request: Dictionary::new(),
@@ -650,7 +677,7 @@ impl AnisetteClient {
                             .await?;
                     }
                     ProvisionInput::GiveEndProvisioningData { cpim } => {
-                        let http_client = make_reqwest()?;
+                        let http_client = make_apple_reqwest()?;
                         let body_data = ProvisionBodyData {
                             header: Dictionary::new(),
                             request: Dictionary::from_iter([("cpim", cpim)].into_iter()),

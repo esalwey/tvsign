@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from . import db, settings
-from .config import IMPORT_PLUME, LOGIN_TIMEOUT, PLUME_HOME, PLUME_LOCK_TIMEOUT, PLUMESIGN
+from .config import IMPORT_PLUME, LOGIN_TIMEOUT, PLUME_HOME, PLUME_LOCK_TIMEOUT, PLUMESIGN, TMP_DIR
 from .proc import Result, Session, register, run, spawn
 from .util import replace_retry
 
@@ -33,7 +33,41 @@ def env() -> dict:
     anisette = settings.anisette_url()
     if anisette:
         e["PLUMESIGN_ANISETTE_URL"] = anisette
+    # Compte plein : jamais de révocation de certificats étrangers sans l'accord de l'utilisateur.
+    e["PLUMESIGN_REVOKE"] = settings.cert_revoke()
+    # Les copies de travail de plumesign (plume_stage_*) vont dans notre dossier de données, pas dans
+    # /tmp du conteneur ni %TEMP% : elles sont balayées par sweep_stage().
+    e.update(_tmp_env())
     return e
+
+
+STAGE_DIR = TMP_DIR / "plumesign"
+
+
+def _tmp_env() -> dict:
+    try:
+        STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return {}
+    path = str(STAGE_DIR)
+    return {"TMP": path, "TEMP": path} if os.name == "nt" else {"TMPDIR": path}
+
+
+def sweep_stage(max_age: float = 3600) -> int:
+    """Supprime les copies de travail plume_stage_* laissées par un plumesign tué (délai, arrêt)."""
+    removed = 0
+    try:
+        entries = list(STAGE_DIR.glob("plume_stage_*"))
+    except OSError:
+        return 0
+    for d in entries:
+        try:
+            if d.is_dir() and time.time() - d.stat().st_mtime > max_age:
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 @asynccontextmanager
@@ -128,12 +162,33 @@ def accounts() -> list[dict]:
             "email": email,
             "name": acc.get("first_name"),
             "team_id": acc.get("team_id"),
+            "cert_expires": settings.raw_get(_CERT_KEY + email),   # AAAA-MM-JJ, vu au dernier passage de plumesign
             "selected": email == selected,
             "ok": st.get("ok"),                 # 1 valide, 0 reconnexion nécessaire, None inconnu
             "message": st.get("message"),
             "checked_at": st.get("checked_at"),
         })
     return out
+
+
+_CERT_KEY = "cert_expires:"
+# Ligne de journal de plumesign : seul un certificat étranger révoqué casse d'autres apps sideloadées.
+FOREIGN_REVOKED = "Revoked certificate (FOREIGN)"
+_CERT_LINE = re.compile(r"^CERT\s+([0-9A-Fa-f]+)\s+(\d{4}-\d{2}-\d{2})\s*$", re.M)
+
+
+def cert_expiry(output: str) -> str | None:
+    """Fin de validité du certificat de signature, d'après la ligne « CERT <série> <date> » de plumesign."""
+    found = _CERT_LINE.findall(output or "")
+    return found[-1][1] if found else None
+
+
+def _forget_cert_expiry(email: str) -> None:
+    """Oublie la date de fin du certificat : elle appartient à l'ancienne session ou équipe."""
+    try:
+        settings.raw_set(_CERT_KEY + email, None)
+    except Exception:  # noqa: BLE001 - l'affichage d'une date ne doit jamais bloquer
+        pass
 
 
 def default_account() -> str | None:
@@ -481,15 +536,70 @@ async def logout(email: str) -> None:
             res = await run(PLUMESIGN, "account", "logout", env=env(), timeout=30)
     except UnknownAccount:
         db.execute("DELETE FROM account_status WHERE email = ?", email)   # déjà retiré du store
+        _forget_cert_expiry(email)
         raise
     if not res.ok:
         raise RuntimeError(f"plumesign account logout : {res.tail(2)}")
     db.execute("DELETE FROM account_status WHERE email = ?", email)
+    _forget_cert_expiry(email)
 
 
 async def select(email: str) -> None:
     async with _locked():
         await _switch(email)
+
+
+# ---------- équipes de développeur ----------
+
+_TEAM_ID = re.compile(r"^[A-Z0-9]{10}$")
+
+
+def parse_teams(output: str) -> list[dict]:
+    """Lignes JSON de « account teams --json » -> [{team_id, name, type, status, selected}]."""
+    teams = []
+    for line in (output or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict) and _TEAM_ID.match(str(item.get("team_id", ""))):
+            teams.append({"team_id": item["team_id"], "name": item.get("name") or item["team_id"],
+                          "type": item.get("type"), "status": item.get("status"),
+                          "selected": bool(item.get("selected"))})
+    return teams
+
+
+def env_team() -> str | None:
+    """Équipe imposée par PLUMESIGN_TEAM_ID (environnement du conteneur) : elle l'emporte sur le choix mémorisé."""
+    return os.environ.get("PLUMESIGN_TEAM_ID", "").strip() or None
+
+
+async def teams(email: str) -> list[dict]:
+    """Équipes de développeur du compte (appel Apple)."""
+    async with _locked(), _as(email):
+        e = env()
+        e["RUST_LOG"] = "warn"
+        # stdout et stderr ensemble : _failure classe la session expirée / l'anisette d'après le journal
+        # (stderr) ; parse_teams ignore les lignes qui ne sont pas du JSON.
+        res = await run(PLUMESIGN, "account", "teams", "--json", env=e, timeout=90)
+    if not res.ok:
+        raise _failure(email, "liste des équipes", res)
+    return parse_teams(res.output)
+
+
+async def set_team(email: str, team_id: str) -> None:
+    """Équipe utilisée pour signer : mémorisée par plumesign dans accounts.json."""
+    if not _TEAM_ID.match(team_id or ""):
+        raise ValueError("identifiant d'équipe invalide")
+    async with _locked(), _as(email):
+        res = await run(PLUMESIGN, "account", "set-team", team_id, env=env(), timeout=90)
+    if not res.ok:
+        raise _failure(email, "choix de l'équipe", res)
+    _forget_cert_expiry(email)   # le certificat dépend de l'équipe : la date affichée n'est plus la bonne
+    db.log(f"Équipe {team_id} choisie pour {email} : les prochaines signatures l'utilisent")
 
 
 # ---------- signature ----------
@@ -515,7 +625,8 @@ async def ensure_device(email: str, udid: str, name: str) -> None:
 
 async def sign(email: str, ipa: Path, out: Path) -> bool:
     """Signe ipa vers out (remplacé seulement en cas de succès).
-    Renvoie True si plumesign a dû révoquer un ancien certificat du compte."""
+    Renvoie True si plumesign a dû révoquer un certificat d'une autre application ou installation
+    (Xcode, SideStore, un autre tvsign) : les certificats morts ou ceux de cette installation ne comptent pas."""
     tmp = out.with_name(out.stem + ".tmp.ipa")
     tmp.unlink(missing_ok=True)
     try:
@@ -524,12 +635,16 @@ async def sign(email: str, ipa: Path, out: Path) -> bool:
             e["RUST_LOG"] = "warn"
             res = await run(PLUMESIGN, "sign", "-p", ipa, "--apple-id", "-o", tmp, env=e, timeout=600)
         if not res.ok or not tmp.exists():
+            sweep_stage()
             raise _failure(email, "signature", res)
         replace_retry(tmp, out)
     finally:
         tmp.unlink(missing_ok=True)
     _set_status(email, True, "session valide")
-    return "Revoked certificate" in res.output
+    expiry = cert_expiry(res.output)
+    if expiry:
+        settings.raw_set(_CERT_KEY + email, expiry)
+    return FOREIGN_REVOKED in res.output
 
 
 async def issued_cert_serials(email: str) -> set[str] | None:

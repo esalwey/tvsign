@@ -98,7 +98,9 @@ def _client_info(url: str) -> tuple[dict | None, str]:
     except Exception as e:  # noqa: BLE001
         return None, str(getattr(e, "reason", e))
     info = data.get("client_info") if isinstance(data, dict) else None
-    if not isinstance(info, str) or not info.strip():
+    agent = data.get("user_agent") if isinstance(data, dict) else None
+    # plumesign needs both: a bare HTTP answer does not prove that this is an anisette-v3 server
+    if not isinstance(info, str) or not info.strip() or not isinstance(agent, str) or not agent.strip():
         return None, "réponse inattendue (ce n'est pas un serveur anisette v3 ?)"
     return data, ""
 

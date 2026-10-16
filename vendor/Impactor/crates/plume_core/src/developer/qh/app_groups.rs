@@ -4,7 +4,7 @@ use serde::Deserialize;
 use crate::Error;
 
 use super::{DeveloperSession, QHResponseMeta};
-use crate::developer::strip_invalid_chars;
+use crate::developer::sanitize_app_name;
 use crate::developer_endpoint;
 
 impl DeveloperSession {
@@ -30,7 +30,7 @@ impl DeveloperSession {
 
         let mut body = Dictionary::new();
         body.insert("teamId".to_string(), Value::String(team_id.clone()));
-        body.insert("name".to_string(), Value::String(strip_invalid_chars(name)));
+        body.insert("name".to_string(), Value::String(sanitize_app_name(name, identifier)));
         body.insert("identifier".to_string(), Value::String(identifier.clone()));
 
         let response = self.qh_send_request(&endpoint, Some(body)).await?;

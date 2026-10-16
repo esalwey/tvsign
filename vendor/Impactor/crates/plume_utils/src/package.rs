@@ -26,6 +26,19 @@ impl Package {
         let out_package_file = stage_dir.join("stage.ipa");
 
         fs::create_dir_all(&stage_dir).ok();
+
+        // Un paquet illisible ne doit pas laisser sa copie dans le dossier temporaire.
+        Self::open_stage(package_file, stage_dir.clone(), out_package_file).map_err(|e| {
+            fs::remove_dir_all(&stage_dir).ok();
+            e
+        })
+    }
+
+    fn open_stage(
+        package_file: PathBuf,
+        stage_dir: PathBuf,
+        out_package_file: PathBuf,
+    ) -> Result<Self, Error> {
         fs::copy(&package_file, &out_package_file)?;
 
         let file = fs::File::open(&out_package_file)?;
@@ -229,6 +242,111 @@ impl Package {
 
     pub fn remove_package_stage(self) {
         fs::remove_dir_all(&self.stage_dir).ok();
+    }
+
+    /// Dossier de travail du paquet (copie de l'IPA et contenu extrait).
+    pub fn stage_dir(&self) -> &PathBuf {
+        &self.stage_dir
+    }
+
+    /// Garde qui supprime le dossier de travail quand elle est lachee, sur tous les chemins de sortie
+    /// (erreur comprise). `Package` reste `Clone` et sans `Drop` : l'interface graphique en garde des copies.
+    pub fn stage_guard(&self) -> StageGuard {
+        StageGuard {
+            dir: self.stage_dir.clone(),
+        }
+    }
+}
+
+/// Supprime un dossier `plume_stage_*` a la fin de la portee.
+#[derive(Debug)]
+pub struct StageGuard {
+    dir: PathBuf,
+}
+
+impl Drop for StageGuard {
+    fn drop(&mut self) {
+        // Meme convention que le chemin de succes : PLUME_DELETE_AFTER_FINISHED garde le dossier (debogage).
+        if env::var("PLUME_DELETE_AFTER_FINISHED").is_err() {
+            fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+}
+
+/// Supprime les dossiers `plume_stage_*` du dossier temporaire plus vieux que `max_age`
+/// (processus tue avant son nettoyage). Renvoie le nombre de dossiers supprimes.
+pub fn sweep_stale_stages(max_age: std::time::Duration) -> usize {
+    sweep_stale_stages_in(&env::temp_dir(), max_age)
+}
+
+fn sweep_stale_stages_in(dir: &std::path::Path, max_age: std::time::Duration) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("plume_stage_") {
+            continue;
+        }
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let old_enough = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= max_age);
+        if old_enough && fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn temp_root() -> PathBuf {
+        let root = env::temp_dir().join(format!("plume-pkg-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn guard_removes_the_stage_on_drop() {
+        let root = temp_root();
+        let stage = root.join("plume_stage_X");
+        fs::create_dir_all(stage.join("Payload")).unwrap();
+        {
+            let _guard = StageGuard { dir: stage.clone() };
+            assert!(stage.exists());
+        }
+        assert!(!stage.exists());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn sweep_removes_only_old_stage_directories() {
+        let root = temp_root();
+        let stage = root.join("plume_stage_OLD");
+        let other = root.join("something_else");
+        fs::create_dir_all(&stage).unwrap();
+        fs::create_dir_all(&other).unwrap();
+
+        // Trop recent : on n'y touche pas (un autre plumesign peut encore s'en servir).
+        assert_eq!(sweep_stale_stages_in(&root, Duration::from_secs(3600)), 0);
+        assert!(stage.exists());
+
+        // Age nul : tout dossier plume_stage_* est supprime, le reste est intact.
+        assert_eq!(sweep_stale_stages_in(&root, Duration::ZERO), 1);
+        assert!(!stage.exists());
+        assert!(other.exists());
+        fs::remove_dir_all(&root).ok();
     }
 }
 

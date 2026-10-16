@@ -37,3 +37,55 @@ pub enum Commands {
     #[command(hide = true)]
     ProbeGsa(probe::ProbeArgs),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Détecte au test (pas en production) les options en double, comme deux `-t` dans `sign`.
+    /// `device` n'est pas vérifié : son option `--mac` n'existe que sous macOS alors que `--udid`
+    /// la cite toujours (défaut d'origine, sans effet en version release).
+    #[test]
+    fn command_line_definition_is_consistent() {
+        for name in ["sign", "account", "pair"] {
+            Cli::command()
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("no {name} command"))
+                .clone()
+                .debug_assert();
+        }
+    }
+
+    #[test]
+    fn new_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "plumesign",
+            "sign",
+            "-p",
+            "a.ipa",
+            "--apple-id",
+            "--team",
+            "ABCDE12345",
+            "--revoke",
+            "never",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Sign(args) => {
+                assert_eq!(args.team_id.as_deref(), Some("ABCDE12345"));
+                assert_eq!(args.revoke.as_deref(), Some("never"));
+            }
+            _ => panic!("expected sign"),
+        }
+
+        let cli = Cli::try_parse_from(["plumesign", "pair", "--ip", "fe80::1%12", "--port", "49152"]).unwrap();
+        match cli.command {
+            Commands::Pair(args) => assert_eq!(args.ip.unwrap().scope_id, 12),
+            _ => panic!("expected pair"),
+        }
+        assert!(Cli::try_parse_from(["plumesign", "pair", "--ip", "fe80::1%eth0", "--port", "1"]).is_err());
+        assert!(Cli::try_parse_from(["plumesign", "account", "set-team", "ABCDE12345"]).is_ok());
+        assert!(Cli::try_parse_from(["plumesign", "account", "teams", "--json"]).is_ok());
+    }
+}

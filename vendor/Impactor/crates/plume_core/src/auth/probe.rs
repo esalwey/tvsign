@@ -143,6 +143,7 @@ pub async fn probe_gsa_init(
         config: AnisetteConfiguration::default(),
         user_agent: user_agent.clone(),
         fresh_identity: provider.identity_is_new(),
+        refresh_failed_at: None,
     };
 
     let mut report = ProbeReport {

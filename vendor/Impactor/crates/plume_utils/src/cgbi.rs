@@ -17,6 +17,10 @@ use flate2::read::DeflateDecoder;
 use flate2::write::ZlibEncoder;
 use std::io::{Read, Write};
 
+/// Cote maximale acceptee pour une icone, et taille maximale des pixels decompresses (64 Mio).
+const MAX_DIMENSION: u32 = 16_384;
+const MAX_DECODED_BYTES: u64 = 64 * 1024 * 1024;
+
 const PNG_SIG: &[u8] = &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
 /// Normalises a PNG buffer. Returns a standard PNG on success, otherwise returns
@@ -53,13 +57,23 @@ fn normalize_impl(data: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
 
+    // Un PNG forge ne doit ni diviser par zero ni gonfler sans limite : dimensions bornees,
+    // arithmetique verifiee, et on ne decompresse jamais plus que la taille attendue.
+    if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return None;
+    }
+    let stride = (width as usize).checked_mul(4)?;
+    let expected = (height as usize).checked_mul(stride.checked_add(1)?)?;
+    if expected as u64 > MAX_DECODED_BYTES {
+        return None;
+    }
+
     // Decompress raw Deflate (CgBI removes the zlib header/trailer).
-    let mut dec = DeflateDecoder::new(raw_idat.as_slice());
+    let mut dec = DeflateDecoder::new(raw_idat.as_slice()).take(expected as u64);
     let mut filtered = Vec::new();
     dec.read_to_end(&mut filtered).ok()?;
 
-    let stride = width as usize * 4;
-    if filtered.len() < height as usize * (1 + stride) {
+    if filtered.len() < expected {
         return None;
     }
 
@@ -181,6 +195,9 @@ fn unfilter_and_fix_pixels(
 }
 
 fn recompress(pixels: &[u8], stride: usize) -> Option<Vec<u8>> {
+    if stride == 0 {
+        return None;
+    }
     let mut buf = Vec::with_capacity(pixels.len() + pixels.len() / stride);
     for row in pixels.chunks(stride) {
         buf.push(0); // filter type: None
@@ -289,4 +306,57 @@ fn crc32(name: &[u8], data: &[u8]) -> u32 {
         crc = TABLE[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
     }
     crc ^ 0xFFFF_FFFF
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PNG CgBI minimal : signature, CgBI, IHDR (largeur/hauteur donnees, RGBA 8 bits), IDAT, IEND.
+    fn cgbi_png(width: u32, height: u32, idat: &[u8]) -> Vec<u8> {
+        let mut out = PNG_SIG.to_vec();
+        write_chunk(&mut out, b"CgBI", &[0, 0, 0, 0]);
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        write_chunk(&mut out, b"IHDR", &ihdr);
+        write_chunk(&mut out, b"IDAT", idat);
+        write_chunk(&mut out, b"IEND", &[]);
+        out
+    }
+
+    fn deflate(data: &[u8]) -> Vec<u8> {
+        let mut enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn zero_width_png_is_left_unchanged_instead_of_panicking() {
+        let png = cgbi_png(0, 4, &deflate(&[0, 0, 0, 0]));
+        assert_eq!(normalize(png.clone()), png);
+    }
+
+    #[test]
+    fn zero_height_png_is_left_unchanged() {
+        let png = cgbi_png(4, 0, &deflate(&[0]));
+        assert_eq!(normalize(png.clone()), png);
+    }
+
+    #[test]
+    fn huge_dimensions_are_rejected_without_allocating() {
+        let png = cgbi_png(u32::MAX, u32::MAX, &deflate(&[0; 16]));
+        assert_eq!(normalize(png.clone()), png);
+    }
+
+    #[test]
+    fn a_valid_cgbi_png_is_converted() {
+        // 1x1 pixel BGRA opaque : filtre 0 puis B G R A.
+        let png = cgbi_png(1, 1, &deflate(&[0, 10, 20, 30, 255]));
+        let out = normalize(png.clone());
+        assert_ne!(out, png);
+        assert!(!is_cgbi(&out));
+    }
 }

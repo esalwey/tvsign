@@ -81,9 +81,12 @@ function relatif(ts, now) {
 // ---------- erreurs en clair ----------
 // Chaque cause connue (messages du serveur et de plumesign) : un titre lisible et ce que l'utilisateur peut faire.
 const CAUSES = [
+  // Ces deux messages listent des numéros de série et des noms d'équipe : à tester avant les motifs génériques.
+  [/CERT_LIMIT/, "c_certlimit"],
+  [/NO_TEAM|MULTIPLE_TEAMS|TEAM_NOT_FOUND/, "c_team"],
+  [/arrêté par le système|killed by the system/i, "c_oom"],
   [/ntfy/i, "c_ntfy"],
   [/8220|no devices from which/i, "c_8220"],
-  [/NO_TEAM|MULTIPLE_TEAMS/, "c_team"],
   [/ancienne version de tvsign/i, "c_legacy"],
   [/appairage perdu|PAIRING_LOST|pairing record|not paired|No stored pairing/i, "c_lost"],
   [/aucune Apple TV/i, "c_no_tv"],
@@ -153,7 +156,7 @@ function flash(ton, titre, texte = "") {
 
 // ---------- rendu sans perte de focus ----------
 const CLES = ["data-renew", "data-toggle", "data-edit", "data-del-app", "data-refresh-dev", "data-del-dev", "data-check",
-  "data-select", "data-relogin", "data-logout", "data-open", "data-key"];
+  "data-select", "data-relogin", "data-logout", "data-team", "data-open", "data-key"];
 function cleDe(el) {
   if (!el?.getAttribute) return null;
   for (const a of CLES) if (el.hasAttribute(a)) return [a, el.getAttribute(a)];
@@ -272,6 +275,7 @@ function problemeApp(a, now) {
     ? `<button class="btn btn--petit" data-relogin="${esc(a.effective_account)}">${t("reconnect")}</button>`
     : e.cle === "c_no_account" ? `<button class="btn btn--petit" data-open="dlg-login" data-key="login-p-${a.id}">${t("connect")}</button>`
     : ["c_lost", "c_legacy"].includes(e.cle) ? `<button class="btn btn--petit" data-open="dlg-pair">${t("pair")}</button>`
+    : e.cle === "c_certlimit" ? `<a class="btn btn--petit" href="#/settings">${t("settings")}</a>`
     : ["c_no_tv", "c_source", "c_bundle", "c_digest"].includes(e.cle) ? `<button class="btn btn--petit" data-edit="${a.id}" data-key="edit-p-${a.id}">${t("settings")}</button>` : "";
   const details = e.brut && (e.brut.length > 110 || e.connu)
     ? `<details class="details" data-key="err-${a.id}"><summary>${t("tech_details")}</summary><pre class="log">${esc(nettoyer(e.brut) || e.brut)}</pre></details>` : "";
@@ -455,11 +459,12 @@ function renderAccounts(s, now) {
       <span class="row__icon row__icon--${a.ok === 0 ? "red" : a.ok === 1 ? "blue" : "gray"}">${ICONS.user}</span>
       <div class="row__label">
         <p class="row__title">${esc(a.email)}${a.selected ? `<small>${t("default_account")}</small>` : ""}</p>
-        <p class="row__sub">${etat}${a.team_id ? ` · ${t("team")} <span class="mono">${esc(a.team_id)}</span>` : ""} · ${esc(t("checked_when", { when: relatif(a.checked_at, now) }))}</p>
+        <p class="row__sub">${etat}${a.team_id ? ` · ${t("team")} <span class="mono">${esc(a.team_id)}</span>` : ""}${a.cert_expires ? ` · ${esc(t("cert_until", { date: a.cert_expires }))}` : ""} · ${esc(t("checked_when", { when: relatif(a.checked_at, now) }))}</p>
         ${note}
       </div>
       <div class="row__buttons">
         <button class="row__action" data-check="${esc(a.email)}">${t("check")}</button>
+        <button class="row__action" data-team="${esc(a.email)}">${t("team_button")}</button>
         ${a.selected ? "" : `<button class="row__action" data-select="${esc(a.email)}">${t("use_default")}</button>`}
         <button class="row__action ${a.ok === 0 ? "row__action--go" : ""}" data-relogin="${esc(a.email)}">${t("reconnect")}</button>
         <button class="row__action row__action--danger" data-logout="${esc(a.email)}">${t("remove")}</button>
@@ -590,6 +595,7 @@ document.addEventListener("click", async (ev) => {
     return;
   }
   if (d.edit) return openEdit(+d.edit);
+  if (d.team) return openTeam(d.team);
   if (!(d.renew || d.toggle || d.delApp || d.refreshDev || d.delDev || d.check || d.select || d.logout)) return;
   try {
     if (d.renew) {
@@ -654,6 +660,55 @@ function openDialog(id) {
   }
   document.getElementById(id).showModal();
 }
+
+// ---------- équipe de développeur d'un compte ----------
+let TEAM_EMAIL = null;
+async function openTeam(email) {
+  TEAM_EMAIL = email;
+  const box = $("#team-list"), err = $("#team-error"), ok = $("#team-submit");
+  err.textContent = "";
+  ok.disabled = true;
+  box.innerHTML = `<p class="statut"><span class="etat etat--cours">${t("team_loading")}</span></p>`;
+  $("#dlg-team").showModal();
+  try {
+    const r = await api(`/api/accounts/${encodeURIComponent(email)}/teams`);
+    if (TEAM_EMAIL !== email) return;
+    if (!r.teams.length) { box.innerHTML = `<div class="vide"><p>${t("team_none")}</p></div>`; return; }
+    // PLUMESIGN_TEAM_ID (environnement du conteneur) l'emporte sur le choix mémorisé : on le dit, on ne laisse pas choisir.
+    const verrou = !!r.env_team;
+    box.innerHTML = (verrou ? `<p class="group__footer">${esc(t("team_env_locked", { name: "PLUMESIGN_TEAM_ID" }))}</p>` : "") +
+      `<div class="list">${r.teams.map((x) => `
+      <label class="row row--choix">
+        <input type="radio" name="team" value="${esc(x.team_id)}" ${x.selected ? "checked" : ""} ${verrou ? "disabled" : ""}>
+        <span class="row__icon row__icon--blue">${ICONS.user}</span>
+        <span class="row__label"><span class="row__title">${esc(x.name)}</span>
+          <span class="row__sub mono">${esc(x.team_id)}${x.type ? " · " + esc(x.type) : ""}</span></span>
+      </label>`).join("")}</div>`;
+    ok.disabled = verrou;
+  } catch (e) {
+    box.innerHTML = "";
+    const c = enClair(e.message);
+    err.textContent = c.connu ? `${c.titre}. ${c.conseil}` : c.titre;
+  }
+}
+$("#form-team").addEventListener("submit", async (ev) => {
+  if (ev.submitter && ev.submitter.value !== "ok") return;
+  ev.preventDefault();
+  const choix = $('input[name="team"]:checked', ev.target), err = $("#team-error"), btn = $("#team-submit");
+  if (!choix || !TEAM_EMAIL) return;
+  btn.disabled = true;
+  try {
+    await api(`/api/accounts/${encodeURIComponent(TEAM_EMAIL)}/team`, { json: { team_id: choix.value } });
+    ev.target.closest("dialog").close();
+    flash("ok", t("team_saved_t"), " " + t("team_saved"));
+  } catch (e) {
+    const c = enClair(e.message);
+    err.textContent = c.connu ? `${c.titre}. ${c.conseil}` : c.titre;
+  } finally {
+    btn.disabled = false;
+    refresh();
+  }
+});
 
 // ---------- ajout d'app ----------
 let PRESETS = null;

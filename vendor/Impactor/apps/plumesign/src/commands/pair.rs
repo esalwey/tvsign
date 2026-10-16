@@ -1,5 +1,5 @@
 use std::io::{BufRead, Write};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -20,9 +20,10 @@ const DEFAULT_HOST: &str = "plume";
 pub struct PairArgs {
     #[command(subcommand)]
     pub command: Option<PairCommands>,
-    /// IP address of the device to pair with
-    #[arg(long = "ip", value_name = "IP", requires = "port")]
-    pub ip: Option<IpAddr>,
+    /// IP address of the device to pair with. A link-local IPv6 address needs its interface
+    /// index: fe80::1%12 (as printed by `pair discover`).
+    #[arg(long = "ip", value_name = "IP", requires = "port", value_parser = parse_scoped_ip)]
+    pub ip: Option<ScopedIp>,
     /// Port the device advertises its pairing service on
     #[arg(long = "port", value_name = "PORT", requires = "ip")]
     pub port: Option<u16>,
@@ -58,7 +59,8 @@ pub enum PairCommands {
     Apps(AppsArgs),
     /// List the processes running on a paired device, with their bundle ID when known
     Processes(ProcessesArgs),
-    /// Tell whether an app is running on a paired device (exit 0 running, 4 not running)
+    /// Tell whether an app has a main process on a paired device (exit 0 yes, 4 no). tvOS keeps
+    /// suspended apps resident, so this does not mean the app is open in the foreground.
     Running(RunningArgs),
 }
 
@@ -75,6 +77,53 @@ pub mod exit_code {
     pub const NOT_RUNNING: i32 = 4;
     /// The device exposes no service able to list processes.
     pub const UNSUPPORTED: i32 = 5;
+    /// `pair`: no PIN was given (stdin closed, empty or timed out); nothing reached the device.
+    pub const CANCELLED: i32 = 6;
+}
+
+/// An IP address that may carry an IPv6 scope id (`fe80::1%12`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScopedIp {
+    pub ip: IpAddr,
+    pub scope_id: u32,
+}
+
+impl ScopedIp {
+    fn socket_addr(self, port: u16) -> SocketAddr {
+        match self.ip {
+            IpAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(v6, port, 0, self.scope_id)),
+            ip => SocketAddr::new(ip, port),
+        }
+    }
+}
+
+/// `192.168.1.5`, `2001:db8::1`, or `fe80::1%12` (numeric interface index).
+fn parse_scoped_ip(value: &str) -> std::result::Result<ScopedIp, String> {
+    let value = value.trim();
+    let Some((addr, scope)) = value.split_once('%') else {
+        return value
+            .parse::<IpAddr>()
+            .map(|ip| ScopedIp { ip, scope_id: 0 })
+            .map_err(|e| format!("invalid IP address: {e}"));
+    };
+    let ip: Ipv6Addr = addr
+        .parse()
+        .map_err(|e| format!("a scope id is only valid on an IPv6 address: {e}"))?;
+    let scope_id: u32 = scope.parse().map_err(|_| {
+        format!("the scope after % must be the numeric interface index (e.g. {addr}%12), got {scope:?}")
+    })?;
+    Ok(ScopedIp {
+        ip: IpAddr::V6(ip),
+        scope_id,
+    })
+}
+
+/// Address as `pair --ip` expects it: the interface index is kept for IPv6 link-local addresses.
+fn format_scoped(address: &SocketAddr) -> String {
+    match address {
+        SocketAddr::V6(v6) if v6.scope_id() != 0 => format!("{}%{}", v6.ip(), v6.scope_id()),
+        other => other.ip().to_string(),
+    }
 }
 
 #[derive(Debug, Args)]
@@ -223,7 +272,7 @@ async fn run_pair(store: &PairingStore, args: PairArgs) -> Result<()> {
     let (Some(ip), Some(port)) = (args.ip, args.port) else {
         bail!("--ip and --port are required to pair; run `plumesign pair discover` to find them");
     };
-    let address = SocketAddr::new(ip, port);
+    let address = ip.socket_addr(port);
 
     log::info!("Pairing with {address} as {:?}", args.host);
 
@@ -231,7 +280,8 @@ async fn run_pair(store: &PairingStore, args: PairArgs) -> Result<()> {
         let pin = args.pin.clone();
         async move {
             match pin {
-                Some(pin) => pin,
+                // Un PIN vide ne part jamais vers la TV : ce serait une tentative ratee de plus.
+                Some(pin) => normalize_pin(&pin).unwrap_or_else(|| cancel_pin("empty PIN")),
                 None => read_pin(),
             }
         }
@@ -641,8 +691,17 @@ struct RunningProcess {
     pid: u64,
     name: Option<String>,
     path: Option<String>,
+    /// Bundle id of the app whose MAIN executable this is (None for extensions and daemons).
     bundle_id: Option<String>,
+    /// `app` (main executable), `extension` (a helper inside an app bundle: Top Shelf, XPC...) or `other`.
+    kind: &'static str,
+    /// For an extension, the bundle id of the app that contains it.
+    parent_bundle_id: Option<String>,
 }
+
+/// Largest os_trace PidList reply accepted (the device chooses the length), and how long to wait for it.
+const OS_TRACE_MAX_REPLY: usize = 16 * 1024 * 1024;
+const OS_TRACE_TIMEOUT: Duration = Duration::from_secs(30);
 
 const APP_SERVICE: &str = "com.apple.coredevice.appservice";
 const OS_TRACE_SERVICE: &str = "com.apple.os_trace_relay.shim.remote";
@@ -678,13 +737,31 @@ fn normalize_path(path: &str) -> String {
     path.trim_end_matches('/').to_string()
 }
 
-fn match_by_path<'a>(apps: &'a [InstalledApp], executable: &str) -> Option<&'a InstalledApp> {
+/// App whose bundle directory contains `executable`, and whether that executable is the app's own
+/// main binary (`<bundle>/<CFBundleExecutable>`) rather than an extension or helper inside it.
+fn classify_by_path<'a>(
+    apps: &'a [InstalledApp],
+    executable: &str,
+) -> Option<(&'a InstalledApp, bool)> {
     let executable = normalize_path(executable);
-    apps.iter().find(|app| {
-        app.path
-            .as_deref()
-            .is_some_and(|p| executable.starts_with(&(normalize_path(p) + "/")))
+    apps.iter().find_map(|app| {
+        let bundle = normalize_path(app.path.as_deref()?);
+        let relative = executable.strip_prefix(&(bundle + "/"))?;
+        let is_main = match app.executable.as_deref() {
+            Some(main) => relative == main,
+            // Executable inconnu : on ne retient que ce qui est a la racine du bundle.
+            None => !relative.contains('/'),
+        };
+        Some((app, is_main))
     })
+}
+
+/// The app whose MAIN executable is `executable`.
+#[cfg(test)]
+fn match_by_path<'a>(apps: &'a [InstalledApp], executable: &str) -> Option<&'a InstalledApp> {
+    classify_by_path(apps, executable)
+        .filter(|(_, is_main)| *is_main)
+        .map(|(app, _)| app)
 }
 
 fn match_by_name<'a>(apps: &'a [InstalledApp], name: &str) -> Option<&'a InstalledApp> {
@@ -718,16 +795,25 @@ async fn list_processes(
                         .into_iter()
                         .map(|token| {
                             let path = token.executable_url.map(|u| u.relative);
-                            let app = path.as_deref().and_then(|p| match_by_path(&apps, p));
+                            let class = path.as_deref().and_then(|p| classify_by_path(&apps, p));
                             let name = path
                                 .as_deref()
                                 .and_then(|p| p.rsplit('/').next())
                                 .map(str::to_string);
+                            let (bundle_id, kind, parent_bundle_id) = match class {
+                                Some((app, true)) => (Some(app.bundle_id.clone()), "app", None),
+                                Some((app, false)) => {
+                                    (None, "extension", Some(app.bundle_id.clone()))
+                                }
+                                None => (None, "other", None),
+                            };
                             RunningProcess {
                                 pid: token.pid as u64,
-                                bundle_id: app.map(|a| a.bundle_id.clone()),
+                                bundle_id,
                                 name,
                                 path: path.map(|p| normalize_path(&p)),
+                                kind,
+                                parent_bundle_id,
                             }
                         })
                         .collect();
@@ -749,6 +835,8 @@ async fn list_processes(
                     pid,
                     bundle_id: app.map(|a| a.bundle_id.clone()),
                     path: app.and_then(|a| a.path.clone()),
+                    kind: if app.is_some() { "app" } else { "other" },
+                    parent_bundle_id: None,
                     name,
                 }
             })
@@ -787,11 +875,22 @@ async fn os_trace_pid_list(connection: &mut RsdConnection) -> Result<Vec<(u64, O
     message.extend_from_slice(&request);
     client.idevice.send_raw(&message).await?;
 
-    // One status byte, then a length-prefixed plist.
-    client.idevice.read_raw(1).await?;
-    let len = client.idevice.read_raw(4).await?;
-    let len = u32::from_be_bytes([len[0], len[1], len[2], len[3]]) as usize;
-    let body = client.idevice.read_raw(len).await?;
+    // One status byte (1 = success), then a length-prefixed plist. The device controls both: check
+    // the status, cap the length, bound the wait, and report "unsupported" rather than aborting.
+    let body = tokio::time::timeout(OS_TRACE_TIMEOUT, async {
+        let status = client.idevice.read_raw(1).await?;
+        if status.first() != Some(&1) {
+            return Err(anyhow::Error::from(ProcessListUnsupported));
+        }
+        let len = client.idevice.read_raw(4).await?;
+        let len = u32::from_be_bytes([len[0], len[1], len[2], len[3]]) as usize;
+        if len == 0 || len > OS_TRACE_MAX_REPLY {
+            return Err(anyhow::Error::from(ProcessListUnsupported));
+        }
+        Ok(client.idevice.read_raw(len).await?)
+    })
+    .await
+    .map_err(|_| anyhow::Error::from(ProcessListUnsupported))??;
     let response: plist::Dictionary = plist::from_bytes(&body)?;
 
     let Some(payload) = response.get("Payload").and_then(|p| p.as_dictionary()) else {
@@ -831,6 +930,8 @@ async fn run_processes(store: &PairingStore, host: &str, args: ProcessesArgs) ->
                     "name": process.name,
                     "bundle_id": process.bundle_id,
                     "path": process.path,
+                    "kind": process.kind,
+                    "parent_bundle_id": process.parent_bundle_id,
                     "source": source,
                 })
             );
@@ -846,7 +947,8 @@ async fn run_processes(store: &PairingStore, host: &str, args: ProcessesArgs) ->
     Ok(())
 }
 
-/// Exit code OK when the app has a process on the device, NOT_RUNNING otherwise.
+/// Exit code OK when the app has a main process on the device (extensions such as Top Shelf do not
+/// count), NOT_RUNNING otherwise. A resident process is not proof the app is in the foreground.
 async fn run_running(store: &PairingStore, host: &str, args: RunningArgs) -> Result<i32> {
     let mut connection = connect(store, host, &args.target).await?;
     let (processes, source) = list_processes(&mut connection).await?;
@@ -945,7 +1047,7 @@ async fn run_discover(store: &PairingStore, args: DiscoverArgs) -> Result<()> {
                     "hostname": device.hostname,
                     "identifier": device.identifier,
                     "auth_tag": device.auth_tag,
-                    "ip": device.address.ip().to_string(),
+                    "ip": format_scoped(&device.address),
                     "port": device.address.port(),
                     "udid": known.as_ref().map(|record| record.udid.clone()),
                 })
@@ -958,7 +1060,7 @@ async fn run_discover(store: &PairingStore, args: DiscoverArgs) -> Result<()> {
             (ServiceKind::ManualPairing, None) => println!(
                 "{device} run: {} pair --ip {} --port {}",
                 invocation(),
-                device.address.ip(),
+                format_scoped(&device.address),
                 device.address.port()
             ),
             (ServiceKind::RemotePairing, None) => println!("{device} paired with another host"),
@@ -1019,13 +1121,42 @@ fn read_pin() -> String {
     flush_stdout();
     eprintln!("Enter the PIN shown on the device:");
 
-    let mut line = String::new();
-    if std::io::stdin().lock().read_line(&mut line).is_err() {
-        return String::new();
-    }
+    // Lecture dans un thread : sans reponse (le parent n'ecrit jamais), on abandonne au bout de
+    // PIN_TIMEOUT au lieu de bloquer indefiniment.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let read = std::io::stdin().lock().read_line(&mut line);
+        let _ = tx.send((read, line));
+    });
 
-    line.trim().to_string()
+    match rx.recv_timeout(PIN_TIMEOUT) {
+        // 0 octet lu = EOF : stdin ferme avant la saisie.
+        Ok((Ok(0), _)) => cancel_pin("stdin closed before a PIN was given"),
+        Ok((Ok(_), line)) => {
+            normalize_pin(&line).unwrap_or_else(|| cancel_pin("empty PIN"))
+        }
+        Ok((Err(e), _)) => cancel_pin(&format!("cannot read the PIN: {e}")),
+        Err(_) => cancel_pin("timed out waiting for the PIN"),
+    }
 }
+
+/// Le PIN affiche par la TV, sans espaces ; `None` s'il est vide.
+fn normalize_pin(raw: &str) -> Option<String> {
+    let pin = raw.trim();
+    (!pin.is_empty()).then(|| pin.to_string())
+}
+
+/// Un PIN vide envoye a la TV compte comme un essai rate (et peut la verrouiller) : on s'arrete
+/// avant qu'un seul octet ne parte, avec une ligne `ERROR CANCELLED` pour l'appelant.
+fn cancel_pin(reason: &str) -> ! {
+    println!("ERROR CANCELLED PIN not provided: {reason}");
+    flush_stdout();
+    std::process::exit(exit_code::CANCELLED)
+}
+
+/// Duree pendant laquelle la TV affiche son PIN.
+const PIN_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[cfg(test)]
 mod tests {
@@ -1073,5 +1204,84 @@ mod tests {
         assert!(match_by_path(&apps, "/private/var/containers/Bundle/Application/U/X.apps/X").is_none());
         assert!(match_by_name(&apps, "X").is_some());
         assert!(match_by_name(&apps, "Y").is_none());
+    }
+
+    #[test]
+    fn extensions_do_not_count_as_the_app() {
+        let apps = vec![InstalledApp {
+            bundle_id: "com.example.tv".into(),
+            path: Some("/private/var/containers/Bundle/Application/U/X.app".into()),
+            executable: Some("X".into()),
+            user: true,
+        }];
+        let base = "/private/var/containers/Bundle/Application/U/X.app";
+        // Le binaire principal.
+        assert!(match_by_path(&apps, &format!("{base}/X")).is_some());
+        // Top Shelf et autres extensions : rattaches a l'app, jamais pris pour elle.
+        let top_shelf = format!("{base}/PlugIns/TopShelf.appex/TopShelf");
+        assert!(match_by_path(&apps, &top_shelf).is_none());
+        let (app, is_main) = classify_by_path(&apps, &top_shelf).unwrap();
+        assert_eq!(app.bundle_id, "com.example.tv");
+        assert!(!is_main);
+        assert!(match_by_path(&apps, &format!("{base}/XPCServices/H.xpc/H")).is_none());
+        // Autre binaire a la racine du bundle (assistant) : pas l'app non plus.
+        assert!(match_by_path(&apps, &format!("{base}/helper")).is_none());
+    }
+
+    #[test]
+    fn executable_unknown_only_matches_the_bundle_root() {
+        let apps = vec![InstalledApp {
+            bundle_id: "com.example.tv".into(),
+            path: Some("/var/containers/Bundle/Application/U/X.app".into()),
+            executable: None,
+            user: true,
+        }];
+        assert!(match_by_path(&apps, "/var/containers/Bundle/Application/U/X.app/X").is_some());
+        assert!(
+            match_by_path(&apps, "/var/containers/Bundle/Application/U/X.app/PlugIns/T.appex/T")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn scoped_ip_parsing() {
+        let plain = parse_scoped_ip("192.168.1.5").unwrap();
+        assert_eq!(plain.scope_id, 0);
+        assert_eq!(plain.socket_addr(49152).to_string(), "192.168.1.5:49152");
+
+        let scoped = parse_scoped_ip("fe80::1%12").unwrap();
+        assert_eq!(scoped.scope_id, 12);
+        match scoped.socket_addr(49152) {
+            SocketAddr::V6(v6) => {
+                assert_eq!(v6.scope_id(), 12);
+                assert_eq!(v6.port(), 49152);
+            }
+            _ => panic!("expected IPv6"),
+        }
+
+        assert!(parse_scoped_ip("fe80::1%eth0").is_err());
+        assert!(parse_scoped_ip("192.168.1.5%12").is_err());
+        assert!(parse_scoped_ip("nope").is_err());
+        assert_eq!(parse_scoped_ip("2001:db8::1").unwrap().scope_id, 0);
+    }
+
+    #[test]
+    fn discover_output_keeps_the_scope_id() {
+        let v6 = SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 49152, 0, 12));
+        assert_eq!(format_scoped(&v6), "fe80::1%12");
+        let global: SocketAddr = "[2001:db8::1]:49152".parse().unwrap();
+        assert_eq!(format_scoped(&global), "2001:db8::1");
+        let v4: SocketAddr = "192.168.1.5:49152".parse().unwrap();
+        assert_eq!(format_scoped(&v4), "192.168.1.5");
+        // Ce que discover imprime se relit tel quel avec --ip.
+        let back = parse_scoped_ip(&format_scoped(&v6)).unwrap();
+        assert_eq!(back.socket_addr(49152), v6);
+    }
+
+    #[test]
+    fn an_empty_pin_is_never_sent() {
+        assert_eq!(normalize_pin(" 1234\n"), Some("1234".to_string()));
+        assert_eq!(normalize_pin("   \n"), None);
+        assert_eq!(normalize_pin(""), None);
     }
 }

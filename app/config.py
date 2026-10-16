@@ -4,6 +4,8 @@ User-facing settings (notifications, renewal window, anisette server, language) 
 app/settings.py: environment > database > default.
 """
 import os
+import re
+import secrets
 import shutil
 import sys
 from pathlib import Path
@@ -123,8 +125,34 @@ RENEW_TIMEOUT_MINUTES = max(float(_env("TVSIGN_RENEW_TIMEOUT_MINUTES", "60")), A
 SHUTDOWN_DRAIN_SECONDS = int(_env("TVSIGN_SHUTDOWN_DRAIN_SECONDS", "240"))
 # How long plumesign looks for an Apple TV on the network, in seconds.
 DEVICE_TIMEOUT = int(_env("TVSIGN_DEVICE_TIMEOUT", "10"))
-# Name presented to the Apple TV when pairing (kept per device afterwards).
-PAIR_HOST = _env("TVSIGN_PAIR_HOST", "tvsign")
 
 for d in (DATA_DIR, IPA_DIR, PLUME_HOME, TMP_DIR):
     d.mkdir(parents=True, exist_ok=True)
+
+
+def _pair_host() -> str:
+    """Name presented to the Apple TV when pairing (kept per device afterwards).
+
+    The TV derives the pairing identifier from it: two installs sharing a name would overwrite each
+    other's pairing. Default: tvsign-<8 hex> drawn once and kept in the data folder, so each install
+    shows up under its own name in the TV's Remotes and Devices list. TVSIGN_PAIR_HOST forces a name.
+    """
+    explicit = _env("TVSIGN_PAIR_HOST")
+    if explicit:
+        return explicit
+    path = DATA_DIR / "pair_host"
+    try:
+        stored = path.read_text(encoding="utf-8").strip()
+        if re.fullmatch(r"tvsign-[0-9a-f]{8}", stored):
+            return stored
+    except OSError:
+        pass
+    name = "tvsign-" + secrets.token_hex(4)
+    try:
+        path.write_text(name + "\n", encoding="utf-8")
+    except OSError:
+        return "tvsign"        # dossier en lecture seule : ancien nom fixe plutôt qu'un nom qui change à chaque lancement
+    return name
+
+
+PAIR_HOST = _pair_host()

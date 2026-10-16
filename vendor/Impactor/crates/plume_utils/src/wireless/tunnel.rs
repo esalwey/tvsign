@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use idevice::IdeviceError;
+use idevice::remote_pairing::errors::RemotePairingError;
 use idevice::remote_pairing::{
     RemotePairingClient, RpPairingFile, RpPairingSocket, connect_tls_psk_tunnel_native,
 };
@@ -55,17 +56,16 @@ pub async fn locate(
         return Err(Error::PairingNotFound(identifier.to_string()));
     }
 
-    let wanted_udid = records
+    let wanted_record = records
         .iter()
-        .find(|record| record.udid.eq_ignore_ascii_case(identifier))
-        .map(|record| record.udid.clone());
-    let wanted_name = records
-        .iter()
-        .find(|record| record.udid.eq_ignore_ascii_case(identifier))
-        .map(|record| record.name.clone());
-    // A device with our device's name whose tag none of our keys produce: probably our device,
-    // which forgot this host. Only reported if the real one never shows up before the deadline.
-    let mut seen_forgotten = false;
+        .find(|record| record.udid.eq_ignore_ascii_case(identifier));
+    let wanted_udid = wanted_record.map(|record| record.udid.clone());
+    let wanted_name = wanted_record.map(|record| record.name.clone());
+    // Identifiant mDNS memorise la derniere fois que l'appareil a ete vu : permet de reconnaitre
+    // son service meme quand l'appelant passe l'UDID d'appairage et que le tag ne correspond plus.
+    let stored_identifier = wanted_record.and_then(|record| record.service_identifier.clone());
+    // Services dont le tag ne correspond a aucune de nos cles (autre hote, ou appareil qui a oublie le notre).
+    let mut foreign: Vec<ForeignService> = Vec::new();
 
     let daemon = ServiceDaemon::new()?;
     let browse = daemon.browse(ServiceKind::RemotePairing.service_type())?;
@@ -91,7 +91,10 @@ pub async fn locate(
             continue;
         };
 
-        let mentioned = service_identifier.eq_ignore_ascii_case(identifier);
+        let mentioned = service_identifier.eq_ignore_ascii_case(identifier)
+            || stored_identifier
+                .as_deref()
+                .is_some_and(|stored| stored.eq_ignore_ascii_case(service_identifier));
 
         match store.find(service_identifier, auth_tag).await? {
             Some(record)
@@ -106,6 +109,14 @@ pub async fn locate(
                     record.udid,
                     device.address
                 );
+                if stored_identifier.as_deref() != Some(service_identifier.as_str()) {
+                    if let Err(e) = store
+                        .remember_identifier(&record.udid, service_identifier)
+                        .await
+                    {
+                        log::debug!("could not remember the advertised identifier: {e}");
+                    }
+                }
                 result = Ok(LocatedDevice {
                     record,
                     service_identifier: service_identifier.clone(),
@@ -119,17 +130,35 @@ pub async fn locate(
                 result = Err(Error::PairingNotAccepted);
                 break;
             }
-            None => {
-                if let (Some(wanted), Some(name)) = (&wanted_name, &device.name) {
-                    seen_forgotten |= wanted.eq_ignore_ascii_case(name);
-                }
-            }
+            None => foreign.push(ForeignService {
+                identifier: service_identifier.clone(),
+                name: device.name.clone(),
+            }),
             _ => {}
         }
     }
 
-    if seen_forgotten && matches!(result, Err(Error::DeviceNotFound(_))) {
-        result = Err(Error::PairingNotAccepted);
+    if matches!(result, Err(Error::DeviceNotFound(_))) {
+        match judge_foreign(wanted_name.as_deref(), &foreign) {
+            Verdict::Lost(name) => {
+                log::warn!(
+                    "the only device named {name:?} on the network no longer accepts this host's \
+                     keys: treating the pairing as lost (if it is another device with the same \
+                     name, pair this one again anyway)"
+                );
+                result = Err(Error::PairingNotAccepted);
+            }
+            Verdict::Ambiguous(name) => {
+                log::warn!(
+                    "several devices named {name:?} are on the network and none is paired with \
+                     this host; not treating the pairing as lost"
+                );
+                result = Err(Error::DeviceNotFound(format!(
+                    "{identifier} (other devices named {name:?} are visible but not paired with this host)"
+                )));
+            }
+            Verdict::Nothing => {}
+        }
     }
 
     if let Err(e) = daemon.shutdown() {
@@ -137,6 +166,51 @@ pub async fn locate(
     }
 
     result
+}
+
+/// A `_remotepairing._tcp` service whose `authTag` none of our keys produce.
+#[derive(Debug, Clone)]
+struct ForeignService {
+    identifier: String,
+    name: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Exactly one distinct device carries our device's name and rejects our keys: it forgot this host.
+    Lost(String),
+    /// Several distinct devices carry that name: impossible to know which one is ours.
+    Ambiguous(String),
+    Nothing,
+}
+
+/// Decides, once the device was never matched, whether the unmatched services prove the pairing lost.
+/// Le nom est librement modifiable (« Apple TV » par defaut), donc seul un nom porte par un seul
+/// identifiant distinct est retenu ; plusieurs identifiants donnent un simple indice.
+fn judge_foreign(wanted_name: Option<&str>, foreign: &[ForeignService]) -> Verdict {
+    let Some(wanted) = wanted_name else {
+        return Verdict::Nothing;
+    };
+    let mut ids: Vec<String> = Vec::new();
+    let mut shown = None;
+    for service in foreign {
+        let Some(name) = service.name.as_deref() else {
+            continue;
+        };
+        if !wanted.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        let id = service.identifier.to_ascii_lowercase();
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+        shown.get_or_insert_with(|| name.to_string());
+    }
+    match (ids.len(), shown) {
+        (1, Some(name)) => Verdict::Lost(name),
+        (n, Some(name)) if n > 1 => Verdict::Ambiguous(name),
+        _ => Verdict::Nothing,
+    }
 }
 
 /// Pair-verifies with `device` and opens a tunnel to its RSD service.
@@ -181,18 +255,12 @@ async fn open_tunnel(
 
     step(client.attempt_pair_verify()).await??;
     if let Err(e) = step(client.validate_pairing()).await? {
-        return Err(match e {
-            IdeviceError::Socket(io) => Error::Unreachable(io),
-            e => {
-                log::debug!("pair-verify rejected: {e}");
-                Error::PairingNotAccepted
-            }
-        });
+        return Err(classify_verify_error(e));
     }
 
     let tunnel_port = step(client.create_tcp_listener()).await??;
-    let tunnel_stream = step(tokio::net::TcpStream::connect(SocketAddr::new(
-        address.ip(),
+    let tunnel_stream = step(tokio::net::TcpStream::connect(tunnel_address(
+        address,
         tunnel_port,
     )))
     .await?
@@ -228,6 +296,35 @@ async fn open_tunnel(
     Ok((adapter, handshake))
 }
 
+/// Adresse du tunnel : celle de l'appareil avec un autre port. On part de `address` elle-meme pour que
+/// l'identifiant de portee d'une adresse IPv6 link-local (fe80::...) ne soit pas perdu.
+fn tunnel_address(address: SocketAddr, port: u16) -> SocketAddr {
+    let mut tunnel = address;
+    tunnel.set_port(port);
+    tunnel
+}
+
+/// Seul un refus explicite de l'appareil prouve que l'appairage est perdu. Une reponse inattendue
+/// (appareil qui se reveille, TLV tronque...) est une panne passagere, a reessayer plus tard.
+fn classify_verify_error(error: IdeviceError) -> Error {
+    match error {
+        IdeviceError::Socket(io) => Error::Unreachable(io),
+        IdeviceError::RemotePairing(
+            RemotePairingError::PairVerifyFailed | RemotePairingError::PairingRejected(_),
+        ) => {
+            log::debug!("pair-verify rejected by the device");
+            Error::PairingNotAccepted
+        }
+        other => {
+            log::debug!("pair-verify failed without a clear rejection: {other}");
+            Error::Unreachable(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("pair-verify answer not understood: {other}"),
+            ))
+        }
+    }
+}
+
 async fn step<F: std::future::Future>(future: F) -> Result<F::Output, Error> {
     tokio::time::timeout(STEP_TIMEOUT, future)
         .await
@@ -237,4 +334,104 @@ async fn step<F: std::future::Future>(future: F) -> Result<F::Output, Error> {
                 "device stopped responding",
             ))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv6Addr, SocketAddrV6};
+
+    #[test]
+    fn tunnel_address_keeps_the_ipv6_scope_id() {
+        let ll = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 1, 2, 3, 4),
+            49152,
+            0,
+            7,
+        ));
+        let tunnel = tunnel_address(ll, 50000);
+        match tunnel {
+            SocketAddr::V6(v6) => {
+                assert_eq!(v6.scope_id(), 7);
+                assert_eq!(v6.port(), 50000);
+            }
+            _ => panic!("expected an IPv6 address"),
+        }
+    }
+
+    #[test]
+    fn tunnel_address_replaces_the_port_for_ipv4() {
+        let v4: SocketAddr = "192.168.1.20:49152".parse().unwrap();
+        assert_eq!(tunnel_address(v4, 1234).to_string(), "192.168.1.20:1234");
+    }
+
+    fn foreign(identifier: &str, name: Option<&str>) -> ForeignService {
+        ForeignService {
+            identifier: identifier.into(),
+            name: name.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_single_same_name_device_rejecting_our_keys_means_pairing_lost() {
+        let seen = [
+            foreign("AAAA", Some("Salon")),
+            // The same service announced again (several interfaces) is still one device.
+            foreign("aaaa", Some("salon")),
+            foreign("BBBB", Some("Chambre")),
+        ];
+        assert_eq!(
+            judge_foreign(Some("Salon"), &seen),
+            Verdict::Lost("Salon".into())
+        );
+    }
+
+    #[test]
+    fn two_distinct_same_name_devices_are_only_a_hint() {
+        let seen = [
+            foreign("AAAA", Some("Apple TV")),
+            foreign("BBBB", Some("Apple TV")),
+        ];
+        assert_eq!(
+            judge_foreign(Some("Apple TV"), &seen),
+            Verdict::Ambiguous("Apple TV".into())
+        );
+    }
+
+    #[test]
+    fn no_same_name_device_or_unknown_name_is_not_a_verdict() {
+        let seen = [foreign("BBBB", Some("Chambre")), foreign("CCCC", None)];
+        assert_eq!(judge_foreign(Some("Salon"), &seen), Verdict::Nothing);
+        assert_eq!(judge_foreign(None, &seen), Verdict::Nothing);
+        assert_eq!(judge_foreign(Some("Salon"), &[]), Verdict::Nothing);
+    }
+
+    #[test]
+    fn only_an_explicit_rejection_means_pairing_lost() {
+        assert!(matches!(
+            classify_verify_error(RemotePairingError::PairVerifyFailed.into()),
+            Error::PairingNotAccepted
+        ));
+        assert!(matches!(
+            classify_verify_error(RemotePairingError::PairingRejected("no".into()).into()),
+            Error::PairingNotAccepted
+        ));
+    }
+
+    #[test]
+    fn unexpected_answers_are_retryable_not_pairing_lost() {
+        assert!(matches!(
+            classify_verify_error(IdeviceError::UnexpectedResponse("x".into())),
+            Error::Unreachable(_)
+        ));
+        assert!(matches!(
+            classify_verify_error(IdeviceError::NotEnoughBytes(32, 3)),
+            Error::Unreachable(_)
+        ));
+        let io = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+        assert!(matches!(
+            classify_verify_error(IdeviceError::Socket(io)),
+            Error::Unreachable(_)
+        ));
+    }
 }

@@ -13,6 +13,8 @@ pub struct PairingRecord {
     pub model: String,
     pub account_id: String,
     pub pairing_file_path: PathBuf,
+    /// `identifier` the device advertised over mDNS the last time it was located (absent until then).
+    pub service_identifier: Option<String>,
 }
 
 impl std::fmt::Display for PairingRecord {
@@ -57,7 +59,7 @@ impl PairingStore {
         let info_path = self.info_path(&device.udid)?;
 
         tokio::fs::create_dir_all(&self.dir).await?;
-        tokio::fs::write(&path, pairing_file.to_bytes()).await?;
+        write_atomic(&path, &pairing_file.to_bytes()).await?;
 
         let mut info = Dictionary::new();
         info.insert("udid".into(), Value::String(device.udid.clone()));
@@ -74,7 +76,7 @@ impl PairingStore {
 
         let mut buf = Vec::new();
         plist::to_writer_xml(&mut buf, &info)?;
-        tokio::fs::write(&info_path, buf).await?;
+        write_atomic(&info_path, &buf).await?;
 
         Ok(path)
     }
@@ -145,6 +147,26 @@ impl PairingStore {
         Ok(None)
     }
 
+    /// Remembers the identifier a located device advertises, in the sidecar. Lets a later `locate`
+    /// recognise the same service even when the caller passes the pairing UDID and none of our keys
+    /// produce its tag any more (the device forgot this host). Best effort: a missing sidecar is created.
+    pub async fn remember_identifier(&self, udid: &str, identifier: &str) -> Result<(), Error> {
+        let mut info = self.read_info(udid).await?.unwrap_or_default();
+        if info.get("service_identifier").and_then(Value::as_string) == Some(identifier) {
+            return Ok(());
+        }
+        info.insert(
+            "service_identifier".into(),
+            Value::String(identifier.to_string()),
+        );
+        if !info.contains_key("udid") {
+            info.insert("udid".into(), Value::String(udid.to_string()));
+        }
+        let mut buf = Vec::new();
+        plist::to_writer_xml(&mut buf, &info)?;
+        write_atomic(&self.info_path(udid)?, &buf).await
+    }
+
     pub async fn remove(&self, udid: &str) -> Result<bool, Error> {
         let removed = remove_if_present(&self.pairing_file_path(udid)?).await?;
         remove_if_present(&self.info_path(udid)?).await?;
@@ -167,6 +189,7 @@ impl PairingStore {
             name: field("name").unwrap_or_else(|| udid.to_string()),
             model: field("model").unwrap_or_else(|| "Unknown".to_string()),
             account_id: field("account_id").unwrap_or_default(),
+            service_identifier: field("service_identifier"),
             udid: udid.to_string(),
             pairing_file_path,
         })
@@ -180,6 +203,34 @@ impl PairingStore {
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// Ecrit dans un fichier voisin puis renomme : un kill ou une coupure de courant en pleine ecriture
+/// laisse l'ancien fichier intact (la cle d'appairage ne se regenere pas sans le PIN de la TV).
+/// Le fichier temporaire se termine par `.tmp`, jamais pris pour un appairage par `list()`.
+async fn write_atomic(path: &Path, data: &[u8]) -> Result<(), Error> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut tmp_name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+
+    let result = async {
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        file.write_all(data).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&tmp, path).await
+    }
+    .await;
+    if let Err(e) = result {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e.into());
+    }
+    Ok(())
 }
 
 async fn remove_if_present(path: &Path) -> Result<bool, Error> {
@@ -284,6 +335,71 @@ mod tests {
 
             tokio::fs::remove_dir_all(store.directory()).await.ok();
         });
+    }
+
+    #[test]
+    fn remembered_identifier_is_stored_in_the_sidecar_and_survives_listing() {
+        let store = temp_store();
+        let device = sample_device();
+        let mut pairing_file = RpPairingFile::generate("plume");
+        pairing_file.alt_irk = Some(ALT_IRK.to_vec());
+
+        block_on(async {
+            store.save(&device, &pairing_file).await.unwrap();
+            assert_eq!(store.list().await.unwrap()[0].service_identifier, None);
+
+            store
+                .remember_identifier(&device.udid, IDENTIFIER)
+                .await
+                .unwrap();
+            store
+                .remember_identifier(&device.udid, IDENTIFIER)
+                .await
+                .unwrap();
+            let record = &store.list().await.unwrap()[0];
+            assert_eq!(record.service_identifier.as_deref(), Some(IDENTIFIER));
+            assert_eq!(record.name, "Living Room");
+
+            tokio::fs::remove_dir_all(store.directory()).await.ok();
+        });
+    }
+
+    #[test]
+    fn saving_twice_replaces_the_file_and_leaves_no_temp_file() {
+        let store = temp_store();
+        let device = sample_device();
+        let mut pairing_file = RpPairingFile::generate("plume");
+        pairing_file.alt_irk = Some(ALT_IRK.to_vec());
+
+        block_on(async {
+            store.save(&device, &pairing_file).await.unwrap();
+            store.save(&device, &pairing_file).await.unwrap();
+
+            let mut names: Vec<String> = Vec::new();
+            let mut entries = tokio::fs::read_dir(store.directory()).await.unwrap();
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                names.push(entry.file_name().to_string_lossy().to_string());
+            }
+            names.sort();
+            assert_eq!(
+                names,
+                vec![
+                    "00008110-001A2B3C00000000.info.plist".to_string(),
+                    "00008110-001A2B3C00000000.plist".to_string(),
+                ]
+            );
+            assert_eq!(store.list().await.unwrap().len(), 1);
+
+            tokio::fs::remove_dir_all(store.directory()).await.ok();
+        });
+    }
+
+    #[test]
+    fn a_leftover_temp_file_is_not_a_pairing() {
+        assert_eq!(
+            pairing_file_udid(Path::new("/x/00008110-001A.plist.tmp")),
+            None
+        );
     }
 
     #[test]

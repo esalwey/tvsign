@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use omnisette::{AnisetteConfiguration, AnisetteError, AnisetteHeaders};
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -26,6 +26,9 @@ pub struct AnisetteData {
     /// The anisette identity was provisioned while these headers were produced: Apple has never
     /// seen it, its first GrandSlam request will be answered with hsc 434 (synchronize).
     pub fresh_identity: bool,
+    /// Last refresh given up after its tries: during `REFRESH_BACKOFF` the previous data are kept
+    /// instead of trying (and waiting) at every request to Apple.
+    pub(crate) refresh_failed_at: Option<Instant>,
 }
 
 /// The client info as the server reported it. Only a client identifier that GrandSlam blocks
@@ -48,6 +51,9 @@ fn header_value(value: &str) -> Result<HeaderValue, Error> {
     })
 }
 
+/// Pause apres un renouvellement abandonne.
+const REFRESH_BACKOFF: Duration = Duration::from_secs(30);
+
 impl AnisetteData {
     pub async fn new(config: AnisetteConfiguration) -> Result<Self, Error> {
         let mut b = AnisetteHeaders::get_anisette_headers_provider(config.clone())?;
@@ -63,6 +69,7 @@ impl AnisetteData {
             fresh_identity: b.provider.identity_is_new(),
             // the server that answered is the first one tried by the next refresh
             config: config.set_preferred_url_v3(b.provider.server_used()),
+            refresh_failed_at: None,
         })
     }
 
@@ -101,7 +108,55 @@ impl AnisetteData {
                 .unwrap_or_else(|| self.user_agent.clone()),
             fresh_identity: b.provider.identity_is_new(),
             config: self.config.clone().set_preferred_url_v3(b.provider.server_used()),
+            refresh_failed_at: None,
         })
+    }
+
+    /// Fetches the data again in place: three tries with a pause (a failover to the other server is
+    /// part of each try), then, when the previous data are still valid, they are kept instead of
+    /// failing in the middle of a sign or a 2FA wait. After an abandoned refresh no new attempt is made
+    /// for `REFRESH_BACKOFF` as long as the previous data are valid, so an outage does not add its
+    /// retries to every request to Apple. Data that are not valid any more are an error: Apple would
+    /// only refuse them. A server that cannot be used at all (not Windows) is not retried.
+    pub async fn refresh_in_place(&mut self) -> Result<(), Error> {
+        let backoff = self.in_backoff(Instant::now());
+        if backoff && self.is_valid() {
+            return Ok(());
+        }
+        let tries = if backoff { 1 } else { 3 };
+        let mut delay = Duration::from_secs(1);
+        let mut last = None;
+        for attempt in 1..=tries {
+            match self.refresh().await {
+                Ok(fresh) => {
+                    *self = fresh;
+                    return Ok(());
+                }
+                Err(e @ Error::Anisette(AnisetteError::UnsupportedServer(_))) => return Err(e),
+                Err(e) => {
+                    log::warn!("anisette refresh failed (attempt {attempt}/{tries}): {e}");
+                    last = Some(e);
+                    if attempt < tries {
+                        tokio::time::sleep(delay).await;
+                        delay *= 2;
+                    }
+                }
+            }
+        }
+        self.refresh_failed_at = Some(Instant::now());
+        match last {
+            Some(e) if !self.is_valid() => Err(e),
+            _ => {
+                log::warn!("anisette refresh abandoned, keeping the previous data");
+                Ok(())
+            }
+        }
+    }
+
+    /// A refresh has just been abandoned: no new try before `REFRESH_BACKOFF`.
+    fn in_backoff(&self, now: Instant) -> bool {
+        self.refresh_failed_at
+            .is_some_and(|failed| now.saturating_duration_since(failed) < REFRESH_BACKOFF)
     }
 
     pub fn generate_headers(
@@ -207,6 +262,7 @@ mod tests {
             config: AnisetteConfiguration::default(),
             user_agent: "akd/1.0 CFNetwork/808.1.4".to_string(),
             fresh_identity: false,
+            refresh_failed_at: None,
         }
     }
 
@@ -283,5 +339,20 @@ mod tests {
         assert!(!d.needs_refresh() && d.is_valid());
         d.generated_at = SystemTime::now() - std::time::Duration::from_secs(100);
         assert!(d.needs_refresh() && !d.is_valid());
+    }
+
+    #[test]
+    fn no_backoff_before_any_failure() {
+        assert!(!data(WINDOWS).in_backoff(Instant::now()));
+    }
+
+    #[test]
+    fn a_failed_refresh_pauses_new_attempts_for_a_while() {
+        let mut d = data(WINDOWS);
+        let failed = Instant::now();
+        d.refresh_failed_at = Some(failed);
+        assert!(d.in_backoff(failed + Duration::from_secs(5)));
+        assert!(d.in_backoff(failed + REFRESH_BACKOFF - Duration::from_secs(1)));
+        assert!(!d.in_backoff(failed + REFRESH_BACKOFF));
     }
 }
