@@ -4,9 +4,11 @@
 # Layout of dist\tvsign\:
 #   tvsign.exe          launcher (window + tray + backend)
 #   plumesign.exe       next to the exe: app/config.py looks for it there first
+#   vcruntime140.dll    the Visual C++ runtime DLLs plumesign.exe imports, copied next to it (see the end)
 #   _internal\          Python runtime, app\presets.json, web\, icons, version.txt
 import os
 import shutil
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_submodules
@@ -17,7 +19,7 @@ HERE = Path(SPECPATH).resolve()
 ROOT = HERE.parent                         # tvsign/ (app/, web/)
 ASSETS = HERE / "assets"
 PLUMESIGN = Path(os.environ.get("TVSIGN_PLUMESIGN_EXE")
-                 or ROOT.parent / "Impactor" / "target" / "release" / "plumesign.exe")
+                 or ROOT / "vendor" / "Impactor" / "target" / "release" / "plumesign.exe")
 VERSION = (HERE / "version.txt").read_text(encoding="utf-8-sig").strip()
 
 if not PLUMESIGN.is_file():
@@ -91,3 +93,13 @@ coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="tvsign")
 
 # plumesign.exe sits next to tvsign.exe (config.APP_DIR), outside _internal\
 shutil.copy2(PLUMESIGN, Path(DISTPATH) / "tvsign" / "plumesign.exe")
+
+# The loader searches plumesign.exe's own folder and System32, not _internal\ (PyInstaller registers that
+# folder for tvsign.exe only): without VCRUNTIME140.dll beside it, plumesign.exe does not start on a PC
+# that lacks the Visual C++ Redistributable. The DLLs it imports are copied from the runtime PyInstaller
+# collected (tools/pe_deps.py; CI checks the result with "pe_deps.py check").
+sys.path.insert(0, str(HERE / "tools"))
+import pe_deps  # noqa: E402
+
+_copied = pe_deps.place_runtime(Path(DISTPATH) / "tvsign" / "plumesign.exe", Path(DISTPATH) / "tvsign" / "_internal")
+print("plumesign.exe runtime DLLs placed next to it:", ", ".join(_copied) or "already there")

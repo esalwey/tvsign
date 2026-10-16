@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import auth, backup, db, devices, diag, ipa, notifier, plume, proc, renew, selfupdate, settings
-from .config import MAX_UPLOAD_MB, ROOT, SHUTDOWN_DRAIN_SECONDS, TMP_DIR, VERSION, WINDOWS
+from .config import EDITION, MAX_UPLOAD_MB, ROOT, SHUTDOWN_DRAIN_SECONDS, TMP_DIR, VERSION, WINDOWS
 from .proc import SESSIONS
 from .util import replace_retry
 
@@ -195,7 +195,7 @@ def auth_status(request: Request):
         "onboarded": settings.raw_get("onboarded") == "1",
         "language": settings.get("language"),
         # texte adapté à la machine : « windows » (application de bureau) ou « docker » (serveur, NAS)
-        "edition": "windows" if WINDOWS else "docker",
+        "edition": EDITION,
     }
 
 
@@ -375,6 +375,8 @@ def state():
         a["update_pending"] = renew.pending_update(a)               # IPA téléchargée, pas encore installée
         a["untracked_link"] = a["source_type"] == "url" and bool(a["source_tag"]) and not a["source_key"]
         a["tv_present"], a["tv_checked_at"] = tv_presence(a)
+        # niveau d'alerte (fail | 24h | 6h | expired | None), même règle que ntfy : voir renew.alert_state
+        a["alert"] = renew.alert_state(a, now)
     health = renew.health(now)
     devices_ = db.rows("SELECT * FROM devices ORDER BY name")
     for d in devices_:

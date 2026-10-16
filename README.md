@@ -27,7 +27,8 @@ Two editions share the same code:
 
 - **Self-host (this page):** a Docker container for an always-on Linux box: NAS, Raspberry Pi,
   home server.
-- **Windows desktop:** a small window app with a tray icon, for a PC that stays on.
+- **Windows desktop:** a small window app with a tray icon, for a PC that stays on. Install,
+  SmartScreen / Smart App Control, firewall and sleep: see the [Windows guide](windows/README-windows.md).
 
 Run one tvsign per Apple ID. Two instances on the same free account revoke each other's
 certificates.
@@ -202,7 +203,9 @@ progress finish before the container stops. Watchtower or Diun work but are opti
 
 tvsign looks once a day for a newer release of itself (one request to the GitHub API, nothing else
 is sent) and shows a dismissible banner with the right instruction for your edition. It never
-updates itself. Turn it off in Settings (“Check for tvsign updates”) or with `TVSIGN_UPDATE_CHECK=off`.
+updates itself. The Windows edition also shows a notification and a tray menu item. Turn it off in
+Settings (“Check for tvsign updates”) or with `TVSIGN_UPDATE_CHECK=off`; `TVSIGN_UPDATE_REPO` points it
+at a fork.
 
 ### Windows
 
@@ -485,7 +488,8 @@ Deux éditions, même code :
 - **Auto-hébergée (cette page)** : un conteneur Docker pour une machine Linux allumée en
   permanence : NAS, Raspberry Pi, serveur maison.
 - **Windows** : une petite application fenêtrée avec icône dans la zone de notification, pour un PC
-  qui reste allumé.
+  qui reste allumé. Installation, SmartScreen / Smart App Control, pare-feu et veille : voir le
+  [guide Windows](windows/README-windows.md).
 
 Un seul tvsign par Apple ID : deux instances sur le même compte gratuit révoquent mutuellement
 leurs certificats.
@@ -672,8 +676,10 @@ restent facultatifs.
 
 tvsign cherche une fois par jour s'il existe une version plus récente de lui-même (une requête à
 l'API GitHub, rien d'autre n'est envoyé) et affiche une bannière qu'on peut écarter, avec la bonne
-consigne pour votre édition. Il ne se met jamais à jour tout seul. Désactivable dans les Réglages
-(« Chercher les mises à jour de tvsign ») ou avec `TVSIGN_UPDATE_CHECK=off`.
+consigne pour votre édition. Il ne se met jamais à jour tout seul. L'édition Windows affiche aussi une
+notification et une entrée dans le menu de l'icône. Désactivable dans les Réglages
+(« Chercher les mises à jour de tvsign ») ou avec `TVSIGN_UPDATE_CHECK=off` ; `TVSIGN_UPDATE_REPO`
+vise un fork.
 
 ### Windows
 

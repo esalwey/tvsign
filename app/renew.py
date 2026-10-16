@@ -9,7 +9,7 @@ import time
 
 from . import backup, db, devices, ipa, notifier, plume, proc, selfupdate, settings, util
 from .config import (ACCOUNT_CHECK_HOURS, APP_WAIT_MINUTES, APPLE_BACKOFF_MINUTES, CHECK_INTERVAL, IPA_DIR,
-                     RELEASE_CHECK_MINUTES, RENEW_TIMEOUT_MINUTES, RETRY_MINUTES, UPDATE_WAIT_MINUTES)
+                     RELEASE_CHECK_MINUTES, RENEW_TIMEOUT_MINUTES, RETRY_MINUTES, UPDATE_WAIT_MINUTES, WINDOWS)
 
 # Arrêt du service en cours : plus aucun renouvellement ne démarre, ceux en cours peuvent finir.
 STOPPING = False
@@ -89,6 +89,28 @@ def _level(app: dict, now: float) -> str:
     if left < 24 * 3600:
         return "24h"
     return "fail"
+
+
+def quiet_failure(app: dict) -> bool:
+    """Échec banal loin de l'expiration (panne passagère : TV en veille, réseau, anisette ; ou session Apple à
+    rouvrir, signalée par l'alerte de compte) : la nature enregistrée par failure_fields() décide, comme pour
+    quiet_fail dans le gestionnaire d'échec."""
+    return app.get("fail_kind") == "transient" or app.get("needs_action") == "session"
+
+
+def alert_state(app: dict, now: float) -> str | None:
+    """Niveau d'alerte à montrer à l'utilisateur (fail, 24h, 6h, expired) ou None. Même règle que les
+    notifications ntfy (alert) : un échec banal loin de l'expiration n'est pas une alerte. Exposé dans
+    /api/state pour les notifications de l'icône Windows, qui ne doivent pas être plus bavardes que ntfy."""
+    exp = app.get("expires_at")
+    if exp and exp <= now:
+        return "expired"
+    if app.get("status") != "error":
+        return None
+    lvl = _level(app, now)
+    if lvl == "fail" and quiet_failure(app):
+        return None
+    return lvl
 
 
 async def alert(app: dict, reason: str, now: float, quiet_fail: bool = False) -> None:
@@ -1276,6 +1298,30 @@ def _log_quietly(message: str, level: str = "error", app_id: int | None = None) 
         db.log(message, level, app_id=app_id)
     except Exception as e:  # noqa: BLE001
         print(f"[{level}] {message} (journal indisponible : {e})", flush=True)
+def suspended_for(expected_at: float | None, now: float, tolerance: float = 180.0) -> float:
+    """Secondes de retard d'un passage de la boucle sur l'heure prévue (0 si dans la tolérance) : l'horloge murale
+    a avancé sans que la boucle tourne, donc le PC était en veille ou hibernation, ou le processus arrêté."""
+    if not expected_at:
+        return 0.0
+    late = now - expected_at
+    return late if late > tolerance else 0.0
+
+
+def suspended_message(late: float, windows: bool) -> tuple[str, str]:
+    """(message, niveau) du journal après une pause de la boucle. Sur Windows c'est presque sûrement la veille du PC
+    (avertissement) ; en Docker, un saut d'horloge NTP ou un conteneur / une VM en pause est banal (info)."""
+    return (f"Aucune vérification depuis {_duration(late + CHECK_INTERVAL)} : la machine était sans doute en "
+            "veille ou en pause ; reprise des renouvellements", "warn" if windows else "info")
+
+
+def _duration(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 48:
+        return f"{hours} h {minutes:02d} min"
+    return f"{hours // 24} j {hours % 24} h"
 
 
 async def _guarded(what: str, coro) -> None:
@@ -1366,11 +1412,18 @@ async def tick(now: float, last_account_check: float, last_release_check: float)
 
 async def loop() -> None:
     last_account_check = last_release_check = 0.0
+    expected_at = None
     while True:
         if backup.RESTORING:        # restauration en cours : la base et les dossiers sont en train d'être remplacés
+            expected_at = None      # cette attente n'est pas une veille de la machine
             await asyncio.sleep(5)
             continue
         now = time.time()
+        late = suspended_for(expected_at, now)
+        if late:
+            # PC en veille pendant la fenêtre de renouvellement : le journal l'explique, et les apps dues partent aussitôt
+            message, level = suspended_message(late, WINDOWS)
+            _log_quietly(message, level)
         HEALTH["last_loop_at"] = now
         HEALTH["next_check_at"] = now + CHECK_INTERVAL
         HEALTH["loop_error"] = None
@@ -1379,7 +1432,7 @@ async def loop() -> None:
         except Exception as e:  # noqa: BLE001 - la boucle ne doit jamais s'arrêter
             HEALTH["loop_error"] = str(e)
             _log_quietly(f"boucle de renouvellement : {e}")
-        HEALTH["next_check_at"] = time.time() + CHECK_INTERVAL
+        expected_at = HEALTH["next_check_at"] = time.time() + CHECK_INTERVAL
         await asyncio.sleep(CHECK_INTERVAL)
 
 

@@ -1,5 +1,6 @@
-# Desktop shell (on top of ../requirements.txt). Only pystray is pinned here: requirements-lock.txt is the
-# pip freeze of the last build (an output, not an input), so rebuilds can pick newer pywebview/pillow/pyinstaller.
+# Desktop shell (on top of ../requirements.txt): the direct dependencies of the Windows build. The build installs
+# requirements-lock.txt (hash-pinned, generated from this file and ../requirements.txt: see its header), so a
+# release does not depend on whatever pywebview/pillow/pyinstaller published since the last one.
 pywebview>=5.4,<7
 pystray==0.19.5
 pillow>=11
