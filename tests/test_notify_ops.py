@@ -495,7 +495,7 @@ class Targets(unittest.TestCase):
                 self.assertTrue(notifier.text(key, lang, **params), (key, lang))
 
     def test_time_has_an_explicit_offset(self):
-        self.assertRegex(notifier.fmt_time(time.time()), r"^\d{4}-\d\d-\d\d \d\d:\d\d UTC[+-]\d\d:\d\d$")
+        self.assertRegex(notifier.fmt_time(time.time()), r"^\d\d/\d\d \d\d:\d\d \(UTC([+-]\d{1,2}(:\d\d)?)?\)$")
 
     def test_language_follows_the_ui_when_auto(self):
         settings.update({"language": None})

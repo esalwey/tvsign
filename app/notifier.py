@@ -134,10 +134,15 @@ def reason(why, language: str | None = None) -> str:
 
 
 def fmt_time(ts: float) -> str:
-    """Date lisible sans ambiguïté : « 2026-10-22 14:05 UTC+02:00 » (fuseau du serveur)."""
+    """Date courte et sans ambiguïté : « 22/10 14:05 (UTC+2) », avec le fuseau du serveur (souvent UTC
+    dans Docker) ; les minutes du décalage n'apparaissent que si elles existent (« UTC+5:30 »)."""
     dt = datetime.fromtimestamp(ts).astimezone()
     off = dt.strftime("%z") or "+0000"
-    return f"{dt:%Y-%m-%d %H:%M} UTC{off[:3]}:{off[3:]}"
+    hours, minutes = int(off[1:3]), off[3:5]
+    zone = f"UTC{off[0]}{hours}" + (f":{minutes}" if minutes != "00" else "")
+    if off in ("+0000", "-0000"):
+        zone = "UTC"
+    return f"{dt:%d/%m %H:%M} ({zone})"
 
 
 # ---------- destinations ----------
