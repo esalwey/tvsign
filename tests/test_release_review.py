@@ -272,6 +272,34 @@ class ChannelSwitch(unittest.TestCase):
         self.patch(source="o/other")
         self.assertIsNone(self.row()["source_tag"])
 
+    def test_a_round_trip_through_the_beta_channel_downloads_nothing_the_second_time(self):
+        old = make_tv_ipa(version="1.0")
+        (renew.app_dir(self.app_id) / "original.ipa").write_bytes(old)
+        db.update("apps", self.app_id, installed_ipa=sha(old), source_sha256=sha(old))
+        downloads = []
+
+        def download(url, dest, sha256=None, expect_bundle=None, **kw):
+            downloads.append(url)
+            data = make_tv_ipa(version="2.0-beta")
+            dest.write_bytes(data)
+            return {"version": "2.0-beta", "bundle_id": "com.example.tv", "sha256": sha(data)}
+        beta = {"tag": "v2.0-beta", "url": "https://x/beta", "sha256": None, "key": "kb", "notes": None}
+        stable = {"tag": "v1.0", "url": "https://x/stable", "sha256": None, "key": "k1", "notes": None}
+        self.patch(channel="beta")
+        with mock.patch.object(renew, "_latest", return_value=beta), mock.patch.object(ipa, "download", download):
+            self.assertTrue(asyncio.run(renew.refresh_source(self.row(), force=True)))
+        row = self.row()
+        self.assertEqual((row["source_tag"], row["prev_tag"], row["prev_version"]), ("v2.0-beta", "v1.0", "1.0"))
+        db.update("apps", self.app_id, installed_ipa=row["source_sha256"], installed_tag="v2.0-beta")      # what a renewal records
+        self.assertEqual(self.client.post(f"/api/apps/{self.app_id}/rollback", headers=HEADERS).status_code, 200)
+        row = self.row()
+        self.assertEqual((row["source_tag"], row["version"]), ("v1.0", "1.0"))          # the tag came back with the file
+        self.patch(channel="stable")
+        downloads.clear()
+        with mock.patch.object(renew, "_latest", return_value=stable), mock.patch.object(ipa, "download", download):
+            self.assertFalse(asyncio.run(renew.refresh_source(self.row(), force=True)))
+        self.assertEqual(downloads, [])                                                  # the identical IPA is not fetched again
+
     def test_the_previous_version_remembers_the_tag_after_a_switch_from_an_older_database(self):
         """Une fiche dont le canal a déjà été changé (source_tag vidé) : installed_tag dit ce qui est gardé."""
         db.update("apps", self.app_id, source_tag=None, installed_ipa="x")

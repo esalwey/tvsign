@@ -517,6 +517,9 @@ class NoRedirect(unittest.TestCase):
 
             def do_POST(self):
                 Handler.seen.append((self.path, self.headers.get("Authorization")))
+                # The body is read before answering: closing a socket that still holds unread data resets the
+                # connection (WinError 10053 on Windows), and the client then never sees the 307.
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 self.send_response(307)
                 self.send_header("Location", "http://127.0.0.1:1/elsewhere")
                 self.end_headers()

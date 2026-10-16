@@ -212,6 +212,8 @@ def migrate(conn: sqlite3.Connection) -> None:
     todo = _pending(conn)
     if not todo:
         return
+    if conn.in_transaction:
+        conn.commit()
     conn.execute("BEGIN")
     try:
         for table, col, kind in todo:
