@@ -19,7 +19,7 @@ import json
 import secrets
 import time
 
-from . import settings
+from . import db, settings
 from .config import (ALLOWED_HOSTS, AUTH_MODE, DATA_DIR, LAUNCH_TOKEN, PASSWORD_ENV, SESSION_DAYS,
                      TRUST_LOOPBACK)
 from .util import write_private
@@ -120,6 +120,10 @@ def init() -> None:
     """At startup: make sure the cookie key exists, print a setup code if setup is pending."""
     global SETUP_CODE
     secret()
+    load_revoked()
+    if PASSWORD_ENV and len(PASSWORD_ENV) < MIN_PASSWORD:
+        print(f"[warn] le mot de passe prévu par TVSIGN_PASSWORD / TVSIGN_PASSWORD_FILE fait moins de "
+              f"{MIN_PASSWORD} caractères : à renforcer", flush=True)
     if not enabled():
         print("[warn] TVSIGN_AUTH=none : interface sans mot de passe, à n'utiliser que derrière un "
               "proxy authentifiant ou un VPN", flush=True)
@@ -162,9 +166,34 @@ def _sign(payload: bytes) -> str:
     return base64.urlsafe_b64encode(hmac.new(secret(), payload, hashlib.sha256).digest()).decode().rstrip("=")
 
 
-def make_cookie() -> str:
+# Sessions déconnectées individuellement (« Se déconnecter ») : leur cookie, même copié ailleurs, ne vaut plus rien.
+_REVOKED: dict[str, float] = {}
+
+
+def load_revoked() -> None:
+    now = time.time()
+    db.execute("DELETE FROM revoked_sessions WHERE until < ?", now)
+    _REVOKED.clear()
+    _REVOKED.update({r["sid"]: r["until"] for r in db.rows("SELECT sid, until FROM revoked_sessions")})
+
+
+def revoke(sid: str) -> None:
+    """Révoque une session. Un cookie expire de toute façon SESSION_DAYS après son émission."""
+    now = time.time()
+    until = now + SESSION_DAYS * 86400
+    _REVOKED[sid] = until
+    db.execute("INSERT INTO revoked_sessions (sid, until) VALUES (?, ?) "
+               "ON CONFLICT(sid) DO UPDATE SET until = excluded.until", sid, until)
+    for old in [s for s, u in _REVOKED.items() if u < now]:
+        _REVOKED.pop(old, None)
+    db.execute("DELETE FROM revoked_sessions WHERE until < ?", now)
+
+
+def make_cookie(sid: str | None = None) -> str:
+    """Cookie de session signé. sid : identifiant conservé d'un renouvellement à l'autre (sinon nouveau)."""
     now = int(time.time())
-    payload = base64.urlsafe_b64encode(json.dumps({"v": _version(), "iat": now}).encode()).decode().rstrip("=")
+    body = {"v": _version(), "iat": now, "sid": sid or secrets.token_hex(8)}
+    payload = base64.urlsafe_b64encode(json.dumps(body).encode()).decode().rstrip("=")
     return f"{payload}.{_sign(payload.encode())}"
 
 
@@ -179,6 +208,12 @@ def read_cookie(value: str | None) -> dict | None:
     except (ValueError, json.JSONDecodeError):
         return None
     if data.get("v") != _version() or time.time() - data.get("iat", 0) > SESSION_DAYS * 86400:
+        return None
+    if not data.get("sid"):
+        # cookie émis avant les sessions individuelles : un identifiant dérivé de sa signature permet de
+        # le révoquer à la déconnexion (il reste valable tel quel jusqu'à son renouvellement)
+        data["sid"] = "legacy-" + sig[:16]
+    if data["sid"] in _REVOKED:
         return None
     return data
 

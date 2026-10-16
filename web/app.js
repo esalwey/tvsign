@@ -25,15 +25,27 @@ const ICONS = {
   ok: '<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>',
 };
 
+// Dépôt GitHub : « owner/projet » ASCII sans segment « . » ni « .. » ; une adresse github.com collée est acceptée
+// (le serveur applique la même règle).
+function depotGithub(v) {
+  let r = String(v || "").trim().replace(/^https?:\/\/(www\.)?github\.com\//i, "").replace(/\/+$/, "").replace(/\.git$/i, "");
+  return /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/.test(r) && !r.split("/").some((p) => p === "." || p === "..") ? r : null;
+}
+
 // ---------- erreurs de l'API ----------
 // Codes stables renvoyés par le serveur (« code » ou « code:paramètre »).
 function apiError(detail, status) {
-  const [code, arg] = String(detail || "").split(":");
+  const [code, arg, arg2] = String(detail || "").split(":");
   const k = "err_" + code;
-  if (I18N[k]) return t(k, { n: arg });
+  if (I18N[k]) return t(k, { n: arg, m: arg2 });
   if (detail) return String(detail);
   return status >= 500 ? t("err_server") : status === 404 ? t("err_not_found") : status === 422 ? t("err_invalid") : t("err_status", { n: status });
 }
+
+// Réglage (clé de l'API) -> libellé du champ affiché, pour qu'une erreur de validation parle comme le formulaire.
+const LIBELLE_REGLAGE = { language: "language", renew_before_hours: "renew_before", anisette_url: "anisette_server",
+  renew_window_start: "set_lbl_renew_window_start", renew_window_end: "set_lbl_renew_window_end" };
+const libelleReglage = (k) => (k === "ntfy_url" ? "ntfy" : LIBELLE_REGLAGE[k] ? t(LIBELLE_REGLAGE[k]) : k);
 
 async function api(path, opts = {}) {
   const { json, quiet, ...init } = opts;
@@ -48,7 +60,7 @@ async function api(path, opts = {}) {
   if (!r.ok) {
     const detail = typeof data.detail === "string" ? data.detail
       : Array.isArray(data.detail) ? data.detail.map((d) => d?.msg || "").filter(Boolean).join(", ")
-      : data.detail && typeof data.detail === "object" ? Object.entries(data.detail).map(([k, v]) => `${k} : ${v}`).join(", ")
+      : data.detail && typeof data.detail === "object" ? Object.entries(data.detail).map(([k, v]) => `${libelleReglage(k)} : ${apiError(v)}`).join(", ")
       : "";
     const e = new Error(apiError(detail, r.status));
     e.status = r.status; e.code = detail;
@@ -86,6 +98,7 @@ const CAUSES = [
   [/NO_TEAM|MULTIPLE_TEAMS|TEAM_NOT_FOUND/, "c_team"],
   [/arrêté par le système|killed by the system/i, "c_oom"],
   [/ntfy/i, "c_ntfy"],
+  [/maximum number of (installed )?(apps|app ?ids?)|too many (installed )?(apps|app ?ids?)|app ?id limit|limit of \d+ (apps|app ?ids)|limite du compte gratuit|reached the maximum number/i, "c_limit"],
   [/8220|no devices from which/i, "c_8220"],
   [/ancienne version de tvsign/i, "c_legacy"],
   [/appairage perdu|PAIRING_LOST|pairing record|not paired|No stored pairing/i, "c_lost"],
@@ -107,7 +120,6 @@ const CAUSES = [
   [/ouverte sur l'Apple TV|app ouverte sur la TV|installd ne progresse plus/i, "c_app_open"],
   [/plumesign trop ancien/i, "c_plumesign_old"],
   [/réseau ou Apple injoignable/i, "c_apple_net"],
-  [/maximum (number )?of (apps|app ids)|too many (apps|app ids)|app id limit|limit of \d+ (apps|app ids)/i, "c_limit"],
   [/identifiant d'app changé/i, "c_bundle"],
   [/empreinte SHA-256/i, "c_digest"],
   [/certificat|certificate/i, "c_cert"],
@@ -205,6 +217,7 @@ function etatApp(a, now, s) {
   if (a.running) {
     const ph = a.phase || {};
     if (ph.step === "waiting_app") return ["warn", t("st_waiting_app")];
+    if (ph.step === "queued") return ["cours", t("st_queued")];
     if (ph.step === "installing" && ph.percent != null) return ["cours", t("st_installing_pct", { n: ph.percent })];
     if (["checking", "signing", "uploading", "installing"].includes(ph.step)) return ["cours", t("st_" + ph.step)];
     return ["cours", t("st_renewing")];
@@ -212,9 +225,14 @@ function etatApp(a, now, s) {
   if (!a.enabled) return ["neutre", t("st_paused")];
   if (!a.device_id) return ["err", t("st_no_tv")];
   if (exp && expiree) return ["err", t("st_expired")];
+  if (a.status === "error" && a.needs_action) return ["err", t("st_action")];
   if (a.status === "error") return ["err", exp && exp - now < 24 * 3600 ? t("st_failed_soon") : t("st_failed")];
   if (!exp) return ["warn", t("st_to_install")];
-  if (exp - now < fenetre) return ["warn", t("st_to_renew")];
+  if (exp - now < fenetre) {
+    // le moment est passé mais la plage horaire choisie n'est pas ouverte : rien n'est en retard
+    if (a.window_wait && s.renew_window) return ["neutre", t("st_window", { h: s.renew_window[0] })];
+    return ["warn", t("st_to_renew")];
+  }
   return ["ok", t("st_valid")];
 }
 const COULEUR = { ok: "green", warn: "orange", err: "red", cours: "blue", neutre: "gray" };
@@ -269,7 +287,10 @@ function problemeApp(a, now) {
   const e = enClair(a.last_error || "aucune Apple TV associée");
   const retry = !a.enabled ? t("retry_paused")
     : a.running ? ""
-    : a.next_attempt_at && a.next_attempt_at > now ? t("retry_at", { when: relatif(a.next_attempt_at, now) })
+    : a.needs_action ? (a.next_attempt_at && a.next_attempt_at > now ? t("retry_blocked", { when: relatif(a.next_attempt_at, now) }) : "")
+    : a.window_wait && a.window_at ? t("retry_window", { when: relatif(a.window_at, now) })
+    : a.next_attempt_at && a.next_attempt_at > now
+      ? ((a.fail_count || 0) > 1 ? t("retry_at_n", { when: relatif(a.next_attempt_at, now), n: a.fail_count }) : t("retry_at", { when: relatif(a.next_attempt_at, now) }))
     : a.device_id ? t("retry_next_pass") : "";
   const bouton = ["c_session", "c_account_missing", "c_disconnected"].includes(e.cle) && a.effective_account
     ? `<button class="btn btn--petit" data-relogin="${esc(a.effective_account)}">${t("reconnect")}</button>`
@@ -291,6 +312,17 @@ function problemeApp(a, now) {
     </div>`;
 }
 
+// La version téléchargée peut précéder celle qui tourne sur la TV (installation différée ou ratée) :
+// « 1.0 installée · 1.1 en attente » tant que les deux diffèrent.
+function versionApp(a) {
+  const dispo = a.version, installee = a.installed_version;
+  if (installee && dispo && installee !== dispo) {
+    return `<small title="${esc(t("version_pending_t"))}">${esc(t("version_pending", { from: installee, to: dispo }))}</small>`;
+  }
+  const v = installee || dispo;
+  return v ? `<small>${esc(v)}</small>` : "";
+}
+
 function carteApp(a, now, s) {
   const [ton, mot] = etatApp(a, now, s);
   const compte = a.effective_account || a.account_email;
@@ -299,7 +331,7 @@ function carteApp(a, now, s) {
     <div class="app__tete">
       <span class="row__icon row__icon--${COULEUR[ton]}">${ICONS.app}</span>
       <div class="app__id">
-        <h3 class="app__nom" id="app-${a.id}-t">${esc(a.name)}${a.version ? `<small>${esc(a.version)}</small>` : ""}</h3>
+        <h3 class="app__nom" id="app-${a.id}-t">${esc(a.name)}${versionApp(a)}</h3>
         <p class="row__sub">${sourceTexte(a)}</p>
       </div>
       <span class="etat etat--${ton}">${esc(mot)}</span>
@@ -323,17 +355,18 @@ function carteApp(a, now, s) {
 }
 // déclencheurs enregistrés par le serveur (en français) -> libellé traduit
 const trigger = (x) => ({ auto: t("tr_auto"), manuel: t("tr_manual"), ajout: t("tr_added"), "nouvelle version": t("tr_new_version"),
-  "nouvelle source": t("tr_new_source"), "nouvelle destination": t("tr_new_dest") }[x] || x);
+  "nouvelle source": t("tr_new_source"), "nouvelle destination": t("tr_new_dest"),
+  reconnexion: t("tr_reconnect"), appairage: t("tr_paired") }[x] || x);
 
 // ---------- synthèse globale ----------
-const boucleArretee = (h, now) => !!h && (h.loop_stalled || (!!h.last_loop_at && now - h.last_loop_at > 3 * (h.check_interval || 600) + 2700));
+const boucleArretee = (h, now) => !!h && (h.loop_stalled || (!!h.last_loop_at && now - h.last_loop_at > 3 * (h.check_interval || 600) + 120));
 function synthese(s, now) {
   const h = s.health || null;
   const actives = s.apps.filter((a) => a.enabled);
   const deco = s.accounts.filter((a) => a.ok === 0);
   const expirees = actives.filter((a) => a.expires_at && a.expires_at <= now);
   const echecs = actives.filter((a) => a.status === "error" || !a.device_id);
-  const lim = 2 * ((h && h.check_interval) || 600) + 900;   // un passage peut durer ~15 min (installation)
+  const lim = 2 * ((h && h.check_interval) || 600) + 300;   // une passe ne fait que lancer les renouvellements (ils tournent à part)
   const enRetard = actives.filter((a) => !a.running && a.status !== "error" && a.expires_at && a.expires_at > now
     && (a.renew_at ?? a.expires_at - s.renew_before_hours * 3600) < now - lim);
   const arret = boucleArretee(h, now);
@@ -455,12 +488,13 @@ function renderAccounts(s, now) {
       : a.checked_at ? `<span class="etat etat--neutre">${t("acc_unknown")}</span>` : `<span class="etat etat--neutre">${t("acc_unchecked")}</span>`;
     const note = a.ok == null && a.checked_at && a.message ? `<p class="row__sub">${esc(t("acc_retry_later", { why: enClair(a.message).titre }))}</p>`
       : a.ok === 0 ? `<p class="row__sub texte-err">${esc(t("acc_reauth_reason"))}</p>` : "";
+    const places = (a.slots || []).map((x) => `<p class="row__sub ${x.apps > x.max ? "texte-err" : ""}">${esc(t("slots_line", { apps: x.apps, max: x.max, tv: x.device_name || "Apple TV" }))}${x.apps >= x.max ? " · " + esc(t("slots_note")) : ""}</p>`).join("");
     return `<div class="row">
       <span class="row__icon row__icon--${a.ok === 0 ? "red" : a.ok === 1 ? "blue" : "gray"}">${ICONS.user}</span>
       <div class="row__label">
         <p class="row__title">${esc(a.email)}${a.selected ? `<small>${t("default_account")}</small>` : ""}</p>
         <p class="row__sub">${etat}${a.team_id ? ` · ${t("team")} <span class="mono">${esc(a.team_id)}</span>` : ""}${a.cert_expires ? ` · ${esc(t("cert_until", { date: a.cert_expires }))}` : ""} · ${esc(t("checked_when", { when: relatif(a.checked_at, now) }))}</p>
-        ${note}
+        ${note}${places}
       </div>
       <div class="row__buttons">
         <button class="row__action" data-check="${esc(a.email)}">${t("check")}</button>
@@ -488,7 +522,7 @@ function renderSysteme(s, now) {
       <span class="row__icon row__icon--${COULEUR[boucle[0]]}">${ICONS.boucle}</span>
       <div class="row__label">
         <p class="row__title">${t("auto_renewal")}</p>
-        <p class="row__sub"><span class="etat etat--${boucle[0]}">${boucle[1]}</span> · ${esc(t("checked_when", { when: relatif(h.last_loop_at, now) }))}${esc(prochaine)}</p>
+        <p class="row__sub"><span class="etat etat--${boucle[0]}">${boucle[1]}</span> · ${esc(t("checked_when", { when: relatif(h.last_loop_at, now) }))}${esc(prochaine)}${h.restarts ? ` · ${esc(t("loop_restarted", { n: h.restarts }))}` : ""}</p>
         ${h.loop_error ? `<p class="row__sub texte-err">${esc(enClair(h.loop_error).titre)}</p>` : ""}
         ${arret ? `<p class="row__sub">${t("restart_hint")}</p>` : ""}
       </div>
@@ -530,6 +564,7 @@ function renderEvents(s) {
       <time datetime="${new Date(e.ts * 1000).toISOString()}">${fmtHeure(e.ts)}</time>
       <span class="sr">${e.level === "error" ? t("error") : e.level === "warn" ? t("warning") : ""}</span>
       <div class="journal__texte"><p>${esc(titre)}</p>
+        ${e.repeat > 1 ? `<p class="journal__rep">${esc(t("journal_repeat", { n: e.repeat, when: fmtHeure(e.first_ts || e.ts) }))}</p>` : ""}
         ${long ? `<details class="details" data-key="ev-${e.id}"><summary>${t("details")}</summary><pre class="log">${esc(e.message)}</pre></details>` : ""}</div>
     </li>`;
   }
@@ -767,8 +802,9 @@ $("#form-app").addEventListener("submit", async (ev) => {
     fd.append("preset", p.value); fd.append("channel", f.channel.value);
   }
   if (type === "github") {
-    if (!/^[\w.-]+\/[\w.-]+$/.test(f.source.value.trim())) return (err.textContent = t("repo_format"));
-    fd.append("source", f.source.value.trim()); fd.append("source_filter", f.source_filter.value.trim());
+    const depot = depotGithub(f.source.value);
+    if (!depot) return (err.textContent = t("repo_format"));
+    fd.append("source", depot); fd.append("source_filter", f.source_filter.value.trim());
     fd.append("channel", f.channel.value);
   }
   if (type === "url") {
@@ -789,7 +825,7 @@ $("#form-app").addEventListener("submit", async (ev) => {
     const app = await api("/api/apps", { method: "POST", body: fd });
     f.closest("dialog").close();
     f.reset();
-    flash("ok", t("app_added_t", { name: app.name }), " " + t("app_added"));
+    flash("ok", t("app_added_t", { name: app.name }), " " + t("app_added") + ((app.warnings || []).includes("slots_full") ? t("warn_slots_full", { max: STATE?.max_active_apps || 3 }) : ""));
   } catch (e) {
     err.textContent = e.message;
   } finally {
@@ -827,8 +863,8 @@ $("#form-edit").addEventListener("submit", async (ev) => {
   const compte = a.account_email || a.effective_account || "";
   if (f.account_email.value && f.account_email.value !== compte) body.account_email = f.account_email.value;
   if (a.source_type === "github") {
-    const src = f.source.value.trim();
-    if (!/^[\w.-]+\/[\w.-]+$/.test(src)) return (err.textContent = t("repo_format"));
+    const src = depotGithub(f.source.value);
+    if (!src) return (err.textContent = t("repo_format"));
     if (src !== a.source) body.source = src;
     if (f.source_filter.value.trim() !== (a.source_filter || "")) body.source_filter = f.source_filter.value.trim();
     if (f.channel.value !== (a.channel === "beta" ? "beta" : "stable")) body.channel = f.channel.value;
@@ -932,7 +968,7 @@ function watchSession(sess, box, { cle, label, doneText, numerique, onEnd }) {
       return fin(false);
     }
     saisie = false;
-    statut(`<span class="etat etat--cours">${envois ? t("verifying") : t("in_progress")}</span>`);
+    statut(`<span class="etat etat--cours">${sess.state === "finishing" ? t("finishing") : envois ? t("verifying") : t("in_progress")}</span>`);
     setTimeout(tick, 1000);
   };
   tick();
@@ -1340,6 +1376,29 @@ $("#vue-settings").addEventListener("click", async (e) => {
   } catch (ex) { if (err) err.textContent = ex.message; else flash("err", t("action_failed"), " " + ex.message); }
 });
 $("#backup-uploads").onchange = (e) => ($("#backup-export").href = "/api/backup/export" + (e.target.checked ? "?uploads=true" : ""));
+// L'export passe par fetch : un « occupé » (connexion Apple ou appairage en cours) s'affiche au lieu d'un
+// téléchargement raté ou d'un fichier contenant {"detail":"busy"}.
+$("#backup-export").addEventListener("click", async (e) => {
+  e.preventDefault();
+  const lien = e.currentTarget, err = $("#reglages-error");
+  if (lien.getAttribute("aria-busy")) return;
+  lien.setAttribute("aria-busy", "true");
+  err.textContent = "";
+  try {
+    const r = await fetch(lien.getAttribute("href"), { credentials: "same-origin", headers: { "X-Tvsign": "1" } });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      throw new Error(apiError(typeof d.detail === "string" ? d.detail : "", r.status));
+    }
+    const nom = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(r.headers.get("content-disposition") || "")?.[1];
+    const url = URL.createObjectURL(await r.blob());
+    const a = document.createElement("a");
+    a.href = url; a.download = nom ? decodeURIComponent(nom) : "tvsign.tvsign-backup";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  } catch (ex) { err.textContent = ex.message; }
+  finally { lien.removeAttribute("aria-busy"); }
+});
 $("#backup-file").onchange = async (e) => {
   const f = e.target.files[0];
   e.target.value = "";

@@ -32,3 +32,26 @@ services:
       # Apple session, certificate private key, Apple TV pairings, database.
       # BACK IT UP, NEVER SHARE IT (no SMB/NFS share, no cloud sync folder in clear).
       - ./tvsign-data:/data
+
+  # Optional anisette server of your own (instead of the community one):
+  #   docker compose --profile anisette up -d
+  # then enter http://127.0.0.1:6969 as the anisette server in tvsign's Settings. Several addresses
+  # can be listed there: the next one takes over when the first is down.
+  # tvsign only uses an anisette server that announces Windows data (Settings > Diagnostics tells).
+  anisette:
+    # pinned (tag + digest) like the other images of this stack; bump both together to update
+    image: dadoum/anisette-v3-server:10-2026@sha256:8577c27cb7592900947960799bf03c79a53bf857ed951e4c48ef6e06c6e0f488
+    container_name: tvsign-anisette
+    profiles: ["anisette"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6969:6969"       # loopback only: tvsign (host network) reaches it, the LAN does not
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      # named volume (not a bind mount): Docker would create a host folder owned by root, which the
+      # image's unprivileged user cannot write its provisioning files to
+      - anisette_data:/home/Alcoholic/.config/anisette-v3/lib/
+
+volumes:
+  anisette_data:

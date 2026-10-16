@@ -2,6 +2,7 @@
 import hashlib
 import ipaddress
 import json
+import base64
 import plistlib
 import re
 import socket
@@ -9,6 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from xml.parsers.expat import ExpatError
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,18 +23,34 @@ class SourceRejected(ValueError):
     ne pas la retélécharger à chaque essai."""
 
 
+def _text(value) -> str | None:
+    """Champ d'Info.plist utilisable comme texte : une chaîne non vide, sinon rien (un tableau ou un
+    nombre à cet endroit ne doit pas finir dans la base)."""
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
 def app_info(ipa: Path) -> dict:
+    """Infos de l'app d'une IPA. ValueError si le fichier n'est pas une IPA exploitable
+    (Info.plist absent, illisible, ni dictionnaire, ou sans identifiant d'app)."""
     with zipfile.ZipFile(ipa) as z:
         names = [n for n in z.namelist() if re.fullmatch(r"Payload/[^/]+\.app/Info\.plist", n)]
         if not names:
             raise ValueError("ce fichier n'est pas une IPA (Payload/*.app/Info.plist absent)")
-        info = plistlib.loads(z.read(names[0]))
+        try:
+            info = plistlib.loads(z.read(names[0]))
+        except (plistlib.InvalidFileException, ExpatError, ValueError) as e:
+            raise ValueError(f"Info.plist illisible ({e})") from e
+    if not isinstance(info, dict):
+        raise ValueError("Info.plist inattendu (dictionnaire attendu)")
+    bundle_id = _text(info.get("CFBundleIdentifier"))
+    if not bundle_id:
+        raise ValueError("Info.plist sans identifiant d'app (CFBundleIdentifier)")
     return {
-        "name": info.get("CFBundleDisplayName") or info.get("CFBundleName") or Path(names[0]).parent.stem,
-        "bundle_id": info.get("CFBundleIdentifier"),
-        "version": info.get("CFBundleShortVersionString") or info.get("CFBundleVersion"),
-        "platform": info.get("DTPlatformName"),
-        "min_os": info.get("MinimumOSVersion"),
+        "name": _text(info.get("CFBundleDisplayName")) or _text(info.get("CFBundleName")) or Path(names[0]).parent.stem,
+        "bundle_id": bundle_id,
+        "version": _text(info.get("CFBundleShortVersionString")) or _text(info.get("CFBundleVersion")),
+        "platform": _text(info.get("DTPlatformName")),
+        "min_os": _text(info.get("MinimumOSVersion")),
     }
 
 
@@ -91,6 +109,68 @@ def profile_cert_serials(signed_ipa: Path) -> set[str]:
     """Numéros de série (hex majuscule, sans zéros de tête) des certificats autorisés par le profil."""
     certs = (_profile(signed_ipa) or {}).get("DeveloperCertificates") or []
     return {cert_serial(c) for c in certs}
+
+
+def _children(buf: bytes, start: int, length: int) -> list[tuple[int, int, int]]:
+    """Éléments DER enfants (tag, début du contenu, longueur) du contenu [start, start+length)."""
+    out, i, end = [], start, start + length
+    while i < end:
+        tag, cstart, n = _der(buf, i)
+        out.append((tag, cstart, n))
+        i = cstart + n
+    return out
+
+
+def _int(buf: bytes, el: tuple[int, int, int]) -> int:
+    return int.from_bytes(buf[el[1]:el[1] + el[2]], "big")
+
+
+def key_modulus(pem: str) -> int | None:
+    """Module RSA d'une clé privée PEM (PKCS#8 « PRIVATE KEY » ou PKCS#1 « RSA PRIVATE KEY »)."""
+    m = re.search(r"-----BEGIN (RSA )?PRIVATE KEY-----(.*?)-----END (RSA )?PRIVATE KEY-----", pem, re.S)
+    if not m:
+        return None
+    der = base64.b64decode("".join(m.group(2).split()))
+    tag, start, n = _der(der, 0)
+    parts = _children(der, start, n)
+    if m.group(1):                                   # PKCS#1 : SEQUENCE { 0, n, e, … }
+        return _int(der, parts[1])
+    inner = parts[2]                                 # PKCS#8 : SEQUENCE { 0, algo, OCTET STRING { PKCS#1 } }
+    _, istart, ilen = _der(der[inner[1]:inner[1] + inner[2]], 0)
+    blob = der[inner[1]:inner[1] + inner[2]]
+    return _int(blob, _children(blob, istart, ilen)[1])
+
+
+def cert_modulus(der: bytes) -> int | None:
+    """Module RSA de la clé publique d'un certificat X.509 DER."""
+    _, cert, clen = _der(der, 0)
+    tbs = _children(der, cert, clen)[0]
+    fields = _children(der, tbs[1], tbs[2])
+    if fields and fields[0][0] == 0xA0:              # version explicite
+        fields = fields[1:]
+    spki = fields[5]                                 # serial, algo, émetteur, validité, sujet, puis la clé publique
+    algo_and_key = _children(der, spki[1], spki[2])
+    bits = algo_and_key[1]                           # BIT STRING : octet d'incomplétude puis RSAPublicKey
+    inner = der[bits[1] + 1:bits[1] + bits[2]]
+    _, istart, ilen = _der(inner, 0)
+    return _int(inner, _children(inner, istart, ilen)[0])
+
+
+def signing_serial(signed_ipa: Path, key_pem: str) -> str | None:
+    """Numéro de série du certificat qui a réellement signé l'app : celui du profil dont la clé publique
+    est celle de notre clé privée. Le profil liste tous les certificats de l'équipe (Xcode, SideStore…),
+    seul celui-ci compte pour savoir si l'app est encore lançable. None si on ne peut pas conclure."""
+    try:
+        mine = key_modulus(key_pem)
+        if not mine:
+            return None
+        found = set()
+        for c in (_profile(signed_ipa) or {}).get("DeveloperCertificates") or []:
+            if cert_modulus(c) == mine:
+                found.add(cert_serial(c))
+        return found.pop() if len(found) == 1 else None
+    except (ValueError, IndexError, TypeError, zipfile.BadZipFile, plistlib.InvalidFileException, ExpatError):
+        return None
 
 
 # ---------- réseau ----------
@@ -162,6 +242,23 @@ def _sha256_of(rel: dict, asset: dict) -> str | None:
     return None
 
 
+_REPO = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}", re.ASCII)
+
+
+def normalize_repo(value: str | None) -> str | None:
+    """« owner/projet » valide, ou None. Accepte aussi une adresse https://github.com/owner/projet
+    (avec ou sans .git) collée telle quelle ; refuse les segments « . » et « .. »."""
+    v = (value or "").strip()
+    v = re.sub(r"^https?://(www\.)?github\.com/", "", v, flags=re.I).rstrip("/")
+    if v.lower().endswith(".git"):
+        v = v[:-4]
+    if not _REPO.fullmatch(v):
+        return None
+    if any(seg in (".", "..") for seg in v.split("/")):
+        return None
+    return v
+
+
 def latest_github(repo: str, tag_prefixes: list[str] | str | None, prereleases: bool = False,
                   asset_name: str | None = None) -> dict | None:
     """Release la plus récente qui correspond : {tag, url, sha256, key, prerelease, asset}.
@@ -170,7 +267,8 @@ def latest_github(repo: str, tag_prefixes: list[str] | str | None, prereleases: 
     if isinstance(tag_prefixes, str):
         tag_prefixes = [tag_prefixes]
     tag_prefixes = [p for p in (tag_prefixes or []) if p]
-    if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo or ""):
+    repo = normalize_repo(repo)
+    if not repo:
         raise SourceRejected("dépôt GitHub attendu sous la forme owner/projet")
     releases = _get_json(f"https://api.github.com/repos/{repo}/releases?per_page=100")
     # L'API ne renvoie pas toujours la plus récente en premier : on trie par date de publication.

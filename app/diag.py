@@ -15,7 +15,7 @@ import urllib.error
 import urllib.request
 
 from . import plume, settings
-from .config import DATA_DIR, PLUMESIGN, VERSION, WINDOWS
+from .config import DATA_DIR, PASSWORD_FILE_ERROR, PLUMESIGN, VERSION, WINDOWS
 
 DEFAULT_ANISETTE = settings.DEFAULT_ANISETTE
 
@@ -114,26 +114,45 @@ def _windows(data: dict | None) -> bool:
 
 async def _anisette() -> dict:
     """Serveur anisette : joignable, et il fournit des données Windows (les seules qu'Apple accepte).
-    Avec le serveur par défaut, le serveur de repli prend le relais quand il ne répond pas."""
-    found = []
-    for url in settings.anisette_servers():
+    Chaque serveur est interrogé avec sa latence : le premier qui convient sert, les suivants prennent le
+    relais. Avec le serveur par défaut, son serveur de repli prend le relais quand il ne répond pas."""
+    servers = settings.anisette_servers()
+
+    async def probe(url: str) -> tuple[str, dict | None, str, float]:
+        t0 = time.time()
         data, err = await asyncio.to_thread(_client_info, url)
-        found.append((url, data, err))
-        if _windows(data):
-            break
-    url, data, err = found[-1]
-    if _windows(data):
-        if len(found) > 1:
-            first_url, first_data, first_err = found[0]
+        return url, data, err, time.time() - t0
+
+    found = list(await asyncio.gather(*(probe(u) for u in servers)))
+    good = next((i for i, (_, data, _, _) in enumerate(found) if _windows(data)), None)
+    if good is not None:
+        url, data, _, dt = found[good]
+        ms = f"{dt * 1000:.0f} ms"
+        if good > 0:
+            first_url, first_data, first_err, _ = found[0]
             why = first_err or f"répond « {first_data['client_info']} »"
-            return _check("anisette", "warn", f"{first_url} inutilisable ({why}) : repli sur {url}", url)
-        return _check("anisette", "ok", f"{url} : {data['client_info']}", url)
-    if data:
+            return _check("anisette", "warn", f"{first_url} inutilisable ({why}) : repli sur {url} ({ms})", url)
+        detail = f"{url} : {data['client_info']} ({ms})"
+        # les autres serveurs que l'utilisateur a listés (pas le repli implicite du serveur par défaut)
+        for other, odata, oerr, odt in found[1:]:
+            if any(settings.same_server(other, u) for u in settings.anisette_urls()):
+                state = f"{odata['client_info']}" if _windows(odata) else (oerr or "données non Windows")
+                detail += f" ; {other} : {state} ({odt * 1000:.0f} ms)"
+        return _check("anisette", "ok", detail, url)
+    url, data, err, _ = found[-1]
+    if len(found) == 1 and data:
         # plumesign refuse un tel serveur sans rien envoyer à Apple : les renouvellements échoueront
         return _check("anisette", "error",
                       f"{url} répond « {data['client_info']} » : Apple n'accepte que des données Windows, "
                       "plumesign n'utilisera pas ce serveur (laisser le réglage vide pour le serveur par défaut)", url)
-    return _check("anisette", "error", " ; ".join(f"{u} : {e or 'données non Windows'}" for u, _, e in found), url)
+    return _check("anisette", "error", " ; ".join(f"{u} : {e or 'données non Windows'}" for u, _, e, _ in found), url)
+
+
+def _password_file() -> dict | None:
+    """TVSIGN_PASSWORD_FILE défini mais inutilisable : le mot de passe prévu n'est pas appliqué."""
+    if not PASSWORD_FILE_ERROR:
+        return None
+    return _check("password_file", "error", PASSWORD_FILE_ERROR)
 
 
 def _disk() -> dict:
@@ -169,6 +188,9 @@ async def run_all() -> dict:
         status = "ok" if abs(skew) < 120 else "error"
         clock = _check("clock", status, f"écart {skew:+.0f} s avec l'heure d'Apple", round(skew))
     checks = [plumesign_, mdns, apple, anis, github, clock, _disk(), _loop()]
+    pw = _password_file()
+    if pw:
+        checks.insert(0, pw)
     return {
         "checks": checks,
         "ok": all(c["status"] != "error" for c in checks),

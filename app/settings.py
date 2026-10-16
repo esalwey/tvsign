@@ -6,6 +6,7 @@ which are never exposed through /api/settings.
 """
 import os
 import re
+import time
 import urllib.parse
 
 from . import db
@@ -27,9 +28,15 @@ class Spec:
         self.default, self.kind, self.envs, self.check = default, kind, envs, check
 
 
+# Les erreurs de validation sont des CODES stables (traduits par l'interface, clés err_*), pas du texte :
+# « url_expected », « range:12:150 », « number_expected », « language_expected », « hour_expected »…
 def _url(value: str) -> None:
     if value and not re.match(r"^https?://[^\s/]+", value):
-        raise ValueError("adresse http(s):// attendue")
+        raise ValueError("url_expected")
+
+
+def split_urls(value: str) -> list[str]:
+    return [u for u in re.split(r"[\s,;]+", value or "") if u]
 
 
 def anisette_host(url: str) -> str:
@@ -47,39 +54,51 @@ def is_legacy_anisette(url: str) -> bool:
     return anisette_host(url) in LEGACY_ANISETTE_HOSTS
 
 
-def _anisette(value: str) -> None:
-    _url(value)
-    if value and is_legacy_anisette(value):
-        raise ValueError(f"serveur anisette Android, refusé par Apple depuis le 12 octobre 2026 : "
-                         f"laisser vide pour le serveur par défaut ({anisette_host(DEFAULT_ANISETTE)})")
+def _urls(value: str) -> None:
+    """Une ou plusieurs adresses http(s):// (séparées par des espaces, virgules ou retours à la ligne),
+    dont aucune ne désigne un serveur anisette Android (code « anisette_android:<hôte> »)."""
+    for one in split_urls(value):
+        _url(one)
+        if is_legacy_anisette(one):
+            raise ValueError(f"anisette_android:{anisette_host(one)}")
 
 
 def _hours(value: float) -> None:
     # profil gratuit = 7 jours (168 h) ; garder au moins 12 h de marge et un renouvellement possible
     if not 12 <= value <= 150:
-        raise ValueError("entre 12 et 150 heures")
+        raise ValueError("range:12:150")
 
 
 def _language(value: str) -> None:
     if value not in ("auto", "en", "fr"):
-        raise ValueError("auto, en ou fr")
+        raise ValueError("language_expected")
+
+
+def _hour(value: str) -> None:
+    if value and not (value.isdigit() and 0 <= int(value) <= 23):
+        raise ValueError("hour_expected")
 
 
 def _cert_revoke(value: str) -> None:
     if value not in ("never", "own", "any"):
-        raise ValueError("never, own ou any")
+        raise ValueError("cert_revoke_expected")
 
 
 PUBLIC: dict[str, Spec] = {
     "language": Spec("auto", str, ["TVSIGN_LANGUAGE"], _language),
     "ntfy_url": Spec("", str, ["TVSIGN_NTFY_URL"], _url),
     "renew_before_hours": Spec(60.0, float, ["TVSIGN_RENEW_BEFORE_HOURS"], _hours),
-    # vide = serveur par défaut de plumesign (DEFAULT_ANISETTE, repli FALLBACK_ANISETTE)
-    "anisette_url": Spec("", str, ["TVSIGN_ANISETTE_URL", "PLUMESIGN_ANISETTE_URL", "ANISETTE_URL_V3"], _anisette),
+    # vide = serveur par défaut de plumesign (DEFAULT_ANISETTE, repli FALLBACK_ANISETTE). Plusieurs adresses :
+    # la première d'abord, la suivante prend le relais si le serveur anisette tombe (voir plume._plume).
+    "anisette_url": Spec("", str, ["TVSIGN_ANISETTE_URL", "PLUMESIGN_ANISETTE_URL", "ANISETTE_URL_V3"], _urls),
     # Compte Apple plein (2 certificats de développement) : quels certificats plumesign peut révoquer.
     # own = seulement ceux de cette installation (et les morts) ; never = aucun ; any = tous (Xcode,
     # SideStore... compris : leurs apps cesseraient de se lancer).
     "cert_revoke": Spec("own", str, ["TVSIGN_CERT_REVOKE", "PLUMESIGN_REVOKE"], _cert_revoke),
+    # Plage horaire (heure locale) des renouvellements NON urgents ; vide = à toute heure.
+    # Ignorée quand il reste moins de 24 h, et pour un renouvellement lancé à la main.
+    "renew_window_start": Spec("", str, ["TVSIGN_RENEW_WINDOW_START"], _hour),
+    "renew_window_end": Spec("", str, ["TVSIGN_RENEW_WINDOW_END"], _hour),
 }
 
 
@@ -108,7 +127,7 @@ def _convert(spec: Spec, raw):
         try:
             value = float(raw)
         except (TypeError, ValueError):
-            raise ValueError("nombre attendu") from None
+            raise ValueError("number_expected") from None
     else:
         value = str(raw if raw is not None else "").strip()
     if spec.check:
@@ -168,10 +187,10 @@ def update(values: dict) -> dict:
     for key, raw in values.items():
         spec = PUBLIC.get(key)
         if not spec:
-            errors[key] = "réglage inconnu"
+            errors[key] = "unknown_setting"
             continue
         if _env(spec):
-            errors[key] = f"défini par {_env(spec)[0]}"
+            errors[key] = f"set_by_env:{_env(spec)[0]}"
             continue
         if raw is None or raw == "":
             todo[key] = None
@@ -180,6 +199,16 @@ def update(values: dict) -> dict:
             todo[key] = _convert(spec, raw)
         except ValueError as e:
             errors[key] = str(e)
+    if not errors and ("renew_window_start" in values or "renew_window_end" in values):
+        # une seule borne de la plage horaire serait ignorée sans le dire (renouvellements à toute heure)
+        pair = {}
+        for key in ("renew_window_start", "renew_window_end"):
+            if key in todo:
+                pair[key] = todo[key] or ""
+            else:
+                pair[key] = str(get(key) or "")
+        if bool(pair["renew_window_start"]) != bool(pair["renew_window_end"]):
+            errors["renew_window_end" if "renew_window_end" in values else "renew_window_start"] = "window_incomplete"
     if errors:
         raise ValueError(errors)
     for key, value in todo.items():
@@ -191,14 +220,17 @@ def migrate() -> None:
     """Au démarrage : un serveur anisette Android enregistré (réglage ou variable d'environnement) ne
     marche plus, on le remplace par le serveur par défaut et on le dit dans le journal."""
     stored = raw_get("anisette_url")
-    if stored and is_legacy_anisette(stored):
-        raw_set("anisette_url", None)
-        db.log(f"Serveur anisette {stored} remplacé par le serveur par défaut ({DEFAULT_ANISETTE}) : "
-               "Apple refuse les données des serveurs anisette Android depuis le 12 octobre 2026 "
+    legacy = [u for u in split_urls(stored) if is_legacy_anisette(u)]
+    if legacy:
+        kept = [u for u in split_urls(stored) if not is_legacy_anisette(u)]
+        raw_set("anisette_url", " ".join(kept) if kept else None)
+        db.log(f"Serveur anisette {' '.join(legacy)} retiré, "
+               + (f"{' '.join(kept)} conservé" if kept else f"remplacé par le serveur par défaut ({DEFAULT_ANISETTE})")
+               + " : Apple refuse les données des serveurs anisette Android depuis le 12 octobre 2026 "
                "(erreur -80045)", "warn")
     for name in PUBLIC["anisette_url"].envs:
         value = os.environ.get(name, "").strip()
-        if value and is_legacy_anisette(value):
+        if value and any(is_legacy_anisette(u) for u in split_urls(value)):
             db.log(f"{name}={value} pointe vers un serveur anisette Android, refusé par Apple : ignoré, "
                    f"le serveur par défaut ({DEFAULT_ANISETTE}) est utilisé. Retire cette variable.", "warn")
 
@@ -212,9 +244,15 @@ def ntfy_url() -> str:
 
 
 def anisette_url() -> str:
-    """Serveur anisette choisi par l'utilisateur ; vide = serveur par défaut avec son serveur de repli.
+    """Première adresse anisette choisie par l'utilisateur (vide : serveur par défaut avec son repli).
     Une adresse de serveur Android n'est jamais renvoyée (valeur invalide : défaut)."""
-    return get("anisette_url")
+    urls = anisette_urls()
+    return urls[0] if urls else ""
+
+
+def anisette_urls() -> list[str]:
+    """Adresses choisies par l'utilisateur, dans l'ordre (vide : serveur par défaut)."""
+    return split_urls(get("anisette_url"))
 
 
 def same_server(a: str, b: str) -> bool:
@@ -223,13 +261,52 @@ def same_server(a: str, b: str) -> bool:
 
 
 def anisette_servers() -> list[str]:
-    """Serveurs que plumesign essaiera, dans l'ordre. Comme lui : le réglage vide, ou l'adresse par défaut
-    saisie telle quelle, donne le serveur par défaut et son repli ; tout autre serveur est utilisé seul."""
-    custom = anisette_url()
-    if custom and not same_server(custom, DEFAULT_ANISETTE):
-        return [custom]
-    return [DEFAULT_ANISETTE, FALLBACK_ANISETTE]
+    """Serveurs que le renouvellement essaiera, dans l'ordre. Comme plumesign : le réglage vide, ou l'adresse
+    par défaut saisie telle quelle, donne le serveur par défaut et son repli ; tout autre serveur est utilisé
+    tel quel, les suivants de la liste prenant le relais s'il tombe."""
+    out: list[str] = []
+    for url in anisette_urls() or [DEFAULT_ANISETTE]:
+        for one in ([DEFAULT_ANISETTE, FALLBACK_ANISETTE] if same_server(url, DEFAULT_ANISETTE) else [url]):
+            if not any(same_server(one, seen) for seen in out):
+                out.append(one)
+    return out
 
 
 def cert_revoke() -> str:
     return get("cert_revoke")
+
+
+def renew_window() -> tuple[int, int] | None:
+    """(début, fin) en heures locales, ou None si aucune plage n'est définie."""
+    start, end = get("renew_window_start"), get("renew_window_end")
+    if start == "" or end == "":
+        return None
+    return int(start), int(end)
+
+
+def in_renew_window(now: float, window: tuple[int, int] | None = None, tz_hour: int | None = None) -> bool:
+    """Vrai si l'heure locale est dans la plage (qui peut passer minuit, ex. 23 -> 6). Début = fin :
+    toute la journée."""
+    window = window if window is not None else renew_window()
+    if not window:
+        return True
+    start, end = window
+    hour = tz_hour if tz_hour is not None else time.localtime(now).tm_hour
+    if start == end:
+        return True
+    return start <= hour < end if start < end else hour >= start or hour < end
+
+
+def next_window_start(ts: float, window: tuple[int, int] | None = None) -> float:
+    """Premier instant >= ts où un renouvellement non urgent est permis : ts lui-même dans la plage, sinon
+    le prochain début de plage (heure locale pleine)."""
+    window = window if window is not None else renew_window()
+    if in_renew_window(ts, window):
+        return ts
+    lt = time.localtime(ts)
+    t = ts - lt.tm_min * 60 - lt.tm_sec        # début de l'heure locale en cours
+    for _ in range(50):                        # au plus un jour et demi (changements d'heure compris)
+        t += 3600
+        if in_renew_window(t, window):
+            return t
+    return ts

@@ -104,7 +104,7 @@ class CertificateExpiry(unittest.TestCase):
             Path(args[6]).write_bytes(b"signed")        # -o <tmp>
             return SimpleNamespace(ok=True, output="CERT 0AB 2027-05-06\n", tail=lambda n=1: "")
 
-        restore = patched(_locked=lambda: FakeLock(), _as=lambda e: FakeLock(), run=fake_run)
+        restore = patched(_locked=lambda *a, **k: FakeLock(), _as=lambda e: FakeLock(), run=fake_run)
         try:
             revoked = asyncio.run(plume.sign("sign@example.com", out_dir / "in.ipa", out_dir / "out.ipa"))
         finally:
@@ -121,7 +121,7 @@ class CertificateExpiry(unittest.TestCase):
             Path(args[6]).write_bytes(b"x")
             return SimpleNamespace(ok=True, output=output, tail=lambda n=1: "")
 
-        restore = patched(_locked=lambda: FakeLock(), _as=lambda e: FakeLock(), run=fake_run)
+        restore = patched(_locked=lambda *a, **k: FakeLock(), _as=lambda e: FakeLock(), run=fake_run)
         try:
             return asyncio.run(plume.sign("sign@example.com", out_dir / "in.ipa", out_dir / "o.ipa"))
         finally:
@@ -144,7 +144,7 @@ class CertificateExpiry(unittest.TestCase):
         async def fake_run(*args, **kwargs):
             return SimpleNamespace(ok=True, output="", tail=lambda n=1: "")
 
-        restore = patched(_locked=lambda: FakeLock(), _as=lambda e: FakeLock(), run=fake_run)
+        restore = patched(_locked=lambda *a, **k: FakeLock(), _as=lambda e: FakeLock(), run=fake_run)
         try:
             settings.raw_set("cert_expires:" + email, "2027-01-01")
             asyncio.run(plume.set_team(email, "ABCDE12345"))
@@ -178,7 +178,7 @@ class Teams(unittest.TestCase):
             seen.append(args[1:])
             return SimpleNamespace(ok=True, output=self.LINES)
 
-        restore = patched(_locked=lambda: FakeLock(), _as=lambda e: FakeLock(), run=fake_run)
+        restore = patched(_locked=lambda *a, **k: FakeLock(), _as=lambda e: FakeLock(), run=fake_run)
         try:
             teams = asyncio.run(plume.teams("a@b.c"))
         finally:
@@ -193,7 +193,7 @@ class Teams(unittest.TestCase):
             return SimpleNamespace(ok=False, code=1, tail=lambda n=1: "x",
                                    output="ERROR Developer API error 1100: session expired\n")
 
-        restore = patched(_locked=lambda: FakeLock(), _as=lambda e: FakeLock(), run=fake_run)
+        restore = patched(_locked=lambda *a, **k: FakeLock(), _as=lambda e: FakeLock(), run=fake_run)
         try:
             db.init()
             with self.assertRaises(plume.SessionExpired):
@@ -208,7 +208,7 @@ class Teams(unittest.TestCase):
             calls.append(args)
             return SimpleNamespace(ok=True, output="")
 
-        restore = patched(_locked=lambda: FakeLock(), _as=lambda e: FakeLock(), run=fake_run)
+        restore = patched(_locked=lambda *a, **k: FakeLock(), _as=lambda e: FakeLock(), run=fake_run)
         try:
             with self.assertRaises(ValueError):
                 asyncio.run(plume.set_team("a@b.c", "x; rm -rf"))

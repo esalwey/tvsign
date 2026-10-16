@@ -126,8 +126,13 @@
             </select></label>
           <label class="field"><span data-i18n="renew_before">Renew before expiry</span>
             <span class="field__unite"><input name="renew_before_hours" type="number" min="12" max="150" step="1" inputmode="numeric"><span aria-hidden="true">h</span></span></label>
+          <label class="field"><span data-i18n="renew_window_from">Renew only from</span>
+            <span class="field__unite"><input name="renew_window_start" type="number" min="0" max="23" step="1" inputmode="numeric" placeholder="—"><span aria-hidden="true">h</span></span></label>
+          <label class="field"><span data-i18n="renew_window_to">until</span>
+            <span class="field__unite"><input name="renew_window_end" type="number" min="0" max="23" step="1" inputmode="numeric" placeholder="—"><span aria-hidden="true">h</span></span></label>
         </div>
         <p class="group__footer" data-i18n="renew_before_note">A free Apple ID profile lasts 7 days (168 h). The default, 60 h, leaves two and a half days of margin if the Apple TV or this computer is off.</p>
+        <p class="group__footer" data-i18n="renew_window_note">Non-urgent renewals only happen within this range (local time; empty: any time). Ignored when less than 24 h remain, and for a manual renewal. Start = end: all day.</p>
       </section>
 
       <section class="group">
@@ -141,7 +146,7 @@
       <section class="group">
         <h2 class="group__header" data-i18n="signing_service">Signing service</h2>
         <div class="list">
-          <label class="field"><span data-i18n="anisette_server">Anisette server</span><input name="anisette_url" type="url" placeholder="https://ani.jkcoxson.com" autocomplete="off" spellcheck="false"></label>
+          <label class="field"><span data-i18n="anisette_server">Anisette server</span><input name="anisette_url" type="text" placeholder="https://ani.jkcoxson.com" autocomplete="off" spellcheck="false"></label>
         </div>
         <p class="group__footer" data-i18n="anisette_note">Used to sign in to Apple. Leave empty: tvsign uses ani.jkcoxson.com and switches to ani2.stikstore.app if it doesn't answer. A custom server must provide Windows anisette-v3 data (Apple refuses Android servers).</p>
       </section>

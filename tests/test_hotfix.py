@@ -184,8 +184,12 @@ class SettingValidation(AnisetteCase):
             settings.update({"anisette_url": "https://ani.sidestore.app"})
         errors = ctx.exception.args[0]
         self.assertIn("anisette_url", errors)
-        self.assertIn("Android", errors["anisette_url"])
-        self.assertIn("12 octobre 2026", errors["anisette_url"])
+        # the validation errors are stable codes, the interface translates them (err_anisette_android)
+        self.assertEqual(errors["anisette_url"], "anisette_android:ani.sidestore.app")
+        i18n = (ROOT / "web" / "i18n.js").read_text(encoding="utf-8")
+        line = next(l for l in i18n.splitlines() if l.lstrip().startswith("err_anisette_android:"))
+        self.assertIn("Android", line)
+        self.assertIn("12 octobre 2026", line)
         self.assertIsNone(settings.raw_get("anisette_url"))
 
     def test_custom_default_and_empty_are_accepted(self):
@@ -199,6 +203,63 @@ class SettingValidation(AnisetteCase):
     def test_a_bad_address_is_still_refused(self):
         with self.assertRaises(ValueError):
             settings.update({"anisette_url": "ani.jkcoxson.com"})
+
+
+class SeveralServers(AnisetteCase):
+    """Une liste de serveurs (secours choisis par l'utilisateur) et les règles Windows / Android du correctif."""
+
+    def test_a_list_with_an_android_server_is_refused_as_a_whole(self):
+        with self.assertRaises(ValueError) as ctx:
+            settings.update({"anisette_url": "https://anisette.example.org https://omni.ethxn.xyz"})
+        self.assertEqual(ctx.exception.args[0]["anisette_url"], "anisette_android:omni.ethxn.xyz")
+
+    def test_a_chosen_list_is_used_in_order_without_the_default_fallback(self):
+        settings.raw_set("anisette_url", "https://a.example https://b.example")
+        self.assertEqual(settings.anisette_urls(), ["https://a.example", "https://b.example"])
+        self.assertEqual(settings.anisette_servers(), ["https://a.example", "https://b.example"])
+
+    def test_the_default_inside_a_list_keeps_its_own_fallback(self):
+        settings.raw_set("anisette_url", f"{settings.DEFAULT_ANISETTE} https://b.example")
+        self.assertEqual(settings.anisette_servers(),
+                         [settings.DEFAULT_ANISETTE, settings.FALLBACK_ANISETTE, "https://b.example"])
+
+    def test_migration_drops_only_the_android_entries_of_a_stored_list(self):
+        settings.raw_set("anisette_url", "https://ani.sidestore.app https://b.example")
+        settings.migrate()
+        self.assertEqual(settings.raw_get("anisette_url"), "https://b.example")
+        settings.raw_set("anisette_url", "https://ani.sidestore.app https://ani.stikstore.app")
+        settings.migrate()
+        self.assertIsNone(settings.raw_get("anisette_url"))
+        self.assertEqual(len(self.logged), 2)
+
+    def test_a_refusal_from_apple_does_not_switch_servers(self):
+        calls = []
+
+        async def fake_run(*args, env=None, **kw):
+            calls.append(env.get("PLUMESIGN_ANISETTE_URL"))
+            return Result(1, "Error: Apple answered -80045 (cannot be completed at this time)\nanisette")
+        settings.raw_set("anisette_url", "https://a.example https://b.example")
+        saved = plume.run
+        plume.run = fake_run
+        try:
+            res = asyncio.run(plume._plume("account", "devices"))
+        finally:
+            plume.run = saved
+        self.assertFalse(res.ok)
+        self.assertEqual(calls, ["https://a.example"])
+
+    def test_diagnostic_lists_every_chosen_server(self):
+        settings.raw_set("anisette_url", "https://a.example https://b.example")
+        windows = AnisetteDiagnostic.WINDOWS
+        saved = diag._client_info
+        diag._client_info = lambda url: (windows, "") if url == "https://a.example" else (None, "injoignable")
+        try:
+            r = asyncio.run(diag._anisette())
+        finally:
+            diag._client_info = saved
+        self.assertEqual(r["status"], "ok")
+        self.assertIn("https://a.example", r["detail"])
+        self.assertIn("https://b.example : injoignable", r["detail"])
 
 
 class SettingsApi(AnisetteCase):
@@ -221,7 +282,7 @@ class SettingsApi(AnisetteCase):
         r = self.client.patch("/api/settings", headers=self.HEADERS, json={"anisette_url": "https://ani.stikstore.app"})
         self.assertEqual(r.status_code, 400)
         detail = r.json()["detail"]
-        self.assertIn("Android", detail["anisette_url"])
+        self.assertEqual(detail["anisette_url"], "anisette_android:ani.stikstore.app")
         self.assertIsNone(settings.raw_get("anisette_url"))
 
     def test_a_custom_server_is_saved_and_the_empty_value_returns_to_the_default(self):
@@ -455,10 +516,18 @@ class CheckAccount(unittest.TestCase):
                 return False
 
         self.saved = plume._locked, plume._as, plume.run
-        plume._locked, plume._as = (lambda: Lock()), (lambda e: Lock())
+        plume._locked, plume._as = (lambda *a, **k: Lock()), (lambda e: Lock())
+        # an account has to be in the store for check_account to look at it
+        plume.STORE.mkdir(parents=True, exist_ok=True)
+        (plume.STORE / "accounts.json").write_text(json.dumps({
+            "selected_account": self.email,
+            "accounts": {self.email: {"first_name": "C", "team_id": "TEAM"}}}), encoding="utf-8")
+        plume._LAST = {}
 
     def tearDown(self):
         plume._locked, plume._as, plume.run = self.saved
+        (plume.STORE / "accounts.json").unlink(missing_ok=True)
+        plume._LAST = {}
         plume.ALERTED.discard(self.email)
         db.execute("DELETE FROM account_status WHERE email = ?", self.email)
 
@@ -499,8 +568,10 @@ class Backoff(unittest.TestCase):
         normal = renew._retry_at(self.APP, now) - now
         transient = renew._retry_at(self.APP, now, transient=True) - now
         slow = renew._retry_at(self.APP, now, slow=True) - now
-        self.assertEqual(normal, renew.RETRY_MINUTES * 60)
-        self.assertEqual(transient, min(normal, 15 * 60))
+        # first failure of a row: the renewal engine's growing delay (renew.backoff_seconds)
+        self.assertEqual(normal, renew.backoff_seconds(1))
+        self.assertEqual(transient, renew.backoff_seconds(1, True))
+        self.assertLessEqual(transient, min(normal, 15 * 60))
         self.assertGreaterEqual(slow, renew.APPLE_BACKOFF_MINUTES * 60)
         self.assertGreaterEqual(slow, 3 * 3600)
 
@@ -644,7 +715,9 @@ class RefusedRenewals(unittest.TestCase):
         self.assertGreaterEqual(self.wait_after_failure("apple_refused"), hours)
         self.assertGreaterEqual(self.wait_after_failure("apple_rate_limited"), hours)
         usual = self.wait_after_failure("apple_503")
-        self.assertAlmostEqual(usual, renew.RETRY_MINUTES * 60, delta=30)
+        fails = db.row("SELECT fail_count FROM apps WHERE id = ?", self.app)["fail_count"]
+        self.assertAlmostEqual(usual, renew.backoff_seconds(fails), delta=30)    # the ordinary growing delay
+        self.assertLessEqual(usual, renew.RETRY_MINUTES * 60)
         self.assertLess(usual, hours)
 
 

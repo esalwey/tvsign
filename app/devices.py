@@ -45,6 +45,10 @@ class OldPlumesign(RuntimeError):
     """plumesign ne connaît pas cette commande ou cette option."""
 
 
+# Appelées (device_id) quand une Apple TV vient d'être (ré)appairée : enregistrées par renew.
+ON_PAIRED: list = []
+
+
 # Une connexion à la fois par appareil.
 _LOCKS: dict[int, asyncio.Lock] = {}
 
@@ -148,17 +152,22 @@ def start_pairing(identifier: str | None, ip: str, port: int, name: str) -> Sess
     Seule action qui fait apparaître un code sur une TV : déclenchée uniquement par l'utilisateur."""
     session = register(Session("pair", re.compile(r"^PIN_REQUIRED$")))
 
+    host = PAIR_HOST
+
     async def done(s: Session) -> None:
         match = next((m for l in reversed(s.lines) if (m := _PAIRED.match(l.strip()))), None)
-        if s.state != "done" or not match:
-            if s.state == "done":
+        if s.user_cancelled and not match:
+            db.log(f"Appairage de {name} annulé")      # choix de l'utilisateur, pas une panne
+            return
+        if not s.exit_ok or not match:
+            if s.exit_ok:
                 s.state = "failed"
             db.log(f"Appairage de {name} échoué : {' | '.join(s.lines[-2:])}", "error")
             return
         udid = match.group(2)
         existing = db.row("SELECT id FROM devices WHERE lower(pairing_udid) = lower(?) OR lower(udid) = lower(?) "
                           "OR lower(pair_identifier) = lower(?) ORDER BY id LIMIT 1", udid, udid, udid)
-        fields = dict(name=name, pair_identifier=udid, pairing_udid=udid, pair_host=PAIR_HOST,
+        fields = dict(name=name, pair_identifier=udid, pairing_udid=udid, pair_host=host,
                       pairing_lost=0, legacy_pairing=0, last_error=None, last_ip=ip)
         if existing:
             device_id = existing["id"]
@@ -168,7 +177,7 @@ def start_pairing(identifier: str | None, ip: str, port: int, name: str) -> Sess
         else:
             device_id = db.execute(
                 "INSERT INTO devices (name, pair_identifier, pairing_udid, udid, pair_host, last_ip, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)", name, udid, udid, udid, PAIR_HOST, ip, time.time())
+                "VALUES (?, ?, ?, ?, ?, ?, ?)", name, udid, udid, udid, host, ip, time.time())
         s.result["device_id"] = device_id
         s.result["udid"] = udid
         db.log(f"Apple TV « {name} » appairée")
@@ -177,8 +186,13 @@ def start_pairing(identifier: str | None, ip: str, port: int, name: str) -> Sess
             await refresh_info(device_id)
         except Exception as e:  # noqa: BLE001
             db.log(f"Infos de {name} non récupérées pour l'instant : {e}", "warn")
+        for hook in ON_PAIRED:
+            try:
+                hook(device_id)
+            except Exception as e:  # noqa: BLE001 - accessoire
+                db.log(f"reprise après appairage de {name} : {e}", "warn")
 
-    args = ["pair", "--ip", ip, "--port", port, "--host", PAIR_HOST]
+    args = ["pair", "--ip", ip, "--port", port, "--host", host]
     if identifier:
         args += ["--identifier", identifier]
     env = plume.env()

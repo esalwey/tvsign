@@ -196,12 +196,14 @@ Apple refuses the data of the servers that generate it as Android (error `-80045
 - tvsign uses `https://ani.jkcoxson.com`, which serves Windows anisette, and switches to
   `https://ani2.stikstore.app` by itself when it does not answer. **Leave the Settings field empty**
   for that. The client info and user agent sent to Apple are the ones the server announces.
-- A server you choose yourself (Settings, or `TVSIGN_ANISETTE_URL`) is used alone, without fallback,
-  and must serve Windows data too: a server that announces anything else is not used (tvsign says so and
-  sends nothing to Apple, which would only answer `-80045` or a 503 page). A setting that names one of
+- A server you choose yourself (Settings, or `TVSIGN_ANISETTE_URL`) is used without the default's
+  fallback (several addresses: see "Several anisette servers"), and must serve Windows data too: a server
+  that announces anything else is not used (tvsign says so and sends nothing to Apple, which would only
+  answer `-80045` or a 503 page). A setting that names one of
   the old Android servers (`ani.sidestore.app`, `ani.stikstore.app`, `anisette.crystall1ne.dev`,
-  `ani3server.fly.dev`, `ani.jaydenha.uk`, `omni.ethxn.xyz`) is replaced by the default, with a line in
-  the log; the same value in an environment variable is ignored.
+  `ani3server.fly.dev`, `ani.jaydenha.uk`, `omni.ethxn.xyz`) is refused when typed in Settings, and
+  removed (replaced by the default if none is left) with a line in the log when it was stored before;
+  the same value in an environment variable is ignored.
 - The anisette identity is created again by itself (the old one, `state.plist` in the `PlumeImpactor`
   folder, is deleted) and provisioned again whenever the server or Apple says it is not valid.
 - Accounts that were already connected keep renewing as long as Apple accepts their session. If it
@@ -222,6 +224,77 @@ If signing in still fails:
   empty. Settings › Diagnostics tells whether the anisette server answers and serves Windows data.
 - **HTTP 429**: too many requests. Do not insist: tvsign waits several hours before trying again by itself,
   and the account does not need to be signed in again.
+
+### How renewals behave
+
+- Renewals run side by side: an app waiting for the Apple TV (or for you to close it) never delays
+  the others, the expiry alerts or the account checks. The most urgent app is always started first.
+- After Apple refuses a request outright (`-80045`, HTTP 429), tvsign waits much longer
+  (`TVSIGN_APPLE_BACKOFF_MINUTES`, 180 by default; 30 min at most in the last 12 hours): every new
+  attempt can lengthen Apple's block. Other failures are retried with a growing delay (10, 20, 40 min… up to `TVSIGN_RETRY_MINUTES`,
+  45 by default; 5 to 15 min when the cause is passing, such as the TV asleep or the anisette server
+  down; 10 min at most in the last 12 hours). A failure only you can fix (Apple session expired,
+  pairing lost, free-account limit, no Apple TV or `.ipa`) shows **Action needed** on the card and
+  is not retried blindly; reconnecting the account, pairing again, editing the app or pressing
+  **Renew** resumes it at once.
+- A session marked expired is checked again with Apple before an app is refused, and a failed
+  check is not final: one passing network or anisette error cannot lock renewals for hours.
+- The card shows the version actually installed on the Apple TV ("1.0 installed · 1.1 pending")
+  until the new one is installed.
+- **Renewal time window** (Settings): restrict non-urgent renewals and updates to certain hours,
+  e.g. 02:00 to 06:00 (`TVSIGN_RENEW_WINDOW_START` / `TVSIGN_RENEW_WINDOW_END`, local time).
+  It never applies in the last 24 hours before expiry, nor to a manual renewal. Enter both a start and
+  an end hour (or neither); start = end means all day. While an app waits for the window, its card
+  says "Waiting for the time window (from N h)" and shows when the window opens instead of a
+  retry delay; it is not counted as late.
+- Loop and limits for tuning: `TVSIGN_CHECK_INTERVAL` (600 s, at least 30), `TVSIGN_RETRY_MINUTES`
+  (45, at least 5), `TVSIGN_ACCOUNT_CHECK_HOURS` (6, at least 1). An unreadable or out-of-range value
+  is replaced by the default (or clamped) with a warning in the log.
+
+### Free Apple ID limits
+
+A free account allows **3 active apps per Apple TV** and **10 App IDs per 7 days** (each extension,
+such as a TopShelf extension, uses one more). Apps installed with other tools (SideStore, AltStore,
+Xcode) count too. tvsign shows "active apps 2/3" per Apple TV on the account card and warns when
+you add a fourth. When Apple or the Apple TV refuses ("maximum number of installed apps…"), the
+app shows **Action needed** with the explanation and tvsign waits 24 hours instead of using up more
+App IDs. Free a slot (**Pause** an app, or remove it from the Apple TV) then press **Renew**.
+
+### Several anisette servers
+
+`TVSIGN_ANISETTE_URL` (or Settings › Signing service) accepts several addresses separated by spaces:
+if the first server is down, the next one takes over and is tried first from then on (the default
+server is used with its own fallback when the field is empty or lists it). Every server must serve
+Windows data (see above). Diagnostics lists each server with its response time. To run your own, `docker compose --profile anisette up -d`
+starts a local anisette-v3 server (`dadoum/anisette-v3-server`) on `127.0.0.1:6969`; put
+`http://127.0.0.1:6969` in the setting (host network: tvsign reaches it on loopback). Its data lives
+in the `anisette_data` Docker volume and the image is pinned to a tag and digest. If the server does
+not answer, check `docker compose logs anisette`.
+Like any other server it must announce Windows data to be used: Settings › Diagnostics says
+whether tvsign accepts it.
+
+### Forgot the admin password
+
+Run on the host that runs tvsign, as the data owner (not root):
+
+```sh
+docker exec -it -u 1000:1000 tvsign python -m app reset-password     # your PUID:PGID
+```
+
+It asks for a new password and signs every browser out. (The Windows edition's own window is trusted:
+Settings › Security changes the password without asking for the old one.) If the password comes from
+`TVSIGN_PASSWORD` or `TVSIGN_PASSWORD_FILE`, change that value and restart instead. A
+`TVSIGN_PASSWORD_FILE` that cannot be read (wrong path, a root-only secret while tvsign runs as
+`PUID`) is reported in the log and in Diagnostics: the preset password is **not** applied then.
+
+Sign out only ends the session of the browser you click it in (a copied cookie stops working, including one issued before this version);
+**Sign out everywhere** also ends all the others. Backups no longer contain the admin password hash.
+
+### Pairing identity
+
+Each installation presents its own host name to the Apple TV when pairing (`tvsign-xxxxxxxx`, picked
+once and kept in the data folder) so that two instances do not share one identity; override
+with `TVSIGN_PAIR_HOST`. Apple TVs already paired keep the name they were paired with.
 
 Building from source: see [docs/building.md](docs/building.md).
 
@@ -420,13 +493,14 @@ de la version 1.0.1 :
 - tvsign utilise `https://ani.jkcoxson.com`, qui fournit des données anisette Windows, et bascule tout
   seul sur `https://ani2.stikstore.app` quand il ne répond pas. **Laissez le champ des Réglages vide**
   pour cela. Le client info et le user agent envoyés à Apple sont ceux que le serveur annonce.
-- Un serveur choisi par vos soins (Réglages, ou `TVSIGN_ANISETTE_URL`) est utilisé seul, sans repli, et
-  doit lui aussi fournir des données Windows : un serveur qui annonce autre chose n'est pas utilisé
-  (tvsign le dit et n'envoie rien à Apple, qui répondrait seulement `-80045` ou une page 503). Un réglage
-  qui désigne l'un des anciens serveurs Android (`ani.sidestore.app`, `ani.stikstore.app`,
-  `anisette.crystall1ne.dev`, `ani3server.fly.dev`, `ani.jaydenha.uk`, `omni.ethxn.xyz`) est remplacé par
-  le serveur par défaut, avec une ligne dans le journal ; la même valeur dans une variable
-  d'environnement est ignorée.
+- Un serveur choisi par vos soins (Réglages, ou `TVSIGN_ANISETTE_URL`) est utilisé sans le repli du
+  serveur par défaut (plusieurs adresses : voir « Plusieurs serveurs anisette »), et doit lui aussi
+  fournir des données Windows : un serveur qui annonce autre chose n'est pas utilisé (tvsign le dit et
+  n'envoie rien à Apple, qui répondrait seulement `-80045` ou une page 503). Un serveur Android
+  (`ani.sidestore.app`, `ani.stikstore.app`, `anisette.crystall1ne.dev`, `ani3server.fly.dev`,
+  `ani.jaydenha.uk`, `omni.ethxn.xyz`) est refusé dans les Réglages, et retiré (remplacé par le serveur
+  par défaut s'il n'en reste aucun) avec une ligne dans le journal quand il était enregistré avant ; la
+  même valeur dans une variable d'environnement est ignorée.
 - L'identité anisette est recréée toute seule (l'ancienne, `state.plist` dans le dossier
   `PlumeImpactor`, est supprimée) et provisionnée de nouveau chaque fois que le serveur ou Apple dit
   qu'elle n'est plus valide.
@@ -451,6 +525,88 @@ Si la connexion échoue encore :
   Windows.
 - **HTTP 429** : trop de requêtes. N'insistez pas : tvsign attend plusieurs heures avant de réessayer
   seul, et il n'y a pas besoin de reconnecter le compte.
+
+### Comportement des renouvellements
+
+- Les renouvellements tournent en parallèle : une app qui attend l'Apple TV (ou que vous la fermiez)
+  ne retarde jamais les autres, les alertes d'expiration ni les contrôles de compte. L'app la plus
+  proche de l'expiration démarre toujours en premier.
+- Quand Apple refuse une requête d'emblée (`-80045`, HTTP 429), tvsign attend beaucoup plus longtemps
+  (`TVSIGN_APPLE_BACKOFF_MINUTES`, 180 par défaut ; 30 min au plus pendant les 12 dernières heures) :
+  chaque nouvel essai peut prolonger le blocage d'Apple. Les autres échecs sont réessayés avec un délai
+  croissant (10, 20, 40 min… jusqu'à
+  `TVSIGN_RETRY_MINUTES`, 45 par défaut ; 5 à 15 min quand la cause est passagère, comme une TV en
+  veille ou un serveur anisette en panne ; 10 min au plus pendant les 12 dernières heures). Un échec
+  que vous seul pouvez régler (session Apple expirée, appairage perdu, limite du compte gratuit,
+  pas d'Apple TV ni d'`.ipa`) affiche **Action requise** sur la carte et n'est pas réessayé à
+  l'aveugle ; reconnecter le compte, réappairer, modifier l'app ou toucher **Renouveler** le relance
+  aussitôt.
+- Une session marquée expirée est revérifiée auprès d'Apple avant de refuser une app, et une
+  vérification ratée n'est pas définitive : une panne passagère du réseau ou de l'anisette ne peut
+  plus bloquer les renouvellements pendant des heures.
+- La carte affiche la version réellement installée sur l'Apple TV (« 1.0 installée · 1.1 en
+  attente ») tant que la nouvelle n'est pas installée.
+- **Plage horaire des renouvellements** (Réglages) : limite les renouvellements et mises à jour non
+  urgents à certaines heures, par exemple de 2 h à 6 h (`TVSIGN_RENEW_WINDOW_START` /
+  `TVSIGN_RENEW_WINDOW_END`, heure locale). Elle ne s'applique jamais dans les 24 dernières heures
+  avant l'expiration, ni à un renouvellement manuel. Indiquer l'heure de début et l'heure de fin (ou
+  aucune des deux) ; début = fin signifie toute la journée. Tant qu'une app attend la plage, sa carte
+  affiche « En attente de la plage horaire (dès N h) » et l'ouverture de la plage au lieu d'un délai
+  de nouvel essai ; elle n'est pas comptée en retard.
+- Réglages de la boucle : `TVSIGN_CHECK_INTERVAL` (600 s, au moins 30), `TVSIGN_RETRY_MINUTES` (45,
+  au moins 5), `TVSIGN_ACCOUNT_CHECK_HOURS` (6, au moins 1). Une valeur illisible ou hors limites est
+  remplacée par le défaut (ou ramenée à la limite) avec un avertissement dans le journal.
+
+### Limites d'un Apple ID gratuit
+
+Un compte gratuit permet **3 apps actives par Apple TV** et **10 App ID par 7 jours** (chaque
+extension, comme une extension TopShelf, en consomme un de plus). Les apps installées avec d'autres
+outils (SideStore, AltStore, Xcode) comptent aussi. tvsign affiche « apps actives 2/3 » par Apple TV
+sur la carte du compte et prévient à l'ajout d'une quatrième. Quand Apple ou l'Apple TV refuse
+(« maximum number of installed apps… »), l'app affiche **Action requise** avec l'explication et
+tvsign attend 24 heures au lieu d'épuiser d'autres App ID. Libérez une place (**Pause** d'une app,
+ou suppression sur l'Apple TV) puis touchez **Renouveler**.
+
+### Plusieurs serveurs anisette
+
+`TVSIGN_ANISETTE_URL` (ou Réglages › Service de signature) accepte plusieurs adresses séparées par
+des espaces : si le premier serveur tombe, le suivant prend le relais et passe en premier ensuite (le
+serveur par défaut garde son propre repli quand le champ est vide ou le nomme). Chaque serveur doit
+fournir des données Windows (voir plus haut). Le diagnostic liste chaque serveur avec son temps de
+réponse. Pour héberger le vôtre,
+`docker compose --profile anisette up -d` lance un serveur anisette-v3 local
+(`dadoum/anisette-v3-server`) sur `127.0.0.1:6969` ; indiquer `http://127.0.0.1:6969` dans le réglage
+(réseau hôte : tvsign l'atteint en boucle locale). Ses données vivent dans le volume Docker
+`anisette_data` et l'image est figée sur un tag et un digest. Si le serveur ne répond pas, consulter
+`docker compose logs anisette`.
+Comme tout autre serveur, il doit annoncer des données Windows pour être utilisé : Réglages ›
+Diagnostic indique si tvsign l'accepte.
+
+### Mot de passe administrateur oublié
+
+À lancer sur la machine qui héberge tvsign, avec l'utilisateur propriétaire des données (pas root) :
+
+```sh
+docker exec -it -u 1000:1000 tvsign python -m app reset-password     # vos PUID:PGID
+```
+
+La commande demande un nouveau mot de passe et déconnecte tous les navigateurs. (La fenêtre de
+l'édition Windows est de confiance : Réglages › Sécurité change le mot de passe sans demander
+l'ancien.) Si le mot de passe vient de `TVSIGN_PASSWORD` ou `TVSIGN_PASSWORD_FILE`, modifier cette valeur et redémarrer.
+Un `TVSIGN_PASSWORD_FILE` illisible (mauvais chemin, secret réservé à root alors que tvsign tourne
+en `PUID`) est signalé dans le journal et dans le diagnostic : le mot de passe prévu n'est alors
+**pas** appliqué.
+
+« Se déconnecter » ne ferme que la session du navigateur utilisé (un cookie copié cesse de
+fonctionner, y compris s'il date d'avant cette version) ; **Se déconnecter partout** ferme aussi toutes les autres. Les sauvegardes ne
+contiennent plus l'empreinte du mot de passe administrateur.
+
+### Identité d'appairage
+
+Chaque installation présente son propre nom d'hôte à l'Apple TV lors de l'appairage (`tvsign-xxxxxxxx`,
+choisi une fois et conservé dans le dossier de données) pour que deux instances ne partagent pas
+la même identité ; `TVSIGN_PAIR_HOST` le remplace. Les Apple TV déjà appairées gardent le nom avec
+lequel elles l'ont été.
 
 Compiler soi-même : voir [docs/building.md](docs/building.md).
 

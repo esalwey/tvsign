@@ -92,7 +92,10 @@ class Session:
     kind: str
     prompt_re: re.Pattern
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
-    state: str = "running"               # running | waiting | done | failed
+    # running | waiting | finishing (plumesign a fini, on termine : modèle, version…) | done | failed
+    state: str = "running"
+    cancelled: bool = False              # abandon voulu par l'utilisateur (pas une panne)
+    exit_ok: bool = False                # plumesign est sorti avec le code 0
     prompt: str = ""
     lines: list[str] = field(default_factory=list)
     result: dict = field(default_factory=dict)
@@ -118,13 +121,18 @@ class Session:
             if self.prompt_re.search(text):
                 self.state, self.prompt = "waiting", text
         code = await self._proc.wait()
-        self.state = "done" if code == 0 else "failed"
+        self.exit_ok = code == 0 and not self.cancelled
+        # « done » seulement une fois le travail de fin terminé : l'interface n'annonce pas « appairée »
+        # alors que le modèle et la version de la TV sont encore en cours de lecture
+        self.state = "finishing" if self.exit_ok else "failed"
         if on_exit:
             try:
                 await on_exit(self)
             except Exception as e:  # noqa: BLE001 - on veut garder la session lisible
                 self.state = "failed"
                 self.lines.append(f"erreur après la fin : {e}")
+        if self.state == "finishing":
+            self.state = "done"
 
     async def send(self, text: str) -> None:
         assert self._proc and self._proc.stdin
@@ -133,10 +141,17 @@ class Session:
         await self._proc.stdin.drain()
 
     @property
+    def user_cancelled(self) -> bool:
+        """Fermée par l'utilisateur, pas abandonnée au bout du délai (qui, lui, est une panne)."""
+        return self.cancelled and not any(l.startswith("délai dépassé") for l in self.lines[-3:])
+
+    @property
     def alive(self) -> bool:
         return self._proc is not None and self._proc.returncode is None
 
     def cancel(self) -> None:
+        if self.state in ("running", "waiting"):
+            self.cancelled = True
         if self.alive:
             if self._proc.stdin:
                 self._proc.stdin.close()
@@ -177,7 +192,7 @@ def register(session: Session) -> Session:
 
 def busy() -> bool:
     """Une session interactive (connexion Apple, appairage) est en cours."""
-    return any(s.state in ("running", "waiting") for s in SESSIONS.values())
+    return any(s.state in ("running", "waiting", "finishing") for s in SESSIONS.values())
 
 
 # Tâches de fond : on garde une référence (sinon le ramasse-miettes peut les interrompre).

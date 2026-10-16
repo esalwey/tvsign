@@ -5,6 +5,7 @@ import shutil
 import time
 import zipfile
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -13,7 +14,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import auth, backup, db, devices, diag, ipa, plume, proc, renew, settings
@@ -35,10 +35,16 @@ async def lifespan(_: FastAPI):
                                                   or db.rows("SELECT id FROM devices LIMIT 1")):
         settings.raw_set("onboarded", "1")   # installation existante : pas d'assistant
     for f in TMP_DIR.glob("*"):
-        if f.is_file() and time.time() - f.stat().st_mtime > 3600:
-            f.unlink(missing_ok=True)
+        if f == plume.STAGE_DIR:
+            continue           # nettoyé par plume.sweep_stage(), au rythme de ses sous-dossiers
+        # fichiers (export interrompu) et dossiers (restauration interrompue : store Apple extrait) oubliés
+        try:
+            if time.time() - f.stat().st_mtime > 3600:
+                shutil.rmtree(f, ignore_errors=True) if f.is_dir() else f.unlink(missing_ok=True)
+        except OSError:
+            pass
     plume.sweep_stage()        # copies de travail de plumesign laissées par un processus tué
-    task = asyncio.create_task(renew.loop())
+    task = renew.start()
     yield
     # arrêt : une installation en cours peut finir avant que l'arrêt ne l'interrompe
     await renew.drain(SHUTDOWN_DRAIN_SECONDS)
@@ -123,7 +129,7 @@ async def _guarded(request: Request, path: str, call_next):
     # cookie glissant : renouvelé au-delà d'un jour d'ancienneté
     data = auth.read_cookie(request.cookies.get(auth.COOKIE))
     if data and not path.startswith("/api/auth/logout") and time.time() - data.get("iat", 0) > 86400:
-        response.set_cookie(value=auth.make_cookie(), **auth.cookie_args(request))
+        response.set_cookie(value=auth.make_cookie(data.get("sid")), **auth.cookie_args(request))
     return response
 
 
@@ -259,7 +265,12 @@ def auth_launch(request: Request, token: str = ""):
 
 
 @app.post("/api/auth/logout")
-def auth_logout():
+def auth_logout(request: Request):
+    # ce navigateur seulement : le cookie est révoqué côté serveur (un exemplaire copié ne vaut plus rien) ;
+    # « se déconnecter partout » reste le moyen de couper aussi les autres appareils
+    data = auth.read_cookie(request.cookies.get(auth.COOKIE))
+    if data and data.get("sid"):
+        auth.revoke(data["sid"])
     response = UTF8JSON({"ok": True})
     response.delete_cookie(auth.COOKIE, path="/")
     return response
@@ -324,20 +335,28 @@ def state():
         a["phase"] = renew.PHASE.get(a["id"]) if a["running"] else None
         exp = a["expires_at"]
         a["expired"] = bool(exp) and exp <= now
-        # moment où la boucle lancera le renouvellement automatique (None : dès que possible)
-        a["renew_at"] = exp - before * 3600 if exp else None
+        # moment où la boucle lancera le renouvellement automatique, plage horaire comprise ;
+        # window_wait : il attend l'ouverture de la plage (window_at)
+        a.update(renew.window_view(a, now, before))
         a["effective_account"] = a["account_email"] or default
     health = renew.health(now)
+    devices_ = db.rows("SELECT * FROM devices ORDER BY name")
+    accounts_ = plume.accounts()
+    slots = renew.account_slots(apps, devices_, accounts_, default)
+    for acc in accounts_:
+        acc["slots"] = slots.get(acc["email"], [])
     return {
         "now": now,
         "version": VERSION,
         "renew_before_hours": before,
+        "renew_window": settings.renew_window(),
+        "max_active_apps": renew.MAX_ACTIVE_APPS,
         "notifications": health["notifications"],
         "auth_disabled": not auth.enabled(),
         "health": health,
         "apps": apps,
-        "devices": db.rows("SELECT * FROM devices ORDER BY name"),
-        "accounts": plume.accounts(),
+        "devices": devices_,
+        "accounts": accounts_,
         "events": db.rows("SELECT * FROM events ORDER BY id DESC LIMIT 80"),
     }
 
@@ -371,7 +390,7 @@ def api_health(request: Request):
 def session_or_404(sid: str):
     s = SESSIONS.get(sid)
     if not s:
-        raise HTTPException(404, "session expirée")
+        raise HTTPException(404, "session_expired")
     return s
 
 
@@ -388,7 +407,7 @@ class Answer(BaseModel):
 async def session_answer(sid: str, body: Answer):
     s = session_or_404(sid)
     if s.state != "waiting":
-        raise HTTPException(409, "aucune saisie attendue")
+        raise HTTPException(409, "no_input_expected")
     await s.send(body.value)
     return s.public()
 
@@ -411,29 +430,46 @@ class Login(BaseModel):
 # async : start_login crée des tâches asyncio, impossible depuis le pool de threads d'une route « def »
 @app.post("/api/accounts/login")
 async def account_login(body: Login):
-    return plume.start_login(body.email.strip(), body.password).public()
+    email = body.email.strip()
+    if not email or not body.password:
+        raise HTTPException(400, "credentials_required")
+    return plume.start_login(email, body.password).public()
+
+
+def account_or_404(email: str) -> str:
+    """Écriture du store pour ce compte (la casse de l'adresse ne compte pas), ou 404."""
+    known = plume.find_account(email)
+    if not known:
+        raise HTTPException(404, "unknown_account")
+    return known
 
 
 @app.post("/api/accounts/{email}/check")
 async def account_check(email: str):
-    return {"ok": await plume.check_account(email)}
+    return {"ok": await plume.check_account(account_or_404(email))}
 
 
 @app.post("/api/accounts/{email}/select")
 async def account_select(email: str):
+    email = account_or_404(email)
     try:
         await plume.select(email)
     except plume.UnknownAccount:
         raise HTTPException(404, "unknown_account") from None
+    except plume.Busy:
+        raise HTTPException(503, "plumesign_busy") from None      # occupé (connexion Apple en attente ?)
     return {"ok": True}
 
 
 @app.delete("/api/accounts/{email}")
 async def account_delete(email: str):
+    email = account_or_404(email)
     try:
         await plume.logout(email)
     except plume.UnknownAccount:
         raise HTTPException(404, "unknown_account") from None
+    except plume.Busy:
+        raise HTTPException(503, "plumesign_busy") from None
     except RuntimeError as e:
         db.log(f"Déconnexion de {email} échouée : {e}", "error")
         raise HTTPException(502, "logout_failed") from None
@@ -487,7 +523,7 @@ class Pair(BaseModel):
 @app.post("/api/devices/pair")
 async def device_pair(body: Pair):
     if not re.fullmatch(r"[0-9A-Fa-f:.%\w-]+", body.ip) or not 0 < body.port < 65536:
-        raise HTTPException(400, "adresse invalide")
+        raise HTTPException(400, "invalid_address")
     return devices.start_pairing(body.identifier, body.ip, body.port, body.name.strip() or "Apple TV").public()
 
 
@@ -547,8 +583,10 @@ def presets():
 
 async def _check_source(source_type: str, source: str | None) -> str | None:
     source = (source or "").strip() or None
-    if source_type == "github" and not re.fullmatch(r"[\w.-]+/[\w.-]+", source or ""):
-        raise HTTPException(400, "invalid_repo")
+    if source_type == "github":
+        source = ipa.normalize_repo(source)     # accepte aussi une adresse github.com collée telle quelle
+        if not source:
+            raise HTTPException(400, "invalid_repo")
     if source_type == "url":
         if not (source or "").startswith("https://"):
             raise HTTPException(400, "https_only")
@@ -598,7 +636,12 @@ async def app_create(
         raise HTTPException(400, "unknown_device")
 
     # compte figé dès la création : en changer créerait une 2e copie (autre équipe = autre bundle ID)
-    account = account_email or plume.default_account()
+    if account_email and account_email.strip():
+        account = plume.find_account(account_email)
+        if not account:
+            raise HTTPException(400, "unknown_account")
+    else:
+        account = plume.default_account()
     # enabled = 0 tant que l'IPA n'est pas validée : la boucle de renouvellement ne voit pas l'app à moitié ajoutée
     app_id = db.execute(
         "INSERT INTO apps (name, source_type, source, source_filter, channel, preset, asset_name, device_id, "
@@ -624,21 +667,25 @@ async def app_create(
         if info["platform"] != "appletvos":
             raise HTTPException(400, f"not_tvos:{info['platform'] or 'unknown'}")
         # même app, même compte : une 2e fiche signerait deux fois et les copies s'écraseraient sur la TV
-        if info["bundle_id"] and db.row(
-                "SELECT id FROM apps WHERE id != ? AND bundle_id = ? AND COALESCE(account_email, '') = ?",
-                app_id, info["bundle_id"], account or ""):
+        if db.row("SELECT id FROM apps WHERE id != ? AND bundle_id = ? AND COALESCE(account_email, '') = ?",
+                  app_id, info["bundle_id"], account or ""):
             raise HTTPException(409, "already_added")
+        db.update("apps", app_id, name=info["name"], bundle_id=info["bundle_id"], version=info["version"],
+                  enabled=1)
     except HTTPException:
         _abort_add(app_id)
         raise
-    except Exception as e:  # noqa: BLE001
+    except BaseException as e:  # noqa: BLE001 - y compris l'annulation (arrêt, client parti) : pas de ligne fantôme
         _abort_add(app_id)
-        raise HTTPException(400, str(e))
-
-    db.update("apps", app_id, name=info["name"], bundle_id=info["bundle_id"], version=info["version"], enabled=1)
+        if isinstance(e, Exception):
+            raise HTTPException(400, str(e)) from None
+        raise
     db.log(f"App ajoutée : {info['name']} {info['version']} ({info['bundle_id']})", app_id=app_id)
     renew.spawn(app_id, "ajout")
-    return db.row("SELECT * FROM apps WHERE id = ?", app_id)
+    created = db.row("SELECT * FROM apps WHERE id = ?", app_id)
+    # au-delà de 3 apps actives pour ce compte sur cette Apple TV, la limite du compte gratuit sera atteinte
+    created["warnings"] = renew.add_warnings(created)
+    return created
 
 
 class AppPatch(BaseModel):
@@ -666,7 +713,13 @@ async def app_patch(app_id: int, body: AppPatch):
     else:
         fields["enabled"] = int(fields["enabled"])
     if "account_email" in fields:
-        fields["account_email"] = fields["account_email"] or plume.default_account()
+        wanted = (fields["account_email"] or "").strip()
+        if wanted:
+            fields["account_email"] = plume.find_account(wanted)
+            if not fields["account_email"]:
+                raise HTTPException(400, "unknown_account")
+        else:
+            fields["account_email"] = plume.default_account()
     if "source" in fields:
         fields["source"] = await _check_source(a["source_type"], fields["source"])
         if a["preset"] and fields["source"] != a["source"]:
@@ -687,7 +740,9 @@ async def app_patch(app_id: int, body: AppPatch):
     if dest_changed:
         # autre appareil/compte : la signature déjà prête ne convient plus
         (renew.app_dir(app_id) / "signed.ipa").unlink(missing_ok=True)
-        fields["next_attempt_at"] = None
+    if dest_changed or source_changed or fields.get("enabled") == 1:
+        # l'utilisateur a agi : on repart de zéro (plus d'attente, ni d'action requise, ni de délai croissant)
+        fields.update(next_attempt_at=None, needs_action=None, fail_count=0)
     db.update("apps", app_id, **fields)
     if dest_changed:
         renew.rerun(app_id)    # un renouvellement en cours vise l'ancienne destination
@@ -699,7 +754,7 @@ async def app_patch(app_id: int, body: AppPatch):
 @app.post("/api/apps/{app_id}/renew")
 async def app_renew(app_id: int):
     app_or_404(app_id)
-    db.update("apps", app_id, next_attempt_at=None)
+    renew.clear_block(app_id)
     return {"ok": True, "started": renew.spawn(app_id, "manuel")}
 
 
@@ -712,7 +767,7 @@ def app_delete(app_id: int):
     db.execute("DELETE FROM apps WHERE id = ?", app_id)
     db.execute("DELETE FROM events WHERE app_id = ?", app_id)   # sinon l'identifiant réutilisé hérite de ce journal
     shutil.rmtree(renew.app_dir(app_id), ignore_errors=True)
-    renew.PHASE.pop(app_id, None)
+    renew.forget(app_id)       # l'identifiant peut être réattribué : rien de l'ancienne app ne doit survivre
     if a:
         db.log(f"App supprimée : {a['name']}")
     return {"ok": True}
@@ -746,7 +801,7 @@ class NotifyTest(BaseModel):
 async def settings_test_notification(body: NotifyTest):
     url = (body.url or "").strip() or None
     if url and not re.match(r"^https?://", url):
-        raise HTTPException(400, "adresse http(s):// attendue")
+        raise HTTPException(400, "url_expected")
     try:
         await renew.notify_test(url)
     except Exception as e:  # noqa: BLE001
@@ -761,18 +816,35 @@ async def diagnostics():
 
 # ---------- sauvegarde ----------
 
+class _SelfDeletingFile(FileResponse):
+    """Réponse fichier dont le fichier disparaît à la fin de l'envoi, réussi, interrompu ou annulé."""
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            Path(self.path).unlink(missing_ok=True)
+
+
 @app.get("/api/backup/export")
 async def backup_export(uploads: bool = False):
-    async with plume._locked():      # accounts.json pas en cours de réécriture
-        path = await asyncio.to_thread(backup.export, uploads)
-    return FileResponse(path, filename=path.name, media_type="application/zip",
-                        background=BackgroundTask(path.unlink, missing_ok=True))
+    if proc.busy():
+        # connexion Apple (code 2FA en attente) ou appairage en cours : plumesign est tenu, l'export
+        # resterait suspendu jusqu'à 15 min sans rien dire
+        raise HTTPException(409, "busy")
+    try:
+        async with plume._locked():      # accounts.json pas en cours de réécriture
+            path = await asyncio.to_thread(backup.export, uploads)
+    except plume.Busy:
+        raise HTTPException(503, "plumesign_busy") from None
+    # l'archive contient les secrets : supprimée même si le téléchargement est interrompu
+    return _SelfDeletingFile(path, filename=path.name, media_type="application/zip")
 
 
 @app.post("/api/backup/import")
 async def backup_import(file: UploadFile = File(...)):
     if renew._RUNNING or proc.busy():
-        raise HTTPException(409, "renouvellement, connexion ou appairage en cours : réessaie dans un instant")
+        raise HTTPException(409, "busy")
     tmp = TMP_DIR / f"import-{int(time.time())}.zip"
     try:
         limit, got = MAX_UPLOAD_MB * 1024 * 1024, 0
@@ -782,11 +854,15 @@ async def backup_import(file: UploadFile = File(...)):
                 if got > limit:
                     raise HTTPException(413, f"too_large:{MAX_UPLOAD_MB}")
                 f.write(chunk)
-        async with plume._locked():
-            try:
-                counts = await asyncio.to_thread(backup.restore, tmp)
-            except ValueError as e:
-                raise HTTPException(400, str(e)) from None
+        try:
+            async with plume._locked():
+                try:
+                    counts = await asyncio.to_thread(backup.restore, tmp)
+                except ValueError as e:
+                    raise HTTPException(400, str(e)) from None
+        except plume.Busy:
+            raise HTTPException(503, "plumesign_busy") from None
+        auth.load_revoked()
         renew.startup()
         await devices.sync_store()
         return {"ok": True, **counts}
