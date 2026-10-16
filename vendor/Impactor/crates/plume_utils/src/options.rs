@@ -26,6 +26,9 @@ pub struct SignerOptions {
     pub app: SignerApp,
     /// Apply autorefresh
     pub refresh: bool,
+    /// The provisioning profile comes from the user (`--provision`): resolve its wildcards
+    /// (`TEAMID.*`) even when the binary has no entitlements to merge.
+    pub resolve_profile_wildcards: bool,
 }
 
 impl Default for SignerOptions {
@@ -43,6 +46,7 @@ impl Default for SignerOptions {
             tweaks: None,
             app: SignerApp::Default,
             refresh: false,
+            resolve_profile_wildcards: false,
         }
     }
 }

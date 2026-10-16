@@ -371,6 +371,32 @@ next `scripts/vendor-impactor` run, and rebase `vendor/patches/0001-tvsign-unica
   and `devices` (iOS when absent, as before the flag worked).
 - Tests: family from class then model, import of a valid file and of garbage, platform names.
 
+## Imported certificates (plume_core, plume_utils, plumesign)
+
+`plumesign sign -p app.ipa --pem cert.pem key.pem --provision profile.mobileprovision -o out.ipa` is the
+upstream route for a certificate of your own: no Apple session, no anisette, nothing sent to Apple. tvsign
+uses it for the apps set to an imported certificate (`app/imported_cert.py` turns the .p12 into that PEM
+pair). The wildcard profile that providers hand out did not work with it, so:
+
+- `crates/plume_core/src/utils/mod.rs`: `resolve_wildcard` turns `TEAMID.*` and the prefix form
+  `TEAMID.com.example.*` into `TEAMID.<application id>`. `merge_entitlements` uses it; the old rule replaced
+  the star by the application id, which repeated the prefix of `TEAMID.com.example.*`
+  (`TEAMID.com.example.com.example.app`). The result for `TEAMID.*` (the Apple ID route's keychain group) is
+  unchanged.
+- `crates/plume_core/src/utils/provision.rs`: `MobileProvision::resolve_wildcards(application_id)`.
+  `merge_entitlements` only runs when the binary already carries entitlements; an unsigned binary (the usual
+  IPA) has none, so the profile's `application-identifier = TEAMID.*` was signed as it was and installd
+  refuses it.
+- `crates/plume_utils/src/options.rs`, `signer.rs`: `SignerOptions::resolve_profile_wildcards`. When the merge
+  fails and the flag is set, `sign_single_bundle` calls `resolve_wildcards` for each bundle (apps and
+  extensions, each with its own identifier).
+- `apps/plumesign/src/commands/sign.rs`: the flag is set when `--provision` is given. The `--apple-id` route
+  never sets it, so what it signs is unchanged.
+- Tests: `utils::tests` in plume_core (full wildcard, prefix wildcard, other strings, the merge). End to end,
+  `tests/test_imported_cert.py` (`PlumesignEndToEnd`) signs a minimal unsigned tvOS IPA with a wildcard, a
+  prefix and an exact profile, with an extension too, and reads the entitlements back (skipped when
+  plumesign is not built).
+
 ## Misc
 
 - `crates/plume_utils/src/cgbi.rs`: a CgBI PNG with a zero or huge dimension, or a huge inflated size,

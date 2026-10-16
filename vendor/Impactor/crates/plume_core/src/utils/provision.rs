@@ -59,6 +59,25 @@ impl MobileProvision {
         Ok(())
     }
 
+    /// Replaces the wildcards of the profile's entitlements (`TEAMID.*`, `TEAMID.com.example.*`) by
+    /// the identifier of the app. `merge_entitlements` does it too, but only when the binary already
+    /// carries entitlements: an unsigned binary (the usual IPA) has none, and the wildcard would be
+    /// signed as it is, which installd refuses. Used with an imported profile only.
+    pub fn resolve_wildcards(&mut self, application_id: &str) {
+        let team_id = self
+            .entitlements
+            .get("com.apple.developer.team-identifier")
+            .and_then(Value::as_string)
+            .map(|s| s.to_owned());
+
+        crate::utils::merge_entitlements(
+            &mut self.entitlements,
+            &Dictionary::new(),
+            &team_id,
+            &Some(application_id.to_string()),
+        );
+    }
+
     pub fn entitlements(&self) -> &Dictionary {
         &self.entitlements
     }

@@ -435,7 +435,12 @@ impl Signer {
                 if let Some(bundle_executable) = bundle.get_executable() {
                     if let Some(bundle_id) = bundle.get_bundle_identifier() {
                         let binary_path = bundle.bundle_dir().join(bundle_executable);
-                        prov.merge_entitlements(binary_path, &bundle_id).ok();
+                        let merged = prov.merge_entitlements(binary_path, &bundle_id);
+                        if merged.is_err() && self.options.resolve_profile_wildcards {
+                            // unsigned binary: nothing to merge, but the wildcard of an imported
+                            // profile still has to become the identifier of this bundle
+                            prov.resolve_wildcards(&bundle_id);
+                        }
                     }
                 }
 

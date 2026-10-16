@@ -85,6 +85,8 @@ pub async fn execute(args: SignArgs) -> Result<()> {
         custom_name: args.name,
         custom_version: args.version,
         tweaks: args.tweaks,
+        // a profile given with --provision belongs to the user: its wildcard has to be resolved
+        resolve_profile_wildcards: args.provisioning_files.is_some(),
         ..Default::default()
     };
 
