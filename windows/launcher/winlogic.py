@@ -31,6 +31,8 @@ def attempt_at(app: dict, now: float) -> float | None:
     nxt = app.get("next_attempt_at") or 0
     if exp and exp <= now:
         return None
+    if app.get("sign_mode") == "certificate" and exp and app.get("status") == "ok":
+        return None     # imported certificate: nothing is renewed at a fixed date, only new versions are installed
     if not exp or app.get("status") in ("error", "pending"):
         # first install, or a failure: the backend retries at next_attempt_at (every 45 min)
         if exp and exp - now > NEAR_EXPIRY:
@@ -114,8 +116,9 @@ def wake_task_xml(when: float, command: str, arguments: str = "", description: s
 
 # ---------- tray toasts ----------
 
-_RANK = {"fail": 0, "24h": 1, "6h": 2, "expired": 3}
-_TOAST = {"fail": "app_failed", "24h": "app_expiring", "6h": "app_expiring", "expired": "app_expired"}
+_RANK = {"fail": 0, "7d": 1, "24h": 1, "1d": 2, "6h": 2, "expired": 3}      # 7d / 1d: an imported certificate (no renewal)
+_TOAST = {"fail": "app_failed", "24h": "app_expiring", "6h": "app_expiring", "expired": "app_expired",
+          "7d": "app_cert_expiring", "1d": "app_cert_expiring"}
 
 
 def snapshot(state: dict) -> dict:

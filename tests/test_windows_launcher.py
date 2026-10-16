@@ -154,6 +154,47 @@ class Toasts(unittest.TestCase):
         self.assertEqual(w.toasts(lost, lost), [])
 
 
+class ImportedCertificate(unittest.TestCase):
+    """An app signed with an imported certificate is not renewed at a fixed date: nothing to stay awake or wake up for."""
+
+    def test_no_keep_awake_or_wake_up_for_a_valid_certificate_app(self):
+        a = app(sign_mode="certificate", expires_at=NOW + 3 * H, renew_at=None)
+        self.assertIsNone(w.attempt_at(a, NOW))
+        self.assertFalse(w.keep_awake_needed([a], NOW))
+        self.assertIsNone(w.next_wake_at([a], NOW))
+        apple = app(expires_at=NOW + 3 * H, renew_at=NOW + 600)             # same dates on the Apple ID route: a renewal is due
+        self.assertEqual(w.attempt_at(apple, NOW), NOW + 600)
+        self.assertTrue(w.keep_awake_needed([apple], NOW))
+
+    def test_a_certificate_app_that_failed_or_was_never_installed_is_retried_like_any_other(self):
+        failing = app(sign_mode="certificate", status="error", expires_at=NOW + 3 * H, next_attempt_at=NOW + 600)
+        self.assertEqual(w.attempt_at(failing, NOW), NOW + 600)
+        never = app(sign_mode="certificate", status="pending", expires_at=None, next_attempt_at=None)
+        self.assertEqual(w.attempt_at(never, NOW), NOW)
+
+    def test_the_two_warnings_toast_once_each_then_the_expiry(self):
+        snaps = [w.snapshot({"apps": [app(alert=level)], "accounts": []}) for level in (None, "7d", "1d", "expired")]
+        got = [w.toasts(a, b) for a, b in zip(snaps, snaps[1:])]
+        self.assertEqual(got, [[("app_cert_expiring", "NuvioTV")], [("app_cert_expiring", "NuvioTV")],
+                               [("app_expired", "NuvioTV")]])
+        self.assertEqual(w.toasts(snaps[1], snaps[1]), [])                    # the same level again is not a new toast
+        self.assertEqual(w.toasts(snaps[2], snaps[1]), [])                    # nor an improvement
+        recovered = w.snapshot({"apps": [app(alert=None)], "accounts": []})
+        self.assertEqual(w.toasts(snaps[1], recovered), [("app_recovered", "NuvioTV")])      # a new certificate was imported
+
+    def test_the_apple_id_levels_keep_their_order(self):
+        self.assertLess(w._RANK["fail"], w._RANK["24h"])
+        self.assertLess(w._RANK["24h"], w._RANK["6h"])
+        self.assertLess(w._RANK["6h"], w._RANK["expired"])
+        self.assertLess(w._RANK["7d"], w._RANK["1d"])
+        self.assertLess(w._RANK["1d"], w._RANK["expired"])
+        self.assertEqual(w._TOAST["7d"], w._TOAST["1d"])
+
+    def test_the_toast_has_a_text_in_both_languages(self):
+        source = (LAUNCHER / "tvsign_app.py").read_text(encoding="utf-8")
+        self.assertEqual(source.count('"app_cert_expiring"'), 2)               # French and English, readable without Windows
+
+
 class AutostartFlag(unittest.TestCase):
     def test_flag_values(self):
         self.assertTrue(w.startup_approved(None))                              # no value: enabled
@@ -250,7 +291,7 @@ class LauncherModule(unittest.TestCase):
             for key, text in lang.items():
                 text.format(**args)
         # every label the toast rules can ask for exists
-        for key in ("app_failed", "app_expiring", "app_expired", "app_recovered", "account_lost"):
+        for key in ("app_failed", "app_expiring", "app_expired", "app_cert_expiring", "app_recovered", "account_lost"):
             self.assertIn(key, fr)
 
     def test_access_log_filter_drops_successful_polls_only(self):
