@@ -1092,8 +1092,12 @@ async def app_patch(app_id: int, body: AppPatch):
     signing_changed = _check_signing(a, fields)
     source_changed = any(k in fields for k in ("source", "source_filter", "channel"))
     if source_changed:
-        fields["source_tag"] = None        # nouvelle source : la prochaine release sera installée
-        fields["source_published_at"] = None
+        if "source" in fields and fields["source"] != a["source"]:
+            fields["source_tag"] = None    # autre dépôt ou autre lien : le tag téléchargé n'a plus de sens
+        # Même dépôt (canal ou préfixe de tag changé) : le tag installé est gardé. Une release différente sera
+        # installée quand même, une identique ne sera pas retéléchargée, et la version précédente gardée, le retour
+        # arrière et le repli retrouvent leur tag au lieu d'un champ vide.
+        fields["source_published_at"] = None     # le choix du canal est celui de l'utilisateur : jamais « plus ancienne »
         fields["source_key"] = None
         fields["bad_tag"] = None
         fields["bad_key"] = None
@@ -1151,11 +1155,13 @@ async def app_copy(app_id: int, body: AppCopy):
     if not a["enabled"] or not a["bundle_id"]:
         # fiche en cours d'ajout : l'IPA n'est pas encore validée, elle pourrait être partielle
         raise HTTPException(409, "app_not_ready")
-    if not db.row("SELECT id FROM devices WHERE id = ?", body.device_id):
+    target = db.row("SELECT * FROM devices WHERE id = ?", body.device_id)
+    if not target:
         raise HTTPException(400, "unknown_device")
     account = a["account_email"] or plume.default_account()
     if _duplicate(app_id, a["bundle_id"], account, body.device_id) or body.device_id == a["device_id"]:
         raise _already_added(body.device_id)
+    _check_app_device(a, target)         # une app tvOS ne se copie pas sur un iPhone, ni l'inverse
     src = renew.app_dir(app_id) / "original.ipa"
     if not src.exists():
         raise HTTPException(400, "ipa_missing")
@@ -1163,10 +1169,12 @@ async def app_copy(app_id: int, body: AppCopy):
     new_id = db.execute(
         "INSERT INTO apps (name, bundle_id, version, source_type, source, source_filter, source_tag, source_key, "
         "source_sha256, channel, preset, asset_name, auto_update, pinned_tag, account_email, device_id, "
-        "created_at, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+        "platform, ui_family, warnings, created_at, enabled) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
         a["name"], a["bundle_id"], a["version"], a["source_type"], a["source"], a["source_filter"],
         a["source_tag"], a["source_key"], a["source_sha256"], a["channel"], a["preset"], a["asset_name"],
-        a["auto_update"], a["pinned_tag"], account, body.device_id, time.time())
+        a["auto_update"], a["pinned_tag"], account, body.device_id,
+        a["platform"], a["ui_family"], a["warnings"], time.time())
     try:
         await asyncio.to_thread(shutil.copy2, src, renew.app_dir(new_id) / "original.ipa")
     except OSError as e:
@@ -1175,7 +1183,6 @@ async def app_copy(app_id: int, body: AppCopy):
         raise HTTPException(500, "copy_failed") from None
     if imported_cert.is_cert(a):
         # un certificat importé est celui d'un appareil : la copie prend, si elle existe, celui de la TV visée
-        target = db.row("SELECT * FROM devices WHERE id = ?", body.device_id)
         ident = imported_cert.pick(target, a)
         if ident:
             db.update("apps", new_id, sign_mode=imported_cert.CERTIFICATE, cert_id=ident["id"])
@@ -1254,10 +1261,11 @@ async def _renew_all(ids: list[int]) -> None:
 
 @app.post("/api/apps/renew-all")
 async def app_renew_all():
-    """Renouvelle maintenant toutes les apps actives qui ont une Apple TV, l'une après l'autre."""
+    """Renouvelle maintenant toutes les apps actives qui ont une Apple TV, l'une après l'autre. Sans effet pour une
+    app déjà en cours ou encore en file d'un « Tout renouveler » précédent : un 2e appel ne la signe pas deux fois."""
     ids = [a["id"] for a in db.rows("SELECT id FROM apps WHERE enabled = 1 AND device_id IS NOT NULL "
                                     "AND status != 'adding' ORDER BY expires_at IS NULL, expires_at, id")
-           if a["id"] not in renew._RUNNING]
+           if a["id"] not in renew._RUNNING and a["id"] not in _RENEW_ALL_PENDING]
     for app_id in ids:
         renew.clear_block(app_id)
     if ids:
@@ -1308,8 +1316,12 @@ async def app_replace_ipa(app_id: int, file: UploadFile = File(...)):
             info = ipa.app_info(tmp)
         except Exception:  # noqa: BLE001 - zip illisible, Info.plist mal formé (ExpatError), clé absente…
             raise HTTPException(400, "not_an_ipa") from None
-        if info["platform"] != "appletvos":
-            raise HTTPException(400, f"not_tvos:{info['platform'] or 'unknown'}")
+        # la famille de l'appareil de l'app décide (Apple TV : IPA tvOS ; iPhone / iPad : IPA iPhone), comme à l'ajout
+        dev = db.row("SELECT family, model FROM devices WHERE id = ?", a["device_id"]) if a["device_id"] else None
+        try:
+            families.check_platform(info, (dev or {}).get("family") or "tvos", (dev or {}).get("model"))
+        except families.PlatformMismatch as e:
+            raise HTTPException(400, e.code) from None
         if a["bundle_id"] and info["bundle_id"] != a["bundle_id"]:
             raise HTTPException(400, f"bundle_mismatch:{a['bundle_id']}")
         _check_min_os(a["device_id"], info)
@@ -1337,7 +1349,7 @@ async def app_replace_ipa(app_id: int, file: UploadFile = File(...)):
             raise HTTPException(409, "files_locked") from None
         (d / "signed.ipa").unlink(missing_ok=True)
         fields = dict(name=info["name"], version=info["version"], bundle_id=info["bundle_id"], source_sha256=sha,
-                      bad_tag=None, bad_key=None, update_error=None, **renew.CLEAR_BLOCK)
+                      bad_tag=None, bad_key=None, update_error=None, **renew.ipa_columns(info), **renew.CLEAR_BLOCK)
         if keep:
             fields.update(prev_tag=a["source_tag"], prev_key=a["source_key"], prev_version=a["version"],
                           prev_sha256=a["source_sha256"])
@@ -1396,9 +1408,12 @@ def update_dismiss():
 @app.patch("/api/settings")
 def settings_patch(body: dict):
     try:
-        return {"settings": settings.update(body)}
+        out = {"settings": settings.update(body)}
     except ValueError as e:
         raise HTTPException(400, e.args[0] if e.args and isinstance(e.args[0], dict) else str(e)) from None
+    if "cert_revoke" in body:
+        renew.certificate_policy_changed()      # un compte plein qui bloquait des apps peut maintenant les signer
+    return out
 
 
 class NotifyTest(BaseModel):
@@ -1450,6 +1465,16 @@ async def backup_export(uploads: bool = False, certs: bool = False):
     return _SelfDeletingFile(path, filename=path.name, media_type="application/zip")
 
 
+def _log_restore_refused(e: "backup.BackupError") -> None:
+    """Pourquoi une restauration est refusée ou annulée. L'API ne renvoie que le code (l'interface le traduit) : sans
+    cette ligne, la cause (dossier verrouillé, disque plein, archive piégée…) ne serait nulle part."""
+    why = re.sub(r"[\x00-\x1f\x7f]+", " ", str(e)).strip()[:400]
+    try:
+        db.log(f"Restauration refusée ({e.code}) : {why}", "error" if e.code == "restore_failed" else "warn")
+    except Exception:  # noqa: BLE001 - le journal ne doit pas masquer l'erreur d'origine
+        print(f"[error] restauration refusée ({e.code}) : {why}", flush=True)
+
+
 @app.post("/api/backup/import")
 async def backup_import(file: UploadFile = File(...)):
     if renew._RUNNING or _RENEW_ALL_PENDING or proc.busy() or backup.RESTORING:
@@ -1473,6 +1498,7 @@ async def backup_import(file: UploadFile = File(...)):
                 try:
                     counts = await asyncio.to_thread(backup.restore, tmp)
                 except backup.BackupError as e:
+                    _log_restore_refused(e)
                     raise HTTPException(400 if e.code != "restore_failed" else 500, e.code) from None
                 except ValueError as e:
                     raise HTTPException(400, str(e)) from None

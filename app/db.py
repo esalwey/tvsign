@@ -205,14 +205,24 @@ def snapshot(dest) -> None:
 
 
 def migrate(conn: sqlite3.Connection) -> None:
-    """Crée les tables manquantes et ajoute les colonnes de MIGRATIONS (sans rien supprimer)."""
+    """Crée les tables manquantes et ajoute les colonnes de MIGRATIONS (sans rien supprimer). Les colonnes et leur
+    remplissage forment une seule transaction (le DDL de SQLite est transactionnel) : un arrêt au milieu laisse la
+    base comme elle était, et le prochain démarrage refait tout."""
     conn.executescript(SCHEMA)
     todo = _pending(conn)
-    for table, col, kind in todo:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {kind}")
-    if ("apps", "platform", "TEXT") in todo:
-        # avant l'arrivée des iPhone/iPad, toute app suivie était une app tvOS
-        conn.execute("UPDATE apps SET platform = 'appletvos' WHERE platform IS NULL")
+    if not todo:
+        return
+    conn.execute("BEGIN")
+    try:
+        for table, col, kind in todo:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {kind}")
+        if ("apps", "platform", "TEXT") in todo:
+            # avant l'arrivée des iPhone/iPad, toute app suivie était une app tvOS
+            conn.execute("UPDATE apps SET platform = 'appletvos' WHERE platform IS NULL")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 def init() -> None:

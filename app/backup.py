@@ -183,6 +183,23 @@ def validate_db(path: Path) -> None:
         raise BackupError("backup_corrupt", f"base de données illisible ({e})") from e
 
 
+def _aside_paths(stamp: int) -> list[Path]:
+    """Ce qu'une restauration de ce numéro crée à côté des données : copies mises de côté, dossier de travail."""
+    return [DATA_DIR / f"tvsign.db.pre-restore-{stamp}", IPA_DIR.with_name(f"ipas.pre-restore-{stamp}"),
+            CERT_DIR.with_name(f"certs.pre-restore-{stamp}"), STORE.with_name(f"PlumeImpactor.pre-restore-{stamp}"),
+            TMP_DIR / f"restore-{stamp}"]
+
+
+def _aside_stamp() -> int:
+    """Numéro des copies de cette restauration : l'heure en secondes, avancée tant qu'un des noms est déjà pris. Deux
+    restaurations dans la même seconde (ou une copie plus ancienne restée là) se heurtaient sinon : le dossier mis de
+    côté existait déjà, le remplacement échouait et la restauration était annulée (restore_failed)."""
+    stamp = int(time.time())
+    while any(p.exists() for p in _aside_paths(stamp)):
+        stamp += 1
+    return stamp
+
+
 def _swap_dir(live: Path, staged: Path | None, aside: Path, undo: list) -> None:
     """Met `live` de côté (sous le nom `aside`) puis met `staged` à sa place, en enregistrant comment annuler."""
     had = live.exists()
@@ -215,7 +232,7 @@ def restore(archive: Path) -> dict:
         if "tvsign.db" not in names:
             raise BackupError("backup_no_db", "base de données absente de la sauvegarde")
 
-        stamp = int(time.time())
+        stamp = _aside_stamp()
         work = TMP_DIR / f"restore-{stamp}"
         work.mkdir(parents=True, exist_ok=True)
         undo: list = []

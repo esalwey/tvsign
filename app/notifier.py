@@ -23,7 +23,7 @@ import urllib.request
 import uuid
 from datetime import datetime
 
-from . import db, settings
+from . import db, reasons, settings
 from .config import VERSION
 from .settings import NOTIFY_EVENTS, mask_url, ntfy_address, unmask_url, valid_url
 
@@ -123,6 +123,16 @@ def text(key: str, language: str | None = None, **params) -> str:
     return (fr if (language or lang()) == "fr" else en).format(**params)
 
 
+def reason(why, language: str | None = None) -> str:
+    """Cause d'un échec (message d'erreur du serveur, écrit en français) dans la langue de la notification : en
+    anglais, la cause reconnue est dite en anglais (mêmes causes que l'interface, voir reasons.py) ; une cause
+    inconnue reste telle quelle plutôt que d'être devinée."""
+    why = str(why)
+    if (language or lang()) == "fr":
+        return why
+    return reasons.english(why) or why
+
+
 def fmt_time(ts: float) -> str:
     """Date lisible sans ambiguïté : « 2026-10-22 14:05 UTC+02:00 » (fuseau du serveur)."""
     dt = datetime.fromtimestamp(ts).astimezone()
@@ -175,7 +185,7 @@ def clean(raw: dict, existing: dict | None = None) -> dict:
     """Valide une destination saisie ; ValueError(code) sinon. Un secret égal à MASK reprend celui
     de la destination existante."""
     kind = raw.get("type")
-    if kind not in PROVIDERS:
+    if not isinstance(kind, str) or kind not in PROVIDERS:        # une liste ou un objet JSON n'est pas hachable
         raise ValueError("notify_type_invalid")
     same = existing if existing and existing.get("type") == kind else None
     out = {"id": (existing or {}).get("id") or uuid.uuid4().hex[:8], "type": kind,

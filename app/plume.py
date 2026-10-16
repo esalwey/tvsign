@@ -161,12 +161,18 @@ def import_existing_store() -> None:
 def note_legacy_anisette() -> bool:
     """Au démarrage : une identité anisette de l'ancienne version (state.plist, Android) est inutile,
     Apple refuse ses données. plumesign la supprime et en crée une Windows au prochain contact avec
-    Apple ; on le dit une fois dans le journal. True si l'ancienne était encore là."""
+    Apple ; on le dit une fois dans le journal (et non à chaque démarrage tant que ce contact n'a pas eu lieu).
+    True si l'ancienne était encore là."""
     if not (STORE / "state.plist").exists() or (STORE / ANISETTE_STATE).exists():
         return False
-    db.log("Identité anisette Android abandonnée (Apple refuse ses données depuis le 12 octobre 2026) : "
-           "une identité Windows sera créée au prochain contact avec Apple")
+    if settings.raw_get(_LEGACY_NOTED) is None:
+        db.log("Identité anisette Android abandonnée (Apple refuse ses données depuis le 12 octobre 2026) : "
+               "une identité Windows sera créée au prochain contact avec Apple")
+        settings.raw_set(_LEGACY_NOTED, "1")
     return True
+
+
+_LEGACY_NOTED = "anisette_legacy_noted"     # l'ancienne identité Android a déjà été signalée au journal
 
 
 # ---------- comptes ----------
@@ -405,6 +411,9 @@ def classify(output: str) -> str | None:
 # Message du compte « à reconnecter » : ce qu'Apple exige et pourquoi
 REAUTH_REASON = ("Apple n'accepte plus la session enregistrée : reconnecte le compte (mot de passe, puis code "
                  "à deux facteurs affiché sur un appareil Apple de confiance)")
+# le même, dans une notification en anglais (le texte français reste celui de l'état du compte et du journal)
+REAUTH_REASON_EN = ("Apple no longer accepts the stored session: sign the account in again (password, then the "
+                    "two-factor code shown on a trusted Apple device)")
 
 
 def session_expired(output: str) -> bool:
@@ -497,7 +506,9 @@ def _failure(email: str, what: str, res: Result, content: bool = False) -> Runti
     if kind in ("apple_refused", "apple_rate_limited", "apple_503"):
         return AppleRefused(f"{what} : {_why(res)}", kind)
     if kind in USER_KINDS:
-        return RuntimeError(f"{what} : {_why(res)}")
+        err = RuntimeError(f"{what} : {_why(res)}")
+        err.user_kind = kind          # lu par renew.failure_kind : action requise, pas de nouvel essai automatique
+        return err
     if session_expired(res.output):
         _set_status(email, False, f"session expirée, reconnexion nécessaire : {REAUTH_REASON}")
         return SessionExpired(f"session Apple de {email} expirée : reconnecte-le (bouton Reconnecter) "

@@ -630,7 +630,7 @@ class OneNotificationPerEpisode(unittest.TestCase):
         self.assertEqual(len(self.notes), 1, self.notes)
         message, priority = self.notes[0]
         self.assertIn(self.email, message)
-        self.assertIn("deux facteurs", message)
+        self.assertRegex(message, "deux facteurs|two-factor")      # la raison, dans la langue des notifications
         self.assertEqual(priority, "high")
         for app_id in self.apps:
             app = db.row("SELECT * FROM apps WHERE id = ?", app_id)

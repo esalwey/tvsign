@@ -17,10 +17,12 @@ import asyncio
 import ipaddress
 import json
 import os
+import plistlib
 import re
 import socket
 import sys
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -120,7 +122,8 @@ def clean_host(value: str | None) -> str | None:
     try:
         ip = ipaddress.ip_address(value.split("%")[0])
     except ValueError:
-        if not _HOSTNAME.match(value):
+        # que des chiffres et des points (« 999.1.1.1 ») : une adresse IPv4 ratée, pas un nom d'hôte à résoudre
+        if not _HOSTNAME.match(value) or re.fullmatch(r"[\d.]+", value):
             raise ValueError("adresse invalide") from None
         return value
     if ip.is_unspecified or ip.is_loopback or ip.is_multicast:
@@ -183,6 +186,22 @@ async def stored_pairings() -> list[dict]:
 STORE_MISSING = "appairage absent du store plumesign"
 
 
+def _store_host(udid: str) -> str:
+    """Nom d'hôte sous lequel l'appairage du store a été fait. plumesign range dans le fichier d'appairage un
+    identifiant tiré de ce nom (UUID v3 du nom, espace DNS) et demande de présenter le même nom ensuite : on retrouve,
+    parmi les noms que tvsign a employés, celui qui redonne cet identifiant, au lieu de supposer « plume ». Sans
+    correspondance (appairage d'un autre outil, fichier illisible), le nom par défaut de plumesign."""
+    try:
+        data = plistlib.loads((plume.STORE / "remotepairing" / f"{udid}.plist").read_bytes())
+        found = str(data.get("identifier") or "").lower()
+    except Exception:  # noqa: BLE001 - absent, tronqué, pas un plist : le nom par défaut
+        return CLI_HOST
+    for name in dict.fromkeys((PAIR_HOST, "tvsign", CLI_HOST)):
+        if str(uuid.uuid3(uuid.NAMESPACE_DNS, name)).lower() == found:
+            return name
+    return CLI_HOST
+
+
 def _reconcile(device: dict, by_udid: dict) -> None:
     """Compare l'appairage d'une TV au store plumesign : absent = perdu (à réappairer), de nouveau
     présent (sauvegarde restaurée, fichier remis) = le drapeau posé par ce contrôle est retiré."""
@@ -220,14 +239,15 @@ async def sync_store() -> None:
             continue
         rec = by_udid.get((d["udid"] or "").lower())
         if rec:
-            # appairage plumesign déjà présent pour cette TV (fait en ligne de commande) : adopté
-            db.update("devices", d["id"], pairing_udid=rec["udid"], pair_host=CLI_HOST,
+            # appairage plumesign déjà présent pour cette TV (en ligne de commande, ou par tvsign avant une base
+            # perdue) : adopté, avec le nom d'hôte sous lequel il a été fait
+            db.update("devices", d["id"], pairing_udid=rec["udid"], pair_host=_store_host(rec["udid"]),
                       legacy_pairing=0, pairing_lost=0)
             db.log(f"Apple TV « {d['name']} » : appairage plumesign existant repris")
         elif not d["legacy_pairing"]:
             db.update("devices", d["id"], legacy_pairing=1)
             db.log(f"Apple TV « {d['name']} » : appairage d'une ancienne version de tvsign, "
-                   "à refaire une fois (Apple TV › Appairer)", "warn")
+                   "à refaire une fois (Appareils › Appairer)", "warn")
     known = {(d["pairing_udid"] or "").lower() for d in db.rows("SELECT pairing_udid FROM devices")}
     for udid, rec in by_udid.items():
         if udid in known:
@@ -238,7 +258,7 @@ async def sync_store() -> None:
         db.execute("INSERT INTO devices (name, pair_identifier, pairing_udid, udid, model, pair_host, created_at, family) "
                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                    rec["name"] or families.label(family), rec["udid"], rec["udid"], rec["udid"], rec["model"] or None,
-                   CLI_HOST, time.time(), family)
+                   _store_host(rec["udid"]), time.time(), family)
         db.log(f"Appairage existant repris : {rec['name']} ({rec['udid']})")
 
 
@@ -405,10 +425,15 @@ def _identity_line(lines: list[str]) -> dict:
 
 
 async def _usb_pairing_done(s: Session) -> None:
+    """Fin de `plumesign pair usb`. Appelée par la session alors qu'elle est encore « finishing » (elle ne passe à
+    « done » qu'après ce travail de fin) : le succès se lit donc dans exit_ok, comme pour l'appairage d'une TV."""
     match = next((m for l in reversed(s.lines) if (m := _PAIRED.match(l.strip()))), None)
-    if s.state != "done" or not match:
-        if s.state == "done":
-            s.state = "failed"
+    if s.user_cancelled and not match:
+        db.log("Appairage USB annulé")           # choix de l'utilisateur, pas une panne
+        return
+    if not s.exit_ok or not match:
+        if s.exit_ok:
+            s.state = "failed"        # sorti en 0 sans dire quel appareil : la session ne peut pas finir « done »
         db.log(f"Appairage USB échoué : {' | '.join(s.lines[-2:])}", "error")
         return
     found = _identity_line(s.lines)
@@ -467,6 +492,8 @@ async def import_pairing(data: bytes, filename: str | None, udid: str | None, na
         if model:
             args += ["-m", model]
         res = await run(PLUMESIGN, *args, env=e, timeout=30, split=True)
+    except (OSError, RuntimeError) as err:        # plumesign absent, bloqué par l'antivirus, non exécutable
+        raise RuntimeError(f"plumesign introuvable ou inutilisable : {err}") from None
     finally:
         tmp.unlink(missing_ok=True)
     if not res.ok:
@@ -497,7 +524,7 @@ def _failed(device: dict, message: str, lost: bool = False) -> None:
 def _target(device: dict, hint: str | None = None) -> list[str]:
     if device.get("legacy_pairing") or not device.get("pairing_udid"):
         msg = (f"appairage perdu avec « {device['name']} » : appairage d'une ancienne version de tvsign, "
-               "réappaire-la une fois depuis tvsign (Apple TV › Appairer)")
+               "réappaire-la une fois depuis tvsign (Appareils › Appairer)")
         _failed(device, msg, lost=True)
         raise PairingLost(msg)
     target = ["-i", device["pairing_udid"], "-t", str(DEVICE_TIMEOUT), "--host", device.get("pair_host") or CLI_HOST]
@@ -665,6 +692,12 @@ def _has_bundle(apps: list[dict], bundle_id: str) -> bool:
     return any((a.get("bundle_id") or "").lower() == bundle_id.lower() for a in apps)
 
 
+def _listed(apps: list[dict]) -> list[dict]:
+    """Les entrées exploitables d'une liste d'apps. Une liste sans aucune n'est pas crédible (journal parasite,
+    TV à peine réveillée) : elle ne prouve l'absence de rien."""
+    return [x for x in apps if isinstance(x, dict) and x.get("bundle_id")]
+
+
 def signed_bundle(app_dir: Path, app: dict) -> str | None:
     """Bundle ID réellement installé : celui de la dernière signature (il change avec l'équipe Apple),
     sinon celui noté à la dernière vérification."""
@@ -710,19 +743,25 @@ def record_presence(app: dict, apps: list[dict], app_dir: Path, now: float) -> b
 async def confirm_installed(device: dict, bundle_id: str | None) -> float | None:
     """Vérifie dans la liste des apps de la TV que l'app y est vraiment après l'installation.
     Renvoie l'heure de la vérification, None si elle n'a pas pu se faire (TV qui s'endort, plumesign
-    ancien : on ne présume rien), NotInstalled si la TV répond sans l'app (confirmé deux fois)."""
+    ancien : on ne présume rien), NotInstalled si la TV répond sans l'app (confirmé deux fois). Une liste vide
+    aux deux essais n'est pas une réponse crédible (comme pour /verify) : installation non vérifiée, sans erreur."""
     if not bundle_id:
         return None
+    credible = False
     for attempt in range(2):
         try:
             apps = await installed_apps(device)
         except Exception as e:  # noqa: BLE001
             db.log(f"« {device['name']} » : liste des apps illisible, installation non vérifiée ({e})", "warn")
             return None
+        credible = credible or bool(_listed(apps))
         if _has_bundle(apps, bundle_id):
             return time.time()
         if attempt == 0:
             await asyncio.sleep(3)     # installd peut mettre un instant à publier l'app
+    if not credible:
+        db.log(f"« {device['name']} » : la liste de ses apps est vide, installation non vérifiée", "warn")
+        return None
     raise NotInstalled(f"l'installation s'est terminée mais « {bundle_id} » n'apparaît pas dans les apps de "
                        f"« {device['name']} » : elle sera réinstallée")
 
@@ -749,6 +788,11 @@ async def audit_installed(now: float | None = None) -> None:
         try:
             apps = await installed_apps(device, wait=False, quiet=True)
         except Exception:  # noqa: BLE001 - TV en veille, occupée… : on réessaie dans une heure, sans erreur sur la fiche
+            _AUDIT_NEXT[device["id"]] = now + 3600
+            continue
+        if not _listed(apps):
+            # liste vide (TV à peine réveillée, journal parasite) : pas une preuve que les apps ont disparu, et en
+            # réinstaller tout de suite consommerait des App ID pour rien
             _AUDIT_NEXT[device["id"]] = now + 3600
             continue
         _AUDIT_NEXT[device["id"]] = now + INSTALL_CHECK_HOURS * 3600

@@ -106,6 +106,22 @@ async def notify(message: str, priority: str = "default", event: str = "fail", *
     return sent
 
 
+def app_label(app: dict) -> str:
+    """Nom de l'app dans une notification. Dès que plusieurs appareils sont suivis, une même app peut figurer sur
+    plusieurs : on ajoute l'appareil (« Nuvio (Salon) »), sinon trois messages identiques arrivent sans qu'on sache
+    de quelle TV ils parlent."""
+    tv = _device_of(app)
+    if tv and db.row("SELECT COUNT(*) AS n FROM devices")["n"] > 1:
+        return f"{app['name']} ({tv['name']})"
+    return app["name"]
+
+
+def meta(app: dict) -> dict:
+    """App et appareil visés, pour le message JSON d'un webhook."""
+    tv = _device_of(app)
+    return {"app": app["name"], "device": tv["name"] if tv else None}
+
+
 # Niveaux d'alerte croissants : on ne renotifie que si la situation s'aggrave. « 7d » et « 1d » sont ceux d'une
 # app signée avec un certificat importé (pas de renouvellement tous les 7 jours : on prévient avant la fin du
 # certificat ou du profil) ; « 24h » et « 6h » ceux d'un compte Apple gratuit.
@@ -139,6 +155,8 @@ def alert_state(app: dict, now: float) -> str | None:
     """Niveau d'alerte à montrer à l'utilisateur (fail, 24h, 6h, expired) ou None. Même règle que les
     notifications ntfy (alert) : un échec banal loin de l'expiration n'est pas une alerte. Exposé dans
     /api/state pour les notifications de l'icône Windows, qui ne doivent pas être plus bavardes que ntfy."""
+    if not app.get("enabled", 1):
+        return None             # app en pause : rien n'est tenté, rien à signaler (comme _check_expired et /api/health)
     exp = app.get("expires_at")
     if exp and exp <= now:
         return "expired"
@@ -163,17 +181,17 @@ async def alert(app: dict, reason: str, now: float, quiet_fail: bool = False) ->
         return  # déjà notifié à ce niveau
     if lvl == "fail" and quiet_fail:
         return
-    name = app["name"]
+    name, why = app_label(app), notifier.reason(reason)
     if lvl == "fail":
-        sent = await notify(notifier.text("renew_failed", name=name, reason=reason), "default", "fail", app=name)
+        sent = await notify(notifier.text("renew_failed", name=name, reason=why), "default", "fail", **meta(app))
     elif lvl == "expired":
-        sent = await notify(notifier.text("expired", name=name, reason=reason), "urgent", "expiry", app=name)
+        sent = await notify(notifier.text("expired", name=name, reason=why), "urgent", "expiry", **meta(app))
     elif lvl in ("7d", "1d"):
-        sent = await notify(notifier.text("import_expiring_failing", name=name, d=lvl[:-1], reason=reason), "high",
-                            "expiry", app=name)
+        sent = await notify(notifier.text("import_expiring_failing", name=name, d=lvl[:-1], reason=why), "high",
+                            "expiry", **meta(app))
     else:
-        sent = await notify(notifier.text("expiring", name=name, h=lvl[:-1], reason=reason), "high", "expiry",
-                            app=name)
+        sent = await notify(notifier.text("expiring", name=name, h=lvl[:-1], reason=why), "high", "expiry",
+                            **meta(app))
     if sent:
         # niveau mémorisé seulement si la notification est partie : sinon on réessaiera au prochain échec
         db.update("apps", app["id"], notified_level=lvl)
@@ -277,15 +295,16 @@ def _blocked_by_os(app: dict) -> str | None:
     return block[5:] if block.startswith("tvos:") else None
 
 
-async def _lift_os_block(app: dict) -> None:
+async def _lift_os_block(app: dict, fresh: bool = False) -> None:
     """Version refusée parce que la TV était trop ancienne : si la TV a été mise à jour depuis, on la
     redevient candidate. La version de tvOS enregistrée peut être périmée : on la relit (au plus
-    toutes les 6 h par TV) tant qu'un blocage existe."""
+    toutes les 6 h par TV) tant qu'un blocage existe. fresh : l'utilisateur demande la mise à jour (« Installer
+    maintenant ») : la TV vient peut-être d'être mise à jour, on la relit sans attendre ces 6 h."""
     need = _blocked_by_os(app)
     if not need or not app.get("device_id"):
         return
     have = _device_os(app)
-    if ipa.os_older(have, need) and time.time() - _OS_REFRESHED.get(app["device_id"], 0) > 6 * 3600:
+    if ipa.os_older(have, need) and (fresh or time.time() - _OS_REFRESHED.get(app["device_id"], 0) > 6 * 3600):
         _OS_REFRESHED[app["device_id"]] = time.time()
         try:
             await devices.refresh_info(app["device_id"])
@@ -299,6 +318,16 @@ async def _lift_os_block(app: dict) -> None:
         system, who = _os_words((_device_of(app) or {}).get("family"))
         db.log(f"{app['name']} : {system} {have} sur {who}, la version refusée ({system} {need} minimum) est de nouveau candidate",
                app_id=app["id"])
+
+
+def _note_pin_missing(app: dict) -> None:
+    """La version épinglée n'existe pas (dans le dépôt, ou sans IPA) : l'app garde sa version et ne suit plus rien
+    tant que l'épingle est là. On le dit sur sa carte (update_block « pin_missing »), pas seulement au journal ;
+    retirer ou corriger l'épingle, ou une release qui apparaît, efface la note."""
+    if app.get("update_block") != "pin_missing" or app.get("update_tag"):
+        fields = dict(update_tag=None, update_notes=None, update_block="pin_missing")
+        db.update("apps", app["id"], **fields)
+        app.update(fields)
 
 
 def _note_update(app: dict, tag: str | None, notes: str | None, block: str | None) -> bool:
@@ -317,8 +346,7 @@ async def _announce_available(app: dict, tag: str) -> None:
     label = _link_label(app, tag)
     db.log(f"{app['name']} : version {label} disponible (mises à jour automatiques désactivées)",
            app_id=app["id"])
-    await notify(notifier.text("update_available", name=app["name"], tag=label), "default", "update",
-                 app=app["name"])
+    await notify(notifier.text("update_available", name=app_label(app), tag=label), "default", "update", **meta(app))
 
 
 def _link_label(app: dict, tag: str | None) -> str:
@@ -337,7 +365,7 @@ async def refresh_source(app: dict, force: bool = False) -> bool:
     tag, key, sha256, notes, published = None, None, None, None, None
     try:
         if dest.exists():
-            await _lift_os_block(app)
+            await _lift_os_block(app, fresh=force)
         if app["source_type"] == "github":
             found = await asyncio.to_thread(_latest, app)
             if found and dest.exists() and _older_than_installed(app, found):
@@ -351,11 +379,19 @@ async def refresh_source(app: dict, force: bool = False) -> bool:
                     pin = f" (version épinglée : {app['pinned_tag']})" if app.get("pinned_tag") else ""
                     raise NoRelease(f"aucune IPA trouvée dans les releases ({channel}{which}) de "
                                     f"{app['source']}{pin}{hint}", beta_tag)
+                pin = app.get("pinned_tag")
+                if pin:
+                    _note_pin_missing(app)          # sur la carte de l'app, pas seulement au journal
                 if app["id"] not in _NO_MATCH_LOGGED:
                     _NO_MATCH_LOGGED.add(app["id"])
-                    db.log(f"{app['name']} : aucune release ne correspond plus dans {app['source']} "
-                           "(tags renommés, IPA absente ou release trop ancienne ?), version actuelle conservée",
-                           "warn", app_id=app["id"])
+                    if pin:
+                        db.log(f"{app['name']} : la version épinglée « {pin} » est introuvable dans {app['source']} "
+                               "(tag mal écrit, release supprimée ou sans IPA ?), version actuelle conservée",
+                               "warn", app_id=app["id"])
+                    else:
+                        db.log(f"{app['name']} : aucune release ne correspond plus dans {app['source']} "
+                               "(tags renommés, IPA absente ou release trop ancienne ?), version actuelle conservée",
+                               "warn", app_id=app["id"])
                 return False
             _NO_MATCH_LOGGED.discard(app["id"])
             tag, url, sha256, key = found["tag"], found["url"], found["sha256"], found.get("key")
@@ -423,8 +459,11 @@ async def refresh_source(app: dict, force: bool = False) -> bool:
             return False                          # même empreinte : le fichier du lien n'a pas changé
         if keep and hold.exists():
             await asyncio.to_thread(util.replace_retry, hold, prev)
-            db.update("apps", app["id"], prev_tag=app.get("source_tag"), prev_key=app.get("source_key"),
-                      prev_version=app.get("version"), prev_sha256=app.get("source_sha256"))
+            # keep : le fichier gardé est celui qui est installé, dont le tag est aussi installed_tag quand
+            # source_tag a été vidé (changement de canal d'une base d'avant ce correctif)
+            db.update("apps", app["id"], prev_tag=app.get("source_tag") or app.get("installed_tag"),
+                      prev_key=app.get("source_key"), prev_version=app.get("version"),
+                      prev_sha256=app.get("source_sha256"))
     except ipa.OsTooOld as e:
         if not dest.exists():
             raise
@@ -432,10 +471,12 @@ async def refresh_source(app: dict, force: bool = False) -> bool:
         # passage, et reprise dès que l'appareil est mis à jour (_lift_os_block)
         db.update("apps", app["id"], bad_tag=tag, bad_key=key, update_tag=tag, update_notes=notes or None,
                   update_block=f"tvos:{e.min_os}")
-        system, who = _os_words(e.family)
-        params = dict(name=app["name"], tag=_link_label(app, tag), need=e.min_os, have=e.have, system=system, who=who)
+        system, device_word = _os_words(e.family)
+        params = dict(name=app["name"], tag=_link_label(app, tag), need=e.min_os, have=e.have, system=system,
+                      who=device_word)
         db.log(notifier.text("update_blocked_os", "fr", **params), "warn", app_id=app["id"])
-        await notify(notifier.text("update_blocked_os", **params), "default", "update", app=app["name"])
+        await notify(notifier.text("update_blocked_os", **{**params, "name": app_label(app)}), "default", "update",
+                     **meta(app))
         return False
     except Exception as e:  # noqa: BLE001
         if not dest.exists():
@@ -450,8 +491,8 @@ async def refresh_source(app: dict, force: bool = False) -> bool:
             db.update("apps", app["id"], bad_tag=tag, bad_key=key, bad_reason=str(e)[:500])
             db.log(f"{app['name']} : version {_link_label(app, tag)} inutilisable ({e}), version précédente conservée",
                    "warn", app_id=app["id"])
-            await notify(notifier.text("update_refused", name=app["name"], tag=_link_label(app, tag), why=e),
-                         "default", "update", app=app["name"])
+            await notify(notifier.text("update_refused", name=app_label(app), tag=_link_label(app, tag),
+                                       why=notifier.reason(e)), "default", "update", **meta(app))
         else:
             db.log(f"{app['name']} : source indisponible ({e}), version précédente conservée",
                    "warn", app_id=app["id"])
@@ -551,6 +592,8 @@ async def new_release(app: dict) -> bool:
         return False
     _release_ok(app)
     if not found:
+        if app.get("pinned_tag"):
+            _note_pin_missing(app)        # la version épinglée n'existe pas (ou plus) : visible sur la carte
         return False
     await _lift_os_block(app)
     tag, key = found["tag"], found.get("key")
@@ -597,8 +640,10 @@ class TvosTooOld(NeedsAction):
 BLOCKED_RETRY_HOURS = {"session": 6, "pairing": 6, "config": 6, "limit": 24}
 
 
-# Équipe de développeur absente ou ambiguë (messages de plumesign) : se règle dans le compte Apple, pas en réessayant.
-_TEAM = re.compile(r"NO_TEAM|MULTIPLE_TEAMS|TEAM_NOT_FOUND")
+# Messages de plumesign qui se règlent dans le compte Apple ou les réglages, pas en réessayant : équipe de développeur
+# absente ou ambiguë, compte plein de certificats d'autres outils (CERT_LIMIT : réglage « Quand le compte Apple est
+# plein »). Chaque nouvel essai solliciterait Apple pour rien.
+_NEEDS_USER = re.compile(r"NO_TEAM|MULTIPLE_TEAMS|TEAM_NOT_FOUND|CERT_LIMIT")
 
 
 def failure_kind(exc: BaseException) -> str | None:
@@ -611,7 +656,9 @@ def failure_kind(exc: BaseException) -> str | None:
         return "pairing"
     if isinstance(exc, plume.LimitReached):
         return "limit"
-    if _TEAM.search(str(exc)):
+    if getattr(exc, "user_kind", None) in plume.USER_KINDS or _NEEDS_USER.search(str(exc)):
+        # SMS refusé, Apple ID jamais connecté sur un appareil, serveur anisette non Windows (plume._failure), équipe,
+        # certificats : aucun essai automatique n'y change rien
         return "config"
     return None
 
@@ -903,8 +950,8 @@ async def _fall_back(app_id: int, first: Exception, deliver, signed) -> float:
     prev_label = cur["prev_version"] or cur["prev_tag"] or "?"
     db.log(f"{name} : la version {new_label} n'a pas pu être installée ({first}) ; la version précédente "
            "est réinstallée et la nouvelle ignorée", "warn", app_id=app_id)
-    await notify(notifier.text("update_rolled_back", name=name, tag=new_label, why=first, prev=prev_label),
-                 "default", "update", app=name)
+    await notify(notifier.text("update_rolled_back", name=app_label(cur), tag=new_label, why=notifier.reason(first),
+                               prev=prev_label), "default", "update", **meta(cur))
     return expires
 
 
@@ -968,7 +1015,7 @@ async def _renew(app_id: int, trigger: str) -> None:
         if trigger in ("nouvelle version", "mise à jour") and not updated and was_ok and not was_pending:
             # téléchargement raté, version refusée ou rien de nouveau : inutile de re-signer l'ancienne version
             db.update("apps", app_id, status="ok", last_error=None)
-            if trigger == "mise à jour" and not cur.get("update_tag"):
+            if trigger == "mise à jour" and not cur.get("update_tag") and cur.get("update_block") != "pin_missing":
                 db.log(f"{app['name']} : déjà à jour", app_id=app_id)
             return
         original = app_dir(app_id) / "original.ipa"
@@ -1016,7 +1063,8 @@ async def _renew(app_id: int, trigger: str) -> None:
                     # bandeau durable dans l'interface (une notification peut ne pas être configurée)
                     settings.raw_set("revocation_notice", json.dumps({"email": email, "app": app["name"],
                                                                       "at": time.time()}))
-                    await notify(notifier.text(kind, **params), "default", "account", app=app["name"])
+                    await notify(notifier.text(kind, **{**params, "name": app_label(app)}), "default", "account",
+                                 **meta(app))
                     # les autres apps tvsign du compte, signées avec le certificat révoqué, sont à refaire
                     # tout de suite plutôt qu'au prochain contrôle périodique
                     await _guarded("contrôle des certificats", _check_certificates(email))
@@ -1096,13 +1144,13 @@ async def _renew(app_id: int, trigger: str) -> None:
         if was_pending and done.get("source_sha256") == cur.get("source_sha256"):
             notes = (cur.get("notes") or "").strip()
             db.log(f"{app['name']} : version {done.get('version')} installée", app_id=app_id)
-            await notify(notifier.text("update_installed", name=app["name"], version=done.get("version"),
+            await notify(notifier.text("update_installed", name=app_label(app), version=done.get("version"),
                                        notes=("\n\n" + notes[:600]) if notes else ""),
-                         "default", "update", app=app["name"], version=done.get("version"))
+                         "default", "update", version=done.get("version"), **meta(app))
         if app.get("notified_level"):
             # seulement si une alerte d'échec est partie : sinon « renouvelée » n'annonce rien de nouveau
-            await notify(notifier.text("renewed", name=app["name"], until=_fmt(expires)), "default", "recovered",
-                         app=app["name"])
+            await notify(notifier.text("renewed", name=app_label(app), until=_fmt(expires)), "default", "recovered",
+                         **meta(app))
     except asyncio.CancelledError:
         # délai dépassé ou arrêt du service : ne pas rester « en cours »
         if STOPPING:
@@ -1141,8 +1189,8 @@ async def _renew(app_id: int, trigger: str) -> None:
                 await account_down(e.email or app.get("account_email") or plume.default_account(),
                                    plume.REAUTH_REASON)
             elif not waiting and not app.get("update_error"):
-                await notify(notifier.text("update_failed", name=app["name"], why=e), "default", "update",
-                             app=app["name"])
+                await notify(notifier.text("update_failed", name=app_label(app), why=notifier.reason(e)), "default",
+                             "update", **meta(app))
             return
         _OUTCOME[app_id] = ("error", str(e))
         db.update("apps", app_id, status="error", last_error=str(e), **fields)
@@ -1311,6 +1359,16 @@ def _resume(apps: list[dict], trigger: str) -> int:
     return started
 
 
+def certificate_policy_changed() -> int:
+    """Réglage « Quand le compte Apple est plein » modifié : les apps que la limite de certificats (CERT_LIMIT) a
+    arrêtées repartent tout de suite, sans attendre la vérification de secours de 6 h. Renvoie leur nombre."""
+    waiting = [a for a in db.rows("SELECT * FROM apps WHERE enabled = 1 AND status = 'error' AND needs_action = 'config'")
+               if "CERT_LIMIT" in (a["last_error"] or "")]
+    if waiting:
+        _resume(waiting, "manuel")
+    return len(waiting)
+
+
 def _account_valid(email: str) -> None:
     """Session Apple de nouveau valide (reconnexion, ou vérification réussie après un échec) : les apps de ce
     compte qui attendaient ne patientent pas jusqu'au prochain essai, et l'alerte « déconnecté » est réarmée."""
@@ -1372,7 +1430,7 @@ async def _check_certificates(email: str) -> None:
             db.update("apps", app["id"], expires_at=time.time() - 1, next_attempt_at=None,
                       notified_level=None)
             db.log(f"{app['name']} : certificat révoqué, nouvelle signature", "error", app_id=app["id"])
-            await notify(notifier.text("cert_revoked_other", name=app["name"]), "high", "account", app=app["name"])
+            await notify(notifier.text("cert_revoked_other", name=app_label(app)), "high", "account", **meta(app))
 
 
 async def account_down(email: str | None, reason: str) -> None:
@@ -1383,7 +1441,8 @@ async def account_down(email: str | None, reason: str) -> None:
         return
     plume.ALERTED.add(email)
     db.log(f"Compte Apple {email} déconnecté : reconnexion nécessaire ({reason})", "error")
-    await notify(notifier.text("account_lost", email=email, reason=reason), "high", "account")
+    shown = plume.REAUTH_REASON_EN if reason == plume.REAUTH_REASON and notifier.lang() != "fr" else reason
+    await notify(notifier.text("account_lost", email=email, reason=shown), "high", "account")
 
 
 async def _check_accounts() -> None:

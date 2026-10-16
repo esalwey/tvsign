@@ -51,10 +51,13 @@ class UsbPairingResult(unittest.TestCase):
     def tearDown(self):
         devices.refresh_info = self.saved
 
-    def session(self, *lines, state="done") -> Session:
+    def session(self, *lines, ok=True) -> Session:
+        """Une session telle que Session._pump la passe à on_exit : plumesign est sorti, l'état est « finishing »
+        (« done » ne vient qu'après le travail de fin) ou « failed »."""
         s = Session("pair", re.compile(r"^\0$"))
         s.lines.extend(lines)
-        s.state = state
+        s.exit_ok = ok
+        s.state = "finishing" if ok else "failed"
         return s
 
     def test_identity_line_is_found_whatever_the_key_order(self):
@@ -81,9 +84,15 @@ class UsbPairingResult(unittest.TestCase):
 
     def test_failed_usb_pairing_creates_nothing(self):
         before = len(db.rows("SELECT id FROM devices"))
-        s = self.session("usbmuxd is not reachable (x)", state="failed")
+        s = self.session("usbmuxd is not reachable (x)", ok=False)
         asyncio.run(devices._usb_pairing_done(s))
         self.assertEqual(len(db.rows("SELECT id FROM devices")), before)
+
+    def test_success_without_a_paired_line_is_a_failure_not_a_done_session(self):
+        before = len(db.rows("SELECT id FROM devices"))
+        s = self.session("rien d'utile")
+        asyncio.run(devices._usb_pairing_done(s))
+        self.assertEqual((s.state, len(db.rows("SELECT id FROM devices"))), ("failed", before))
 
 
 class PairAddress(unittest.TestCase):
