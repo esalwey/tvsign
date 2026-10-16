@@ -37,7 +37,8 @@ two-factor step) follows [isideload](https://github.com/nab138/isideload) (MIT),
 > USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 Python dependencies: FastAPI (MIT), Starlette (BSD-3-Clause), Uvicorn (BSD-3-Clause),
-python-multipart (Apache-2.0), Pydantic (MIT). The Windows edition also bundles pywebview (BSD-3-Clause),
+python-multipart (Apache-2.0), Pydantic (MIT), cryptography (Apache-2.0 or BSD-3-Clause; its wheels carry
+OpenSSL, Apache-2.0; it reads the .p12 files and seals the imported certificates). The Windows edition also bundles pywebview (BSD-3-Clause),
 pystray (LGPL-3.0, used unmodified) and Pillow (MIT-CMU). pystray is packaged by PyInstaller in the
 application folder (`_internal`), not as a separate installable library; its unmodified source is
 available from https://github.com/moses-palmer/pystray, and building tvsign from this repository
