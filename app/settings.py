@@ -22,6 +22,9 @@ LEGACY_ANISETTE_HOSTS = frozenset({
     "ani3server.fly.dev", "ani.jaydenha.uk", "omni.ethxn.xyz",
 })
 
+# Événements de notification qu'une destination peut recevoir (voir notifier.py).
+NOTIFY_EVENTS = ("fail", "expiry", "recovered", "update", "account")
+
 
 class Spec:
     def __init__(self, default, kind, envs, check=None):
@@ -30,9 +33,24 @@ class Spec:
 
 # Les erreurs de validation sont des CODES stables (traduits par l'interface, clés err_*), pas du texte :
 # « url_expected », « range:12:150 », « number_expected », « language_expected », « hour_expected »…
-def _url(value: str) -> None:
-    if value and not re.match(r"^https?://[^\s/]+", value):
+def valid_url(value: str) -> str:
+    """Adresse http(s) exploitable : hôte présent, ni espace ni caractère de contrôle, port valide."""
+    value = value.strip()
+    if not value or re.search(r"[\s\x00-\x1f\x7f]", value):
         raise ValueError("url_expected")
+    try:
+        parts = urllib.parse.urlsplit(value)
+        parts.port  # noqa: B018 - lève ValueError si le port est invalide
+    except ValueError:
+        raise ValueError("url_expected") from None
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError("url_expected")
+    return value
+
+
+def _url(value: str) -> None:
+    if value:
+        valid_url(value)
 
 
 def split_urls(value: str) -> list[str]:
@@ -63,15 +81,48 @@ def _urls(value: str) -> None:
             raise ValueError(f"anisette_android:{anisette_host(one)}")
 
 
+def ntfy_address(value: str) -> str:
+    """Adresse ntfy ; un simple nom de sujet (« mon-sujet ») devient https://ntfy.sh/mon-sujet."""
+    value = value.strip()
+    if value and "://" not in value and re.fullmatch(r"[\w.-]+", value):
+        value = "https://ntfy.sh/" + value
+    if value:
+        valid_url(value)
+    return value
+
+
+def _ntfy(value: str):
+    return ntfy_address(value)
+
+
+def mask_url(url: str) -> str:
+    """Cache le mot de passe d'une adresse https://utilisateur:mot-de-passe@hôte/sujet."""
+    return re.sub(r"^(\w+://[^/@:\s]*:)[^/@\s]*@", r"\1***@", url or "")
+
+
+_USERINFO_PASSWORD = re.compile(r"^(\w+://[^/@:\s]*:)([^/@\s]*)@")
+
+
+def unmask_url(posted: str, existing: str) -> str:
+    """Adresse saisie dont le mot de passe vaut « *** » (valeur masquée renvoyée par l'interface,
+    peut-être avec un autre hôte ou sujet) : reprend le mot de passe de l'adresse enregistrée."""
+    new = _USERINFO_PASSWORD.match(posted or "")
+    old = _USERINFO_PASSWORD.match(existing or "")
+    if new and old and new.group(2) == "***" and old.group(2) != "***":
+        return new.group(1) + old.group(2) + "@" + posted[new.end():]
+    return posted
+
+
 def _hours(value: float) -> None:
     # profil gratuit = 7 jours (168 h) ; garder au moins 12 h de marge et un renouvellement possible
     if not 12 <= value <= 150:
         raise ValueError("range:12:150")
 
 
-def _onoff(value: str) -> None:
+def _onoff(value: str) -> str:
     if value.lower() not in ("on", "off", "1", "0", "true", "false", "yes", "no"):
         raise ValueError("onoff_expected")
+    return "off" if value.lower() in ("off", "0", "false", "no") else "on"    # l'interface ne connaît que on / off
 
 
 def _language(value: str) -> None:
@@ -89,9 +140,26 @@ def _cert_revoke(value: str) -> None:
         raise ValueError("cert_revoke_expected")
 
 
+def _events(value: str):
+    """Événements reçus par la destination ntfy : liste séparée par des virgules ; vide = tous,
+    « none » = aucun."""
+    items = [x.strip() for x in value.split(",") if x.strip()]
+    if any(x not in NOTIFY_EVENTS + ("none",) for x in items):
+        raise ValueError("events_invalid")
+    return ",".join(dict.fromkeys(items))
+
+
+def events_of(value: str) -> list[str]:
+    items = [x.strip() for x in (value or "").split(",") if x.strip() in NOTIFY_EVENTS]
+    if (value or "").strip() == "none":
+        return []
+    return items or list(NOTIFY_EVENTS)
+
+
 PUBLIC: dict[str, Spec] = {
     "language": Spec("auto", str, ["TVSIGN_LANGUAGE"], _language),
-    "ntfy_url": Spec("", str, ["TVSIGN_NTFY_URL"], _url),
+    "ntfy_url": Spec("", str, ["TVSIGN_NTFY_URL"], _ntfy),
+    "ntfy_events": Spec("", str, ["TVSIGN_NTFY_EVENTS"], _events),
     "renew_before_hours": Spec(60.0, float, ["TVSIGN_RENEW_BEFORE_HOURS"], _hours),
     # vide = serveur par défaut de plumesign (DEFAULT_ANISETTE, repli FALLBACK_ANISETTE). Plusieurs adresses :
     # la première d'abord, la suivante prend le relais si le serveur anisette tombe (voir plume._plume).
@@ -131,16 +199,16 @@ def _env(spec: Spec) -> tuple[str, str] | None:
 
 def _convert(spec: Spec, raw):
     if spec.kind is float:
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            raise ValueError("number_expected") from None
+        # float() accepte « 1_00 », « nan », « inf » : on exige un nombre décimal ordinaire
+        if not re.fullmatch(r"\d+([.,]\d+)?", str(raw).strip()):
+            raise ValueError("number_expected")
+        value = float(str(raw).strip().replace(",", "."))
     else:
         value = str(raw if raw is not None else "").strip()
     if spec.check:
-        spec.check(value)
-    if spec.check is _onoff:
-        value = "off" if value.lower() in ("off", "0", "false", "no") else "on"    # l'interface ne connaît que on / off
+        fixed = spec.check(value)     # un validateur peut renvoyer la valeur normalisée
+        if fixed is not None:
+            value = fixed
     return value
 
 
@@ -181,7 +249,7 @@ def describe() -> dict:
         env = _env(spec)
         stored = raw_get(key)
         out[key] = {
-            "value": get(key),
+            "value": mask_url(get(key)) if key == "ntfy_url" else get(key),
             "default": spec.default,
             "source": "env" if env else "db" if stored is not None else "default",
             "locked": bool(env),
@@ -201,6 +269,10 @@ def update(values: dict) -> dict:
         if _env(spec):
             errors[key] = f"set_by_env:{_env(spec)[0]}"
             continue
+        if key == "ntfy_url" and isinstance(raw, str) and raw.strip():
+            if raw.strip() != get(key) and raw.strip() == mask_url(get(key)):
+                continue        # valeur masquée renvoyée telle quelle par l'interface : on garde le secret
+            raw = unmask_url(raw.strip(), get(key))     # hôte ou sujet changé, mot de passe masqué conservé
         if raw is None or raw == "":
             todo[key] = None
             continue
@@ -250,6 +322,10 @@ def renew_before_hours() -> float:
 
 def ntfy_url() -> str:
     return get("ntfy_url")
+
+
+def ntfy_events() -> list[str]:
+    return events_of(get("ntfy_events"))
 
 
 def anisette_url() -> str:

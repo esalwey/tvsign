@@ -17,6 +17,7 @@ from pathlib import Path
 from . import db, plume
 from .config import DEVICE_TIMEOUT, INSTALL_TIMEOUT, PAIR_HOST, PLUMESIGN
 from .proc import Result, Session, register, run, spawn
+from .util import ContentError, is_content_error
 
 # Nom d'hôte de plumesign par défaut : appairages faits hors de tvsign (plumesign en CLI).
 CLI_HOST = "plume"
@@ -259,6 +260,8 @@ async def _wireless(device: dict, command: str, *extra, timeout: float = 120, ok
         _failed(device, msg)
         raise Unreachable(f"Apple TV « {device['name']} » : {msg}")
     _failed(device, f"{command} : {why}")
+    if command == "install" and is_content_error(res.output + " " + res.err):
+        raise ContentError(f"{command} : {why}")      # paquet refusé par installd : en cause, l'IPA
     raise RuntimeError(f"{command} : {why}")
 
 
@@ -366,4 +369,5 @@ async def install(device: dict, ipas: list[Path], on_event=None, wait_cap: float
                 res = await _wireless(device, "install", ipa, timeout=budget, on_line=line,
                                       on_timeout=on_timeout)
             if "INSTALLED" not in res.lines():
-                raise RuntimeError(f"installation de {ipa.name} : {res.tail()}")
+                kind = ContentError if is_content_error(res.output + " " + res.err) else RuntimeError
+                raise kind(f"installation de {ipa.name} : {res.tail()}")

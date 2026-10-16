@@ -63,6 +63,15 @@ CREATE TABLE IF NOT EXISTS revoked_sessions (
     sid   TEXT PRIMARY KEY,                -- identifiant de session (cookie) déconnecté
     until REAL NOT NULL                    -- au-delà, le cookie a de toute façon expiré
 );
+CREATE TABLE IF NOT EXISTS renewals (
+    id       INTEGER PRIMARY KEY,
+    app_id   INTEGER NOT NULL,
+    started  REAL NOT NULL,
+    finished REAL NOT NULL,
+    cause    TEXT,                          -- déclencheur : auto, manuel, nouvelle version…
+    outcome  TEXT NOT NULL,                 -- ok | error | skipped
+    error    TEXT
+);
 """
 
 
@@ -150,15 +159,20 @@ def snapshot(dest) -> None:
         src.close()
 
 
+def migrate(conn: sqlite3.Connection) -> None:
+    """Crée les tables manquantes et ajoute les colonnes de MIGRATIONS (sans rien supprimer)."""
+    conn.executescript(SCHEMA)
+    for table, col, kind in _pending(conn):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {kind}")
+
+
 def init() -> None:
     existed = DB_PATH.exists() and DB_PATH.stat().st_size > 0
     with tx() as conn:
         if existed and _pending(conn):
             # copie de sécurité avant de modifier le schéma (retour arrière possible)
             snapshot(DB_PATH.with_name(f"tvsign.db.pre-migrate-{int(time.time())}"))
-        conn.executescript(SCHEMA)
-        for table, col, kind in _pending(conn):
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {kind}")
+        migrate(conn)
 
 
 def rows(sql: str, *args) -> list[dict]:

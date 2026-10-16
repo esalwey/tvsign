@@ -35,16 +35,19 @@ def _head(url: str) -> tuple[int | None, float | None, str]:
     except Exception as e:  # noqa: BLE001
         return None, None, str(getattr(e, "reason", e))
     date = headers.get("Date") if headers else None
-    ts = email.utils.parsedate_to_datetime(date).timestamp() if date else None
+    try:
+        ts = email.utils.parsedate_to_datetime(date).timestamp() if date else None
+    except (ValueError, TypeError, OverflowError):
+        ts = None       # Date illisible (portail captif, proxy, serveur maison) : la sonde reste valable
     return code, ts, ""
 
 
 async def _plumesign() -> dict:
     if not PLUMESIGN.exists() and not shutil.which(str(PLUMESIGN)):
-        return _check("plumesign", "error", f"introuvable : {PLUMESIGN} (TVSIGN_PLUMESIGN)")
+        return _check("plumesign", "error", f"not found: {PLUMESIGN} (TVSIGN_PLUMESIGN)")
     v = await plume.version()
     if not v:
-        return _check("plumesign", "error", f"{PLUMESIGN} ne répond pas à --version")
+        return _check("plumesign", "error", f"{PLUMESIGN} does not answer --version")
     return _check("plumesign", "ok", str(PLUMESIGN), v)
 
 
@@ -55,7 +58,7 @@ async def _mdns() -> dict:
         return _check("mdns", "error", str(e), 0)
     ours = sum(1 for d in found if d.get("udid"))
     pairable = sum(1 for d in found if d["kind"] == "pairable")
-    detail = f"{len(found)} annonce(s), {ours} appairée(s) avec tvsign, {pairable} en attente d'appairage"
+    detail = f"{len(found)} announcement(s), {ours} paired with tvsign, {pairable} waiting to be paired"
     return _check("mdns", "ok" if found else "warn", detail, {"total": len(found), "ours": ours, "pairable": pairable})
 
 
@@ -159,7 +162,7 @@ def _disk() -> dict:
     free = shutil.disk_usage(DATA_DIR).free
     gb = free / 1e9
     status = "ok" if gb >= 1 else "warn" if gb >= 0.2 else "error"
-    return _check("disk", status, f"{gb:.1f} Go libres dans {DATA_DIR}", round(gb, 2))
+    return _check("disk", status, f"{gb:.1f} GB free in {DATA_DIR}", round(gb, 2))
 
 
 def _loop() -> dict:
@@ -168,25 +171,33 @@ def _loop() -> dict:
     name = type(asyncio.get_running_loop()).__name__
     ok = "Proactor" in name
     return _check("event_loop", "ok" if ok else "error",
-                  name + ("" if ok else " : sous-processus impossibles, lancer avec « python -m app »"))
+                  name + ("" if ok else ": no subprocesses, start with \"python -m app\""))
 
 
 async def run_all() -> dict:
     started = time.time()
-    results = await asyncio.gather(
-        _plumesign(), _mdns(),
-        _apple(),
-        _anisette(),
-        _reach("github", "https://api.github.com/"),
+
+    async def safe(id_: str, coro, pair: bool = False):
+        # une sonde qui lève ne doit pas faire échouer tout le diagnostic : elle devient une erreur affichée
+        try:
+            return await coro
+        except Exception as e:  # noqa: BLE001
+            failed = _check(id_, "error", f"{type(e).__name__}: {e}")
+            return (failed, None) if pair else failed
+
+    plumesign_, mdns, (apple, apple_date), anis, (github, gh_date) = await asyncio.gather(
+        safe("plumesign", _plumesign()), safe("mdns", _mdns()),
+        safe("apple", _apple(), True),
+        safe("anisette", _anisette()),
+        safe("github", _reach("github", "https://api.github.com/"), True),
     )
-    plumesign_, mdns, (apple, apple_date), anis, (github, gh_date) = results
     server_date = apple_date or gh_date
     if server_date is None:
-        clock = _check("clock", "warn", "aucune date serveur disponible pour comparer")
+        clock = _check("clock", "warn", "no server date available to compare with")
     else:
         skew = time.time() - server_date
         status = "ok" if abs(skew) < 120 else "error"
-        clock = _check("clock", status, f"écart {skew:+.0f} s avec l'heure d'Apple", round(skew))
+        clock = _check("clock", status, f"{skew:+.0f} s from Apple's clock", round(skew))
     checks = [plumesign_, mdns, apple, anis, github, clock, _disk(), _loop()]
     pw = _password_file()
     if pw:

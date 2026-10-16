@@ -151,6 +151,9 @@ PLUME_LOCK_TIMEOUT = _num("TVSIGN_PLUME_LOCK_TIMEOUT", 900, 30)
 # App open on the Apple TV: installd holds the installation until the app is closed (a process
 # alone does not mean the app is on screen: tvOS keeps closed apps in memory). Max wait, in minutes.
 APP_WAIT_MINUTES = _num("TVSIGN_APP_WAIT_MINUTES", 30, 1, kind=float)
+# Same wait for an optional update (new version of an app whose profile is still valid): shorter, so
+# a TV in use does not hold the whole renewal loop for half an hour.
+UPDATE_WAIT_MINUTES = min(_num("TVSIGN_UPDATE_WAIT_MINUTES", 5, 1, kind=float), APP_WAIT_MINUTES)
 # Max duration of the installation itself (upload + installd), waiting excluded, in seconds.
 INSTALL_TIMEOUT = _num("TVSIGN_INSTALL_TIMEOUT", 900, 60)
 # Max duration of a full renewal, in minutes (always leaves room for the app wait).

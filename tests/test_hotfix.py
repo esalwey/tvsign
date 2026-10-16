@@ -593,7 +593,7 @@ class OneNotificationPerEpisode(unittest.TestCase):
         self.email = "reconnect@example.com"
         self.notes = []
 
-        async def notify(message, priority="default"):
+        async def notify(message, priority="default", event="fail", **extra):
             self.notes.append((message, priority))
             return True
         self.saved_notify = renew.notify

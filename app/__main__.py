@@ -55,6 +55,8 @@ def main() -> None:
         "app.main:app", host=HOST, port=PORT, reload=False, workers=1, loop="asyncio",
         proxy_headers=True, forwarded_allow_ips=proxies, server_header=False,
         log_level=os.environ.get("TVSIGN_LOG_LEVEL", "info"),
+        # the page polls /api/state every 5 s: one access line each would fill the Docker log
+        access_log=os.environ.get("TVSIGN_ACCESS_LOG", "").strip().lower() in ("1", "true", "yes", "on"),
     )
     server = uvicorn.Server(config)
     # asyncio.run keeps the platform default loop (Proactor on Windows)

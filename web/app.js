@@ -98,12 +98,13 @@ const CAUSES = [
   [/CERT_LIMIT/, "c_certlimit"],
   [/NO_TEAM|MULTIPLE_TEAMS|TEAM_NOT_FOUND/, "c_team"],
   [/arrêté par le système|killed by the system/i, "c_oom"],
-  [/ntfy/i, "c_ntfy"],
+  [/ntfy|notification .*échouée|notify_failed/i, "c_ntfy"],
   [/maximum number of (installed )?(apps|app ?ids?)|too many (installed )?(apps|app ?ids?)|app ?id limit|limit of \d+ (apps|app ?ids)|limite du compte gratuit|reached the maximum number/i, "c_limit"],
   [/limite de requêtes GitHub/i, "c_gh_rate"],
   [/jeton GitHub refusé/i, "c_gh_token"],
   [/dépôt GitHub introuvable/i, "c_gh_missing"],
   [/demande tvOS/i, "c_tvos"],
+  [/aucune IPA trouvée/, "c_no_release"],
   [/8220|no devices from which/i, "c_8220"],
   [/ancienne version de tvsign/i, "c_legacy"],
   [/appairage perdu|PAIRING_LOST|pairing record|not paired|No stored pairing/i, "c_lost"],
@@ -147,6 +148,14 @@ function nettoyer(msg) {
     .replace(/https?:\/\/\S+/g, "")
     .replace(/^(\w[\w ]{0,20} : )?(Error: )?(Core error: )?/, "$1")
     .replace(/\s+/g, " ").trim();
+}
+// Message d'une erreur d'API : traduit si le serveur a envoyé un code connu, sinon texte brut passé par enClair
+// (messages français des sources : « aucune IPA trouvée… », « adresse locale refusée… »).
+function messageErreur(e) {
+  const code = String(e.code || "").split(":")[0];
+  if (I18N["err_" + code]) return e.message;
+  const c = enClair(e.code || e.message);
+  return c.connu ? `${c.titre}.${c.conseil ? " " + c.conseil : ""}` : e.message;
 }
 function enClair(msg) {
   const brut = String(msg || "");
@@ -344,7 +353,7 @@ function problemeApp(a, now) {
     : ["c_lost", "c_legacy"].includes(e.cle) ? `<button class="btn btn--petit" data-open="dlg-pair">${t("pair")}</button>`
     : e.cle === "c_certlimit" ? `<a class="btn btn--petit" href="#/settings">${t("settings")}</a>`
     : e.cle === "c_ipa_missing" && a.source_type === "upload" ? `<button class="btn btn--petit" data-replace="${a.id}">${t("replace_ipa")}</button>`
-    : ["c_no_tv", "c_source", "c_bundle", "c_digest", "c_gh_missing"].includes(e.cle) ? `<button class="btn btn--petit" data-edit="${a.id}" data-key="edit-p-${a.id}">${t("settings")}</button>` : "";
+    : ["c_no_tv", "c_source", "c_bundle", "c_digest", "c_gh_missing", "c_no_release"].includes(e.cle) ? `<button class="btn btn--petit" data-edit="${a.id}" data-key="edit-p-${a.id}">${t("settings")}</button>` : "";
   const details = e.brut && (e.brut.length > 110 || e.connu)
     ? `<details class="details" data-key="err-${a.id}"><summary>${t("tech_details")}</summary><pre class="log">${esc(nettoyer(e.brut) || e.brut)}</pre></details>` : "";
   return `<div class="probleme" role="group" aria-label="${esc(t("last_problem"))}">
@@ -465,6 +474,10 @@ function renderAlertes() {
   if (s) {
     if (s.auth_disabled) {
       html.push(`<div class="banner banner--info"><p><strong>${t("auth_off_t")}</strong>${t("auth_off")}</p></div>`);
+    }
+    for (const n of (s.notices || []).filter((x) => x.id === "revocation")) {
+      html.push(`<div class="banner"><p><strong>${esc(t("revoked_t", { email: n.email }))}</strong>${esc(t("revoked", { app: n.app }))}</p>
+        <button class="btn" type="button" data-dismiss-notice="revocation">${t("dismiss")}</button></div>`);
     }
     for (const a of s.accounts.filter((x) => x.ok === 0)) {
       html.push(`<div class="banner"><p><strong>${esc(t("acc_disconnected_t", { email: a.email }))}</strong>${t("acc_disconnected")}</p>
@@ -600,11 +613,14 @@ function renderSysteme(s, now) {
   </div>`);
 }
 
+let OLDER_EVENTS = [];      // événements plus anciens chargés par « Afficher plus » (extras.js)
+let OLDER_MORE = null;      // null : inconnu (on suppose qu'il y en a si le serveur en a renvoyé 80)
 function renderEvents(s) {
   const filtre = store.get("tvsign.journal") || "tout";
   const radio = $(`input[name="journal-filtre"][value="${filtre}"]`);
   if (radio && !radio.checked) radio.checked = true;
-  const evs = s.events.filter((e) => filtre === "tout" || e.level !== "info");
+  const tous = s.events.concat(OLDER_EVENTS.filter((o) => o.id < (s.events[s.events.length - 1]?.id ?? Infinity)));
+  const evs = tous.filter((e) => filtre === "tout" || e.level !== "info");
   if (!evs.length) return setHTML($("#events"), `<div class="vide"><p>${filtre === "tout" ? t("log_empty") : t("log_no_problem")}</p></div>`);
   const jour = (ts) => {
     const d = new Date(ts * 1000), auj = new Date(), hier = new Date(Date.now() - 86400000);
@@ -629,7 +645,8 @@ function renderEvents(s) {
         ${long ? `<details class="details" data-key="ev-${e.id}"><summary>${t("details")}</summary><pre class="log">${esc(e.message)}</pre></details>` : ""}</div>
     </li>`;
   }
-  setHTML($("#events"), html + "</ol>");
+  const plus = OLDER_MORE === null ? s.events.length >= 80 : OLDER_MORE;
+  setHTML($("#events"), html + "</ol>" + (plus ? `<div class="actions-form"><button class="btn" type="button" data-more-events>${t("log_more")}</button></div>` : ""));
 }
 
 function render() {
@@ -802,6 +819,9 @@ function openDialog(id) {
   if (id === "dlg-login") {
     $("#login-session").innerHTML = ""; $("#login-error").textContent = "";
     $("#login-submit").disabled = false;
+    // l'avertissement sur les certificats se confirme une fois, au premier compte
+    $("#login-ack-row").hidden = !!(STATE?.accounts || []).length;
+    $("#form-login").ack.checked = false;
   }
   document.getElementById(id).showModal();
 }
@@ -937,7 +957,7 @@ $("#form-app").addEventListener("submit", async (ev) => {
     f.reset();
     flash("ok", t("app_added_t", { name: app.name }), " " + t("app_added") + ((app.warnings || []).includes("slots_full") ? t("warn_slots_full", { max: STATE?.max_active_apps || 3 }) : ""));
   } catch (e) {
-    err.textContent = e.message;
+    err.textContent = messageErreur(e);
   } finally {
     btn.disabled = false; btn.textContent = t("add");
     refresh();
@@ -1000,7 +1020,7 @@ $("#form-edit").addEventListener("submit", async (ev) => {
     if (relance && a.enabled) lance = await api(`/api/apps/${a.id}/renew`, { method: "POST" });   // nouvelle destination : installer tout de suite
     flash("ok", t("saved_t"), !lance ? "" : lance.started === false ? " " + t("dest_after") : " " + t("dest_now"));
   } catch (e) {
-    err.textContent = e.message;
+    err.textContent = messageErreur(e);
   } finally {
     btn.disabled = false;
     refresh();
@@ -1145,6 +1165,7 @@ $("#form-login").addEventListener("submit", async (ev) => {
   const f = ev.target, btn = $("#login-submit");
   if (btn.disabled) return;
   $("#login-error").textContent = "";
+  if (!f.ack.checked && !(STATE?.accounts || []).length) return ($("#login-error").textContent = t("login_ack_needed"));
   btn.disabled = true;
   try {
     const sess = await api("/api/accounts/login", { json: { email: f.email.value.trim(), password: f.password.value } });
@@ -1314,6 +1335,15 @@ const WIZ_RENDU = {
   },
 };
 
+// Détails calculés par le serveur en anglais (dossier de support) : l'interface les écrit dans sa langue.
+function detailDiag(c, d) {
+  if (c.id === "disk" && c.value != null) return t("diag_disk_d", { gb: c.value, dir: d.data_dir || "" });
+  if (c.id === "clock" && typeof c.value === "number") return t("diag_clock_d", { s: (c.value > 0 ? "+" : "") + c.value });
+  if (c.id === "clock" && c.value == null && c.status === "warn") return t("diag_clock_none");
+  if (c.id === "mdns" && c.value && typeof c.value === "object") return t("diag_mdns_d", c.value);
+  return c.detail;
+}
+
 function listeDiag(d) {
   return `<div class="list">${d.checks.map((c) => {
     const ton = c.status === "ok" ? "ok" : c.status === "warn" ? "warn" : "err";
@@ -1323,7 +1353,7 @@ function listeDiag(d) {
       <div class="row__label">
         <p class="row__title">${t("diag_" + c.id)}</p>
         <p class="row__sub"><span class="etat etat--${ton}">${t("diag_" + c.status)}</span>${c.id === "plumesign" && c.value ? ` · <span class="mono">${esc(c.value)}</span>` : ""}</p>
-        <p class="row__sub">${esc(c.detail)}</p>
+        <p class="row__sub">${esc(detailDiag(c, d))}</p>
         ${conseil && conseil !== `diag_${c.id}_fix` ? `<p class="row__sub">${esc(conseil)}</p>` : ""}
       </div>
     </div>`;
@@ -1361,7 +1391,7 @@ $("#vue-onboarding").addEventListener("click", async (e) => {
     fd.append("device_id", tv.id);
     await busy(b, "id", t("downloading"), async () => {
       try { await api("/api/apps", { method: "POST", body: fd }); WIZ.appAjoutee = true; await refresh(); }
-      catch (err) { const el = $("#wiz-erreur"); if (el) el.textContent = err.message; }
+      catch (err) { const el = $("#wiz-erreur"); if (el) el.textContent = messageErreur(err); }
     });
   }
 });
@@ -1406,6 +1436,7 @@ async function chargerReglages() {
   cb.checked = (STATE?.apps || []).some((a) => a.source_type === "upload");
   $("#backup-export").href = "/api/backup/export" + (cb.checked ? "?uploads=true" : "");
   renderSecurite();
+  if (typeof chargerNotifs === "function") chargerNotifs();
 }
 function afficherMaj(u) {
   const el = $("#update-status");
@@ -1479,14 +1510,6 @@ function afficherFlashReglages() {
   const b = $("#reglages-submit"), txt = b.textContent;
   b.textContent = t("saved_t"); setTimeout(() => (b.textContent = txt), 1800);
 }
-$("#ntfy-test").onclick = async (ev) => {
-  const b = ev.currentTarget, err = $("#reglages-error");
-  err.textContent = "";
-  await busy(b, "id", t("sending"), async () => {
-    try { await api("/api/settings/test-notification", { json: { url: $("#form-reglages").ntfy_url.value.trim() || null } }); b.textContent = t("sent"); }
-    catch (e) { err.textContent = e.message; }
-  });
-};
 $("#vue-settings").addEventListener("click", async (e) => {
   const b = e.target.closest("button");
   if (!b) return;
@@ -1583,6 +1606,7 @@ async function changerLangue(lang, serveur = false) {
 }
 function appliquerI18n() {
   document.documentElement.lang = LANG;
+  if (typeof annoncerLangue === "function") annoncerLangue();
   $$("[data-i18n]").forEach((el) => (el.textContent = t(el.dataset.i18n)));
   $$("[data-i18n-placeholder]").forEach((el) => (el.placeholder = t(el.dataset.i18nPlaceholder)));
   $$("[data-i18n-aria]").forEach((el) => el.setAttribute("aria-label", t(el.dataset.i18nAria)));

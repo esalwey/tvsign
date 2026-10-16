@@ -2,7 +2,8 @@
 # tvsign host checker and installer (Linux: Raspberry Pi OS 64-bit, Debian, Ubuntu, NAS shells).
 #
 #   sh install.sh                 check this host only, change nothing
-#   sh install.sh --install [DIR] check, then write DIR/docker-compose.yml (default /opt/tvsign),
+#   sh install.sh --install [DIR] check, then write DIR/docker-compose.yml (default /opt/tvsign, or ~/tvsign
+#                                 when you are not root and sudo is missing),
 #                                 start tvsign and print the address and the one-time setup code
 #
 # Options: --port N (default 8765), --image REF (default ghcr.io/esalwey/tvsign:1), --tz ZONE
@@ -11,7 +12,7 @@ set -u
 
 IMAGE=${TVSIGN_IMAGE:-ghcr.io/esalwey/tvsign:1}
 PORT=8765
-DIR=/opt/tvsign
+DIR=
 TZ_VALUE=${TZ:-}
 INSTALL=0
 
@@ -37,6 +38,11 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 SUDO=
 if [ "$(id -u)" != 0 ]; then have sudo && SUDO=sudo; fi
+
+# Default folder: /opt/tvsign needs root. Without root and without sudo (NAS shells), use ~/tvsign.
+if [ -z "$DIR" ]; then
+    if [ "$(id -u)" = 0 ] || [ -n "$SUDO" ]; then DIR=/opt/tvsign; else DIR=${HOME:-.}/tvsign; fi
+fi
 
 printf "${B}tvsign host check${N}\n"
 
@@ -155,7 +161,14 @@ OWNER_UID=${SUDO_UID:-$(id -u)}
 OWNER_GID=${SUDO_GID:-$(id -g)}
 [ "$OWNER_UID" = 0 ] && { OWNER_UID=1000; OWNER_GID=1000; }
 
-$SUDO mkdir -p "$DIR/tvsign-data" || exit 1
+if ! $SUDO mkdir -p "$DIR/tvsign-data"; then
+    echo "cannot create $DIR/tvsign-data." >&2
+    if [ -z "$SUDO" ] && [ "$(id -u)" != 0 ]; then
+        echo "You are not root and sudo is not installed: pick a folder you own, e.g." >&2
+        echo "  sh install.sh --install \"\$HOME/tvsign\"" >&2
+    fi
+    exit 1
+fi
 if [ -f "$DIR/docker-compose.yml" ]; then
     echo "keeping existing $DIR/docker-compose.yml"
     # the port that counts is the one in that file, not --port
@@ -172,6 +185,11 @@ services:
     network_mode: host
     security_opt:
       - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     stop_grace_period: 5m
     environment:
       TZ: $TZ_VALUE

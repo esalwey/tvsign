@@ -23,7 +23,13 @@ from .util import replace_retry
 
 class SourceRejected(ValueError):
     """Release refusée pour de bon (IPA invalide, empreinte fausse, bundle ID changé) :
-    ne pas la retélécharger à chaque essai."""
+    ne pas la retélécharger à chaque essai.
+    code : identifiant stable (« code » ou « code:paramètre ») que l'API renvoie tel quel et que
+    l'interface traduit ; le message reste en français pour le journal."""
+
+    def __init__(self, message: str, code: str | None = None):
+        super().__init__(message)
+        self.code = code
 
 
 def _text(value) -> str | None:
@@ -36,8 +42,7 @@ class UrlRejected(SourceRejected):
     """Adresse de lien refusée avant tout accès réseau. `code` : clé d'interface (https_only, url_userinfo, url_private)."""
 
     def __init__(self, message: str, code: str):
-        super().__init__(message)
-        self.code = code
+        super().__init__(message, code)
 
 
 class OsTooOld(SourceRejected):
@@ -581,7 +586,7 @@ def latest_github(repo: str, tag_prefixes: list[str] | str | None, prereleases: 
             key = sha256 or f"{ipas[0].get('id')}:{ipas[0].get('updated_at')}:{ipas[0].get('size')}"
             return {"tag": rel["tag_name"], "url": _asset_url(ipas[0]),
                     "sha256": sha256, "key": key, "prerelease": bool(rel.get("prerelease")),
-                    "asset": ipas[0]["name"], "notes": (rel.get("body") or "")[:4000]}
+                    "asset": ipas[0]["name"], "notes": (rel.get("body") or "")[:4000], "name": rel.get("name") or rel["tag_name"]}
     return None
 
 
@@ -618,11 +623,11 @@ def download(url: str, dest: Path, sha256: str | None = None, expect_bundle: str
             expected = int(r.headers.get("Content-Length") or 0)
             limit = MAX_UPLOAD_MB * 1024 * 1024    # même plafond que les envois : un lien ne remplit pas le disque
             if expected > limit:
-                raise SourceRejected(f"fichier trop gros (> {MAX_UPLOAD_MB} Mo)")
+                raise SourceRejected(f"fichier trop gros (> {MAX_UPLOAD_MB} Mo)", code=f"too_large:{MAX_UPLOAD_MB}")
             got = 0
             while chunk := r.read(1 << 20):
                 if got + len(chunk) > limit:
-                    raise SourceRejected(f"fichier trop gros (> {MAX_UPLOAD_MB} Mo)")
+                    raise SourceRejected(f"fichier trop gros (> {MAX_UPLOAD_MB} Mo)", code=f"too_large:{MAX_UPLOAD_MB}")
                 f.write(chunk)
                 h.update(chunk)
                 got += len(chunk)

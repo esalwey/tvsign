@@ -5,6 +5,7 @@ import re
 import subprocess
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 
 # Windows : pas de fenêtre console qui clignote à chaque appel de plumesign (app lancée depuis le tray).
@@ -35,6 +36,21 @@ class Result:
 
     def lines(self) -> list[str]:
         return [l.strip() for l in self.output.splitlines() if l.strip()]
+
+
+# Dernières sorties des commandes plumesign (dossier de support) : (heure, commande, code, lignes).
+# Jamais d'arguments dans l'étiquette (chemins, identifiants d'appareil), et masquées à l'export.
+RING: deque = deque(maxlen=60)
+_LABEL_WORD = re.compile(r"[a-z][a-z-]*")
+
+
+def _remember(args, result: "Result") -> None:
+    try:
+        words = [a for a in map(str, args[1:4]) if _LABEL_WORD.fullmatch(a)]
+        lines = [l[:500] for l in (result.err or result.output).splitlines() if l.strip()][-200:]
+        RING.append((time.time(), " ".join(["plumesign", *words]), result.code, lines))
+    except Exception:  # noqa: BLE001 - jamais gênant pour la commande elle-même
+        pass
 
 
 async def run(*args, env: dict | None = None, timeout: float = 600, split: bool = False,
@@ -76,13 +92,17 @@ async def run(*args, env: dict | None = None, timeout: float = 600, split: bool 
         await asyncio.wait_for(_read(), timeout)
     except TimeoutError:
         # on garde la sortie partielle pour le diagnostic
-        return Result(-1, f"{text(out)}\ndélai dépassé ({timeout:.0f} s)", text(err))
+        result = Result(-1, f"{text(out)}\ndélai dépassé ({timeout:.0f} s)", text(err))
+        _remember(args, result)
+        return result
     finally:
         # tue aussi l'enfant si on est annulé (arrêt, délai externe)
         if proc.returncode is None:
             proc.kill()
             await proc.wait()
-    return Result(proc.returncode, text(out), text(err))
+    result = Result(proc.returncode, text(out), text(err))
+    _remember(args, result)
+    return result
 
 
 @dataclass

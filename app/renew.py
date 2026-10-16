@@ -1,18 +1,15 @@
 """Renouvellement : mise à jour de la source, signature, installation, et boucle de planification."""
 import asyncio
-import base64
 import hashlib
 import json
 import os
 import re
 import shutil
 import time
-import urllib.parse
-import urllib.request
 
-from . import db, devices, ipa, plume, proc, selfupdate, settings, util
+from . import backup, db, devices, ipa, notifier, plume, proc, selfupdate, settings, util
 from .config import (ACCOUNT_CHECK_HOURS, APP_WAIT_MINUTES, APPLE_BACKOFF_MINUTES, CHECK_INTERVAL, IPA_DIR,
-                     RELEASE_CHECK_MINUTES, RENEW_TIMEOUT_MINUTES, RETRY_MINUTES)
+                     RELEASE_CHECK_MINUTES, RENEW_TIMEOUT_MINUTES, RETRY_MINUTES, UPDATE_WAIT_MINUTES)
 
 # Arrêt du service en cours : plus aucun renouvellement ne démarre, ceux en cours peuvent finir.
 STOPPING = False
@@ -27,6 +24,8 @@ _NO_MATCH_LOGGED: set[int] = set()      # apps dont l'absence de release corresp
 _RELEASE_ERR: dict[int, str] = {}       # apps dont la recherche de version échoue : message (une ligne de journal par épisode)
 _LINK_CHECKED: dict[int, float] = {}    # liens sans marqueur de version : dernière comparaison d'empreinte
 _OS_REFRESHED: dict[int, float] = {}    # Apple TV dont la version de tvOS a été relue pour lever un blocage
+_OUTCOME: dict[int, tuple[str, str | None]] = {}   # résultat du dernier essai par app (historique des renouvellements)
+_STALL_ALERTED = False                  # blocage de la boucle déjà signalé (une alerte par épisode)
 
 # Ce que l'utilisateur remet à zéro en agissant (destination, source, renouvellement manuel…) : plus d'attente,
 # ni d'action requise, ni de délai croissant.
@@ -46,7 +45,7 @@ HEALTH: dict = {
     "loop_error": None,                 # dernière erreur inattendue de la boucle
     "last_account_check_at": None,
     "last_release_check_at": None,
-    "notify_error": None,               # dernier échec d'envoi ntfy
+    "notify_error": None,               # dernier échec d'envoi à une destination de notification
     "restarts": 0,                      # relances de la boucle par le superviseur
     "release_check_error": None,        # dernier échec de la recherche de nouvelles versions (GitHub)
 }
@@ -61,48 +60,17 @@ def app_dir(app_id: int):
 
 
 def _fmt(ts: float) -> str:
-    return time.strftime("%d/%m %H:%M", time.localtime(ts))
+    return notifier.fmt_time(ts)
 
 
 # ---------- notifications ----------
 
-def _send(message: str, priority: str, url: str | None = None) -> None:
-    url = url or settings.ntfy_url()
-    headers = {"Title": "tvsign", "Priority": priority}
-    parts = urllib.parse.urlsplit(url)
-    if parts.username is not None:
-        # https://user:pass@hôte/sujet : urllib n'en fait pas d'authentification, on l'envoie en Basic
-        cred = f"{urllib.parse.unquote(parts.username)}:{urllib.parse.unquote(parts.password or '')}"
-        headers["Authorization"] = "Basic " + base64.b64encode(cred.encode("utf-8")).decode()
-        host = parts.hostname + (f":{parts.port}" if parts.port else "")
-        url = urllib.parse.urlunsplit(parts._replace(netloc=host))
-    req = urllib.request.Request(url, data=message.encode("utf-8"), headers=headers)
-    urllib.request.urlopen(req, timeout=10).close()
-
-
-async def notify_test(url: str | None = None) -> None:
-    """Notification d'essai depuis les Réglages ; lève l'erreur pour l'afficher."""
-    target = url or settings.ntfy_url()
-    if not target:
-        raise RuntimeError("aucune adresse de notification")
-    await asyncio.to_thread(_send, "tvsign : notification de test", "default", target)
-    HEALTH["notify_error"] = None
-
-
-async def notify(message: str, priority: str = "default") -> bool:
-    """Envoi ntfy hors de la boucle d'événements ; un échec est journalisé une fois.
+async def notify(message: str, priority: str = "default", event: str = "fail", **extra) -> bool:
+    """Envoi aux destinations abonnées à `event` (voir notifier.py), hors de la boucle d'événements.
     True si la notification est partie : l'appelant ne doit la considérer envoyée qu'alors."""
-    if not settings.ntfy_url():
-        return False
-    try:
-        await asyncio.to_thread(_send, message, priority)
-        HEALTH["notify_error"] = None
-        return True
-    except Exception as e:  # noqa: BLE001 - la notification est accessoire
-        if HEALTH["notify_error"] is None:
-            db.log(f"notification ntfy échouée : {e}", "warn")
-        HEALTH["notify_error"] = str(e)
-        return False
+    sent = await notifier.dispatch(event, message, priority, **extra)
+    HEALTH["notify_error"] = notifier.last_error()
+    return sent
 
 
 # Niveaux d'alerte croissants : on ne renotifie que si la situation s'aggrave.
@@ -132,12 +100,14 @@ async def alert(app: dict, reason: str, now: float, quiet_fail: bool = False) ->
         return  # déjà notifié à ce niveau
     if lvl == "fail" and quiet_fail:
         return
+    name = app["name"]
     if lvl == "fail":
-        sent = await notify(f"{app['name']} : renouvellement échoué, {reason}")
+        sent = await notify(notifier.text("renew_failed", name=name, reason=reason), "default", "fail", app=name)
     elif lvl == "expired":
-        sent = await notify(f"{app['name']} : profil EXPIRÉ, l'app ne se lance plus. {reason}", "urgent")
+        sent = await notify(notifier.text("expired", name=name, reason=reason), "urgent", "expiry", app=name)
     else:
-        sent = await notify(f"{app['name']} expire dans moins de {lvl[:-1]} h et le renouvellement échoue : {reason}", "high")
+        sent = await notify(notifier.text("expiring", name=name, h=lvl[:-1], reason=reason), "high", "expiry",
+                            app=name)
     if sent:
         # niveau mémorisé seulement si la notification est partie : sinon on réessaiera au prochain échec
         db.update("apps", app["id"], notified_level=lvl)
@@ -257,13 +227,24 @@ async def _lift_os_block(app: dict) -> None:
                app_id=app["id"])
 
 
-def _note_update(app: dict, tag: str | None, notes: str | None, block: str | None) -> None:
-    """Mémorise (ou efface, avec tag None) la mise à jour disponible mais non installée, pour l'interface."""
+def _note_update(app: dict, tag: str | None, notes: str | None, block: str | None) -> bool:
+    """Mémorise (ou efface, avec tag None) la mise à jour disponible mais non installée, pour l'interface.
+    Renvoie True quand c'est une nouvelle version qui vient d'être signalée."""
     want = dict(update_tag=tag, update_notes=notes or None if tag else None, update_block=block if tag else None)
     fields = {k: v for k, v in want.items() if app.get(k) != v}
     if fields:
         db.update("apps", app["id"], **fields)
         app.update(fields)
+    return bool(tag) and "update_tag" in fields
+
+
+async def _announce_available(app: dict, tag: str) -> None:
+    """Mises à jour automatiques coupées : une ligne au journal et une notification par nouvelle version."""
+    label = _link_label(app, tag)
+    db.log(f"{app['name']} : version {label} disponible (mises à jour automatiques désactivées)",
+           app_id=app["id"])
+    await notify(notifier.text("update_available", name=app["name"], tag=label), "default", "update",
+                 app=app["name"])
 
 
 def _link_label(app: dict, tag: str | None) -> str:
@@ -290,10 +271,10 @@ async def refresh_source(app: dict, force: bool = False) -> bool:
                     channel = "stable" if app.get("channel") != "beta" else "beta"
                     prefixes, _ = ipa.release_rule(app)
                     which = f", tags {' / '.join(x + '*' for x in prefixes)}" if prefixes else ""
-                    hint = await _beta_hint(app) if channel == "stable" else ""
+                    hint, beta_tag = await _beta_hint(app) if channel == "stable" else ("", None)
                     pin = f" (version épinglée : {app['pinned_tag']})" if app.get("pinned_tag") else ""
-                    raise RuntimeError(f"aucune IPA trouvée dans les releases ({channel}{which}) de "
-                                       f"{app['source']}{pin}{hint}")
+                    raise NoRelease(f"aucune IPA trouvée dans les releases ({channel}{which}) de "
+                                    f"{app['source']}{pin}{hint}", beta_tag)
                 if app["id"] not in _NO_MATCH_LOGGED:
                     _NO_MATCH_LOGGED.add(app["id"])
                     db.log(f"{app['name']} : aucune release ne correspond plus dans {app['source']} "
@@ -326,7 +307,8 @@ async def refresh_source(app: dict, force: bool = False) -> bool:
                     return False
             elif not force and not app.get("auto_update", 1):
                 # mise à jour automatique coupée : on signale la nouvelle version sans l'installer
-                _note_update(app, tag, notes, "manual")
+                if _note_update(app, tag, notes, "manual"):
+                    await _announce_available(app, tag)
                 return False
         if not unchanged_sha:
             db.log(f"{app['name']} : téléchargement de {_link_label(app, tag)}"
@@ -361,10 +343,9 @@ async def refresh_source(app: dict, force: bool = False) -> bool:
         # passage, et reprise dès que la TV est mise à jour (_lift_os_block)
         db.update("apps", app["id"], bad_tag=tag, bad_key=key, update_tag=tag, update_notes=notes or None,
                   update_block=f"tvos:{e.min_os}")
-        msg = (f"{app['name']} : la version {_link_label(app, tag)} demande tvOS {e.min_os} ou plus, "
-               f"l'Apple TV est en tvOS {e.have} : version actuelle conservée")
-        db.log(msg, "warn", app_id=app["id"])
-        await notify(msg)
+        params = dict(name=app["name"], tag=_link_label(app, tag), need=e.min_os, have=e.have)
+        db.log(notifier.text("update_blocked_os", "fr", **params), "warn", app_id=app["id"])
+        await notify(notifier.text("update_blocked_os", **params), "default", "update", app=app["name"])
         return False
     except Exception as e:  # noqa: BLE001
         if not dest.exists():
@@ -379,8 +360,8 @@ async def refresh_source(app: dict, force: bool = False) -> bool:
             db.update("apps", app["id"], bad_tag=tag, bad_key=key)
             db.log(f"{app['name']} : version {_link_label(app, tag)} inutilisable ({e}), version précédente conservée",
                    "warn", app_id=app["id"])
-            await notify(f"{app['name']} : nouvelle version {_link_label(app, tag)} inutilisable ({e}), "
-                         "version précédente conservée")
+            await notify(notifier.text("update_refused", name=app["name"], tag=_link_label(app, tag), why=e),
+                         "default", "update", app=app["name"])
         else:
             db.log(f"{app['name']} : source indisponible ({e}), version précédente conservée",
                    "warn", app_id=app["id"])
@@ -393,15 +374,23 @@ async def refresh_source(app: dict, force: bool = False) -> bool:
     return True
 
 
-async def _beta_hint(app: dict) -> str:
-    """Canal stable sans release : indique si le canal beta, lui, en a une."""
+async def _beta_hint(app: dict) -> tuple[str, str | None]:
+    """Canal stable sans release : indique si le canal beta, lui, en a une (texte, tag)."""
     try:
         prefixes, prereleases = ipa.release_rule({**app, "channel": "beta"})
         found = await asyncio.to_thread(ipa.latest_github, app["source"], prefixes, prereleases,
                                         app.get("asset_name"))
     except Exception:  # noqa: BLE001 - simple indication
-        return ""
-    return f" ; une version beta existe ({found['tag']}) : choisis le canal Beta" if found else ""
+        return "", None
+    return (f" ; une version beta existe ({found['tag']}) : choisis le canal Beta", found["tag"]) if found else ("", None)
+
+
+class NoRelease(RuntimeError):
+    """Aucune release GitHub ne correspond (canal, préfixes de tag) et aucune IPA n'est encore téléchargée."""
+
+    def __init__(self, message: str, beta_tag: str | None = None):
+        super().__init__(message)
+        self.beta_tag = beta_tag
 
 
 def _latest(app: dict) -> dict | None:
@@ -461,7 +450,8 @@ async def new_release(app: dict) -> bool:
             _note_update(app, None, None, None)
         return False
     if not app.get("auto_update", 1):
-        _note_update(app, tag, found.get("notes"), "manual")
+        if _note_update(app, tag, found.get("notes"), "manual"):
+            await _announce_available(app, tag)
         return False
     return True
 
@@ -517,8 +507,14 @@ def is_transient(exc: BaseException) -> bool:
 
 
 def ipa_fault(exc: BaseException) -> bool:
-    """L'échec peut-il venir de l'IPA elle-même ? Ni la TV, le compte, le réseau ni Apple (qui refuse ou limite)."""
-    return not (failure_kind(exc) or is_transient(exc) or isinstance(exc, plume.AppleRefused))
+    """L'échec peut-il venir de l'IPA elle-même ? Oui quand plumesign ou installd désignent le contenu
+    (ContentError : bundle, Info.plist, entitlements, paquet refusé). Sinon, ni la TV, le compte, le réseau,
+    Apple (qui refuse ou limite) ni une limite du compte ou un disque plein : l'ancienne version les suivrait
+    à l'identique."""
+    if isinstance(exc, util.ContentError):
+        return True
+    return not (failure_kind(exc) or is_transient(exc) or isinstance(exc, plume.AppleRefused)
+                or util.is_limit_text(str(exc)))
 
 
 def backoff_seconds(fails: int, transient: bool = False, left: float | None = None) -> float:
@@ -618,22 +614,38 @@ def forget(app_id: int) -> None:
     _release_ok({"id": app_id})            # sinon la bannière « recherche impossible » resterait jusqu'au redémarrage
 
 
+def _record(app_id: int, trigger: str, started: float) -> None:
+    """Historique des renouvellements (inclus dans le dossier de support) ; ne doit jamais gêner un essai."""
+    outcome, error = _OUTCOME.pop(app_id, ("skipped", None))
+    try:
+        db.execute("INSERT INTO renewals (app_id, started, finished, cause, outcome, error) VALUES (?, ?, ?, ?, ?, ?)",
+                   app_id, started, time.time(), trigger, outcome, (error or "")[:500] or None)
+        db.execute("DELETE FROM renewals WHERE id NOT IN (SELECT id FROM renewals ORDER BY id DESC LIMIT 500)")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def renew(app_id: int, trigger: str = "manuel") -> None:
-    if app_id in _RUNNING or STOPPING:
+    if app_id in _RUNNING or STOPPING or backup.RESTORING:
         return
     _RUNNING.add(app_id)
     try:
         while True:
+            started = time.time()
             try:
                 await asyncio.wait_for(_renew(app_id, trigger), RENEW_TIMEOUT_MINUTES * 60)
             except TimeoutError:
+                _OUTCOME[app_id] = ("error", "renouvellement trop long, abandonné")
                 app = db.row("SELECT * FROM apps WHERE id = ?", app_id)
                 if app:
                     db.log(f"{app['name']} : renouvellement trop long, abandonné", "error", app_id=app_id)
                     await alert(app, "renouvellement trop long, abandonné", time.time())
             except Exception as e:  # noqa: BLE001 - une tâche de fond ne doit jamais mourir en silence
+                _OUTCOME[app_id] = ("error", str(e))
                 HEALTH["loop_error"] = f"renouvellement : {e}"
-                db.log(f"renouvellement de l'app {app_id} : {e}", "error", app_id=app_id)
+                _log_quietly(f"renouvellement de l'app {app_id} : {e}", app_id=app_id)
+            finally:
+                _record(app_id, trigger, started)
             if app_id not in _RERUN:
                 break
             # Apple TV ou compte changés pendant l'opération : l'essai terminé visait l'ancienne destination
@@ -647,7 +659,7 @@ async def renew(app_id: int, trigger: str = "manuel") -> None:
 
 def spawn(app_id: int, trigger: str = "manuel") -> bool:
     """Lance un renouvellement en tâche de fond (référence conservée). False si déjà en cours."""
-    if app_id in _RUNNING or STOPPING:
+    if app_id in _RUNNING or STOPPING or backup.RESTORING:
         return False
     proc.spawn(renew(app_id, trigger))
     return True
@@ -768,10 +780,11 @@ async def _fall_back(app_id: int, first: Exception, deliver, signed) -> float:
               source_sha256=cur["prev_sha256"], bad_tag=cur["source_tag"], bad_key=cur["source_key"],
               update_tag=None, update_notes=None, update_block=None, notes=None,
               prev_tag=None, prev_key=None, prev_version=None, prev_sha256=None)
-    msg = (f"{name} : la version {new_label} n'a pas pu être installée ({first}) ; la version précédente "
-           "est réinstallée et la nouvelle ignorée")
-    db.log(msg, "warn", app_id=app_id)
-    await notify(msg)
+    prev_label = cur["prev_version"] or cur["prev_tag"] or "?"
+    db.log(f"{name} : la version {new_label} n'a pas pu être installée ({first}) ; la version précédente "
+           "est réinstallée et la nouvelle ignorée", "warn", app_id=app_id)
+    await notify(notifier.text("update_rolled_back", name=name, tag=new_label, why=first, prev=prev_label),
+                 "default", "update", app=name)
     return expires
 
 
@@ -807,7 +820,8 @@ async def _renew(app_id: int, trigger: str) -> None:
 
         updated = await refresh_source(app, force=trigger in FORCE_UPDATE)
         cur = db.row("SELECT * FROM apps WHERE id = ?", app_id) or app
-        if trigger in ("nouvelle version", "mise à jour") and not updated and was_ok and not pending_update(cur):
+        was_pending = pending_update(cur)             # version téléchargée, jamais installée avec succès
+        if trigger in ("nouvelle version", "mise à jour") and not updated and was_ok and not was_pending:
             # téléchargement raté, version refusée ou rien de nouveau : inutile de re-signer l'ancienne version
             db.update("apps", app_id, status="ok", last_error=None)
             if trigger == "mise à jour" and not cur.get("update_tag"):
@@ -839,19 +853,23 @@ async def _renew(app_id: int, trigger: str) -> None:
                 await plume.ensure_device(email, device["udid"], device["name"], on_lock=lock_state)
                 db.log(f"{app['name']} : signature avec {email}", app_id=app_id, journal=not retry)
                 if await plume.sign(email, original, signed, on_lock=lock_state):
-                    msg = (f"un ancien certificat de {email} a été révoqué pour signer {app['name']} : "
-                           "les autres apps sideloadées avec ce compte (iPhone…) vont cesser de fonctionner")
-                    db.log(msg, "warn", app_id=app_id)
-                    await notify(msg)
+                    db.log(notifier.text("cert_revoked", "fr", email=email, name=app["name"]), "warn", app_id=app_id)
+                    # bandeau durable dans l'interface (une notification peut ne pas être configurée)
+                    settings.raw_set("revocation_notice", json.dumps({"email": email, "app": app["name"],
+                                                                      "at": time.time()}))
+                    await notify(notifier.text("cert_revoked", email=email, name=app["name"]), "default", "account",
+                                 app=app["name"])
                     # les autres apps tvsign du compte, signées avec le certificat révoqué, sont à refaire
                     # tout de suite plutôt qu'au prochain contrôle périodique
                     await _guarded("contrôle des certificats", _check_certificates(email))
                 expires = ipa.profile_expiry(signed) or time.time() + 7 * 86400
 
             # 3. Installation. Si l'app est ouverte sur la TV, installd attend qu'elle soit fermée :
-            # l'interface le signale, et on abandonne au bout de APP_WAIT_MINUTES.
+            # l'interface le signale, et on abandonne au bout de APP_WAIT_MINUTES. Une mise à jour facultative
+            # n'attend que UPDATE_WAIT_MINUTES : une TV en service ne retient pas la boucle une demi-heure.
             db.log(f"{app['name']} : installation sur « {device['name']} »", app_id=app_id, journal=not retry)
-            wait_cap = APP_WAIT_MINUTES * 60
+            optional = _optional_update(app, trigger, was_ok, time.time())
+            wait_cap = (UPDATE_WAIT_MINUTES if optional else APP_WAIT_MINUTES) * 60
             logged = set()
 
             def on_event(step: str, percent=None, since=None) -> None:
@@ -893,11 +911,20 @@ async def _renew(app_id: int, trigger: str) -> None:
             # Pas d'écrasement d'un compte choisi pendant l'opération.
             fields["account_email"] = email
         db.update("apps", app_id, **fields)
+        _OUTCOME[app_id] = ("ok", None)
         db.log(f"{app['name']} : renouvelée ({trigger}), valable jusqu'au {_fmt(expires)}, "
                f"prochain renouvellement auto le {_fmt(expires - settings.renew_before_hours() * 3600)}",
                app_id=app_id)
-        if app["status"] == "error" or app.get("notified_level"):
-            await notify(f"{app['name']} : renouvelée, valable jusqu'au {_fmt(expires)}")
+        if was_pending and done.get("source_sha256") == cur.get("source_sha256"):
+            notes = (cur.get("notes") or "").strip()
+            db.log(f"{app['name']} : version {done.get('version')} installée", app_id=app_id)
+            await notify(notifier.text("update_installed", name=app["name"], version=done.get("version"),
+                                       notes=("\n\n" + notes[:600]) if notes else ""),
+                         "default", "update", app=app["name"], version=done.get("version"))
+        if app.get("notified_level"):
+            # seulement si une alerte d'échec est partie : sinon « renouvelée » n'annonce rien de nouveau
+            await notify(notifier.text("renewed", name=app["name"], until=_fmt(expires)), "default", "recovered",
+                         app=app["name"])
     except asyncio.CancelledError:
         # délai dépassé ou arrêt du service : ne pas rester « en cours »
         if STOPPING:
@@ -905,18 +932,17 @@ async def _renew(app_id: int, trigger: str) -> None:
             db.update("apps", app_id, status="pending", last_error=None, next_attempt_at=None)
         else:
             now = time.time()
+            _OUTCOME[app_id] = ("error", "renouvellement trop long, abandonné")
             db.update("apps", app_id, status="error", last_error="renouvellement trop long, abandonné",
                       **failure_fields(app, now, TimeoutError(), False))
         raise
     except Exception as e:  # noqa: BLE001 - l'erreur est remontée dans l'interface
         e = _as_limit(e)
         now = time.time()
-        unreachable = isinstance(e, devices.Unreachable)
         transient = is_transient(e)
         reconnect = isinstance(e, plume.SessionExpired)
         exp = app["expires_at"]
-        optional = bool(trigger in UPDATE_TRIGGERS and was_ok and exp
-                        and exp - now > settings.renew_before_hours() * 3600)
+        optional = _optional_update(app, trigger, was_ok, now)
         # les essais d'une mise à jour facultative ont leur propre recul : ils ne font pas monter celui du
         # renouvellement obligatoire (ni l'inverse)
         fields = failure_fields(app, now, e, transient, optional)
@@ -928,6 +954,7 @@ async def _renew(app_id: int, trigger: str) -> None:
             fields["next_attempt_at"] = min(fields["next_attempt_at"],
                                             max(now + 60, exp - settings.renew_before_hours() * 3600))
             db.update("apps", app_id, status="ok", last_error=None, update_error=str(e)[:500], **fields)
+            _OUTCOME[app_id] = ("skipped", str(e))
             waiting = transient or fields["needs_action"] in ("session", "pairing")
             db.log(f"{app['name']} : mise à jour {'en attente' if waiting else 'impossible'}, {e}",
                    "warn", app_id=app_id)
@@ -935,17 +962,25 @@ async def _renew(app_id: int, trigger: str) -> None:
                 await account_down(e.email or app.get("account_email") or plume.default_account(),
                                    plume.REAUTH_REASON)
             elif not waiting and not app.get("update_error"):
-                await notify(f"{app['name']} : la mise à jour n'a pas pu être installée ({e}), "
-                             "la version actuelle reste valable")
+                await notify(notifier.text("update_failed", name=app["name"], why=e), "default", "update",
+                             app=app["name"])
             return
+        _OUTCOME[app_id] = ("error", str(e))
         db.update("apps", app_id, status="error", last_error=str(e), **fields)
         db.log(f"{app['name']} : échec, {e}", "error", app_id=app_id)
         if reconnect:
             # une seule alerte pour le compte, pas une par app : les niveaux 24h / 6h / expiré restent notifiés
             await account_down(e.email or app.get("account_email") or plume.default_account(), plume.REAUTH_REASON)
-        # une TV en veille loin de l'expiration est banale : pas de notification avant le niveau 24h
+        # une panne banale (TV en veille, app ouverte, anisette, reconnexion à faire) loin de l'expiration ne
+        # prévient pas : les niveaux 24h / 6h / expiré, eux, notifient toujours
         await alert(db.row("SELECT * FROM apps WHERE id = ?", app_id) or app, str(e), now,
-                    quiet_fail=unreachable or reconnect)
+                    quiet_fail=transient or reconnect)
+
+
+def _optional_update(app: dict, trigger: str, was_ok: bool, now: float) -> bool:
+    """Mise à jour facultative : l'app installée reste valable bien au-delà de la fenêtre de renouvellement."""
+    exp = app["expires_at"]
+    return bool(trigger in UPDATE_TRIGGERS and was_ok and exp and exp - now > settings.renew_before_hours() * 3600)
 
 
 def urgent(app: dict, now: float) -> bool:
@@ -1113,8 +1148,7 @@ async def _check_certificates(email: str) -> None:
             db.update("apps", app["id"], expires_at=time.time() - 1, next_attempt_at=None,
                       notified_level=None)
             db.log(f"{app['name']} : certificat révoqué, nouvelle signature", "error", app_id=app["id"])
-            await notify(f"{app['name']} : certificat Apple révoqué (autre outil sur le même compte), "
-                         "re-signature en cours", "high")
+            await notify(notifier.text("cert_revoked_other", name=app["name"]), "high", "account", app=app["name"])
 
 
 async def account_down(email: str | None, reason: str) -> None:
@@ -1125,7 +1159,7 @@ async def account_down(email: str | None, reason: str) -> None:
         return
     plume.ALERTED.add(email)
     db.log(f"Compte Apple {email} déconnecté : reconnexion nécessaire ({reason})", "error")
-    await notify(f"Compte Apple {email} déconnecté : reconnecte-le dans tvsign. {reason}", "high")
+    await notify(notifier.text("account_lost", email=email, reason=reason), "high", "account")
 
 
 async def _check_accounts() -> None:
@@ -1216,10 +1250,20 @@ def health(now: float | None = None) -> dict:
     alive = TASK is None or not TASK.done()
     stalled = not alive or now - (last or HEALTH["started_at"]) > 3 * CHECK_INTERVAL + LOOP_SLACK_SECONDS
     background = {name: not t.done() for name, t in _BG.items()}
-    return {**HEALTH, "notifications": bool(settings.ntfy_url()), "loop_stalled": stalled, "loop_alive": alive,
+    return {**HEALTH, "notify_error": notifier.last_error(), "notifications": notifier.configured(),
+            "loop_stalled": stalled, "loop_alive": alive,
             "renewals_running": len(_RUNNING), "background": background,
             "check_interval": CHECK_INTERVAL, "retry_minutes": RETRY_MINUTES,
             "release_check_minutes": RELEASE_CHECK_MINUTES, "account_check_hours": ACCOUNT_CHECK_HOURS}
+
+
+def _log_quietly(message: str, level: str = "error", app_id: int | None = None) -> None:
+    """Journal sans jamais lever : appelé depuis un gestionnaire d'erreur, souvent parce que la base
+    est verrouillée ou pleine, et une exception de plus tuerait la boucle de renouvellement."""
+    try:
+        db.log(message, level, app_id=app_id)
+    except Exception as e:  # noqa: BLE001
+        print(f"[{level}] {message} (journal indisponible : {e})", flush=True)
 
 
 async def _guarded(what: str, coro) -> None:
@@ -1227,7 +1271,7 @@ async def _guarded(what: str, coro) -> None:
         await coro
     except Exception as e:  # noqa: BLE001 - un échec isolé ne doit pas bloquer le reste
         HEALTH["loop_error"] = f"{what} : {e}"
-        db.log(f"{what} : {e}", "error")
+        _log_quietly(f"{what} : {e}")
 
 
 def _background(name: str, factory) -> bool:
@@ -1305,6 +1349,9 @@ async def tick(now: float, last_account_check: float, last_release_check: float)
 async def loop() -> None:
     last_account_check = last_release_check = 0.0
     while True:
+        if backup.RESTORING:        # restauration en cours : la base et les dossiers sont en train d'être remplacés
+            await asyncio.sleep(5)
+            continue
         now = time.time()
         HEALTH["last_loop_at"] = now
         HEALTH["next_check_at"] = now + CHECK_INTERVAL
@@ -1313,7 +1360,7 @@ async def loop() -> None:
             last_account_check, last_release_check = await tick(now, last_account_check, last_release_check)
         except Exception as e:  # noqa: BLE001 - la boucle ne doit jamais s'arrêter
             HEALTH["loop_error"] = str(e)
-            db.log(f"boucle de renouvellement : {e}", "error")
+            _log_quietly(f"boucle de renouvellement : {e}")
         HEALTH["next_check_at"] = time.time() + CHECK_INTERVAL
         await asyncio.sleep(CHECK_INTERVAL)
 
@@ -1329,8 +1376,26 @@ async def supervise() -> None:
         except Exception as e:  # noqa: BLE001
             HEALTH["restarts"] += 1
             HEALTH["loop_error"] = f"boucle relancée : {e}"
-            db.log(f"boucle de renouvellement arrêtée, relancée : {e}", "error")
+            _log_quietly(f"boucle de renouvellement arrêtée, relancée : {e}")
             await asyncio.sleep(SUPERVISE_DELAY)
+
+
+async def watchdog(period: float = 300) -> None:
+    """Prévient (une fois par épisode) quand la boucle ne donne plus signe de vie : /api/livez reste
+    vert tant que le serveur répond, et personne n'ouvre forcément l'interface."""
+    global _STALL_ALERTED
+    while True:
+        await asyncio.sleep(period)
+        try:
+            if health()["loop_stalled"]:
+                if not _STALL_ALERTED:
+                    _STALL_ALERTED = True
+                    _log_quietly("la boucle de renouvellement ne répond plus")
+                    await notify(notifier.text("loop_stalled"), "urgent", "fail")
+            else:
+                _STALL_ALERTED = False
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] surveillance de la boucle : {e}", flush=True)
 
 
 def start() -> asyncio.Task:

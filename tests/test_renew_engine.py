@@ -442,7 +442,7 @@ class Scheduler(Base):
         self.add_app("Dead", expires_at=NOW - 60, status="error", next_attempt_at=NOW + 3600)
         sent = []
 
-        async def notify(msg, priority="default"):
+        async def notify(msg, priority="default", event="fail", **extra):
             sent.append(msg)
             return True
 
@@ -1365,9 +1365,11 @@ class Interface(unittest.TestCase):
             self.assertTrue(m, key)
 
     def test_every_setting_has_a_field(self):
+        # ntfy_url et ntfy_events se règlent dans la liste des destinations de notification (extras.js)
         for key in settings.PUBLIC:
-            if key != "language":
+            if key not in ("language", "ntfy_url", "ntfy_events"):
                 self.assertIn(f'name="{key}"', self.HTML, key)
+        self.assertIn('id="notif-liste"', self.HTML)
 
 
 
@@ -1388,7 +1390,7 @@ class ReviewFixes(Base):
         self.add_app("Revoked", expires_at=NOW - 1, notified_level=None)
         sent = []
 
-        async def notify(msg, priority="default"):
+        async def notify(msg, priority="default", event="fail", **extra):
             sent.append(msg)
             return True
 

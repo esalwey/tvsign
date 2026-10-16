@@ -19,11 +19,16 @@ services:
     network_mode: host
     security_opt:
       - no-new-privileges:true
+    logging:                        # Docker keeps container logs forever by default
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     stop_grace_period: 5m           # lets an install in progress finish (TVSIGN_SHUTDOWN_DRAIN_SECONDS, 240 s)
     environment:
-      TZ: Europe/Paris              # your time zone (renewal times, journal)
-      PUID: "1000"                  # owner of ./tvsign-data on the host (`id -u`)
-      PGID: "1000"                  # (`id -g`)
+      TZ: ${TZ:-UTC}                # your time zone, e.g. Europe/Paris (renewal times, journal)
+      PUID: ${PUID:-1000}           # owner of ./tvsign-data on the host: run `id -u`
+      PGID: ${PGID:-1000}           # and `id -g` (or put TZ/PUID/PGID in a .env file next to this one)
       # TVSIGN_PORT: "8765"         # web UI port (host network: pick a free one)
       # TVSIGN_HOST: 127.0.0.1      # only when a reverse proxy on this host serves the UI
       # TVSIGN_PASSWORD_FILE: /run/secrets/tvsign_password   # otherwise chosen in the web UI

@@ -1,5 +1,6 @@
 """tvsign : signe et maintient installées des apps tvOS sur des Apple TV, avec un compte Apple gratuit."""
 import asyncio
+import json
 import re
 import shutil
 import time
@@ -16,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import auth, backup, db, devices, diag, ipa, plume, proc, renew, selfupdate, settings
+from . import auth, backup, db, devices, diag, ipa, notifier, plume, proc, renew, selfupdate, settings
 from .config import MAX_UPLOAD_MB, ROOT, SHUTDOWN_DRAIN_SECONDS, TMP_DIR, VERSION
 from .proc import SESSIONS
 from .util import replace_retry
@@ -45,11 +46,13 @@ async def lifespan(_: FastAPI):
         except OSError:
             pass
     plume.sweep_stage()        # copies de travail de plumesign laissées par un processus tué
-    task = renew.start()
+    # renew.start() lance la boucle supervisée (relancée si une exception lui échappe) ; watchdog() prévient si elle se fige
+    tasks = [renew.start(), asyncio.create_task(renew.watchdog())]
     yield
     # arrêt : une installation en cours peut finir avant que l'arrêt ne l'interrompe
     await renew.drain(SHUTDOWN_DRAIN_SECONDS)
-    task.cancel()
+    for task in tasks:
+        task.cancel()
     for s in SESSIONS.values():
         s.cancel()
 
@@ -101,6 +104,8 @@ async def security(request: Request, call_next):
         response = await call_next(request)          # supervision : jamais filtrée
     elif not auth.host_allowed(request):
         response = _deny(421, "host_not_allowed")
+    elif backup.RESTORING and path.startswith("/api/") and path != "/api/backup/import":
+        response = _deny(503, "restoring")           # base et dossiers en cours de remplacement
     else:
         response = await _guarded(request, path, call_next)
     for k, v in HEADERS.items():
@@ -353,6 +358,13 @@ def state():
     slots = renew.account_slots(apps, devices_, accounts_, default)
     for acc in accounts_:
         acc["slots"] = slots.get(acc["email"], [])
+    notices = []
+    try:
+        revoked = json.loads(settings.raw_get("revocation_notice") or "null")
+    except ValueError:
+        revoked = None
+    if isinstance(revoked, dict):
+        notices.append({"id": "revocation", **revoked})
     return {
         "now": now,
         "version": VERSION,
@@ -367,6 +379,7 @@ def state():
         "devices": devices_,
         "accounts": accounts_,
         "events": db.rows("SELECT * FROM events ORDER BY id DESC LIMIT 80"),
+        "notices": notices,
     }
 
 
@@ -605,7 +618,7 @@ async def _check_source(source_type: str, source: str | None) -> str | None:
         except ipa.UrlRejected as e:
             raise HTTPException(400, e.code) from None
         except (ValueError, ConnectionError) as e:
-            raise HTTPException(400, str(e)) from None
+            raise HTTPException(400, getattr(e, "code", None) or str(e)) from None
     return source
 
 
@@ -702,8 +715,11 @@ async def app_create(
         raise
     except BaseException as e:  # noqa: BLE001 - y compris l'annulation (arrêt, client parti) : pas de ligne fantôme
         _abort_add(app_id)
+        if isinstance(e, renew.NoRelease):
+            raise HTTPException(400, f"no_release_beta:{e.beta_tag}" if e.beta_tag else "no_release") from None
         if isinstance(e, Exception):
-            raise HTTPException(400, str(e)) from None
+            # SourceRejected porte un code stable que l'interface traduit ; sinon le texte brut (français)
+            raise HTTPException(400, getattr(e, "code", None) or str(e)) from None
         raise
     db.log(f"App ajoutée : {info['name']} {info['version']} ({info['bundle_id']})", app_id=app_id)
     renew.spawn(app_id, "ajout")
@@ -981,13 +997,14 @@ class NotifyTest(BaseModel):
 
 @app.post("/api/settings/test-notification")
 async def settings_test_notification(body: NotifyTest):
-    url = (body.url or "").strip() or None
-    if url and not re.match(r"^https?://", url):
-        raise HTTPException(400, "url_expected")
+    """Ancien point d'entrée (adresse ntfy seule) ; l'interface utilise /api/notifications/test."""
+    url = (body.url or "").strip() or settings.ntfy_url()
     try:
-        await renew.notify_test(url)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, str(e))
+        await notifier.test({"type": "ntfy", "url": url})
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
+    except notifier.NotifyFailed as e:
+        raise HTTPException(502, e.api_detail) from None
     return {"ok": True}
 
 
@@ -1025,7 +1042,7 @@ async def backup_export(uploads: bool = False):
 
 @app.post("/api/backup/import")
 async def backup_import(file: UploadFile = File(...)):
-    if renew._RUNNING or proc.busy():
+    if renew._RUNNING or proc.busy() or backup.RESTORING:
         raise HTTPException(409, "busy")
     tmp = TMP_DIR / f"import-{int(time.time())}.zip"
     try:
@@ -1036,17 +1053,32 @@ async def backup_import(file: UploadFile = File(...)):
                 if got > limit:
                     raise HTTPException(413, f"too_large:{MAX_UPLOAD_MB}")
                 f.write(chunk)
+        # l'envoi a pu durer : un renouvellement a pu démarrer entre-temps. Aucun await entre cette
+        # vérification et le drapeau : la boucle et l'API se mettent en retrait avant tout remplacement.
+        if renew._RUNNING or proc.busy() or backup.RESTORING:
+            raise HTTPException(409, "busy")
+        backup.RESTORING = True
         try:
             async with plume._locked():
                 try:
                     counts = await asyncio.to_thread(backup.restore, tmp)
+                except backup.BackupError as e:
+                    raise HTTPException(400 if e.code != "restore_failed" else 500, e.code) from None
                 except ValueError as e:
                     raise HTTPException(400, str(e)) from None
+            auth.load_revoked()
+            renew.startup()
+            await devices.sync_store()
         except plume.Busy:
             raise HTTPException(503, "plumesign_busy") from None
-        auth.load_revoked()
-        renew.startup()
-        await devices.sync_store()
+        finally:
+            backup.RESTORING = False
         return {"ok": True, **counts}
     finally:
         tmp.unlink(missing_ok=True)
+
+
+# ---------- routes ajoutées : notifications, journal, support (voir routes_extra.py) ----------
+from . import routes_extra  # noqa: E402
+
+app.include_router(routes_extra.router)
