@@ -54,7 +54,8 @@ def write_private(path: Path, data: bytes | str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     raw = data.encode("utf-8") if isinstance(data, str) else data
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # O_BINARY (Windows only): without it the C runtime writes every 0x0A byte as 0x0D 0x0A, which breaks binary data
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600)
     try:
         os.write(fd, raw)
     finally:

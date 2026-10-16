@@ -784,6 +784,32 @@ async def sign(email: str, ipa: Path, out: Path, on_lock=None) -> bool:
     return FOREIGN_REVOKED in res.output
 
 
+async def sign_with_certificate(files, ipa: Path, out: Path, on_lock=None) -> None:
+    """Signe ipa vers out avec un certificat importé (voir imported_cert.signing_files : `files` porte les
+    chemins cert, key et profile). Aucun compte Apple, aucune session, aucun serveur anisette : plumesign signe
+    hors ligne, avec le profil donné. Même verrou que les autres opérations plumesign (une à la fois)."""
+    tmp = out.with_name(out.stem + ".tmp.ipa")
+    tmp.unlink(missing_ok=True)
+    try:
+        async with _locked(on_lock):
+            e = env()
+            e["RUST_LOG"] = "warn"
+            # --pem lit tous les arguments qui suivent : une autre option doit venir après
+            res = await run(PLUMESIGN, "sign", "-p", ipa, "--pem", files.cert, files.key, "--provision", files.profile,
+                            "-o", tmp, env=e, timeout=600)
+        if not res.ok or not tmp.exists():
+            sweep_stage()
+            what = "signature avec le certificat importé"
+            if res.code == -1:
+                raise Transient(f"{what} : délai dépassé (passager, nouvel essai automatique)")
+            if is_content_error(res.output):
+                raise ContentError(f"{what} : {res.tail()}")
+            raise RuntimeError(f"{what} : {res.tail()}")
+        replace_retry(tmp, out)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def signing_key(email: str) -> str | None:
     """Clé privée PEM avec laquelle plumesign signe pour ce compte (keys/<équipe>/key.pem du store),
     ou None si on ne la trouve pas (équipe inconnue et plusieurs clés possibles)."""

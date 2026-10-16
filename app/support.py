@@ -13,7 +13,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-from . import db, diag, notifier, plume, proc, renew, settings
+from . import db, diag, imported_cert, notifier, plume, proc, renew, settings
 from .config import DATA_DIR, VERSION
 
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
@@ -120,6 +120,7 @@ async def build_bundle() -> bytes:
             "pinned_tag": a.get("pinned_tag"), "installed_version": a.get("installed_version"),
             "bad_tag": a["bad_tag"],
             "account": _mask_email(a["account_email"], accounts), "device_id": a["device_id"],
+            "sign_mode": a.get("sign_mode"), "cert_id": a.get("cert_id"),
         })
     devices = [{"id": d["id"], "model": d["model"], "os_version": d["os_version"],
                 "last_seen": _iso(d["last_seen"]), "last_error": d["last_error"],
@@ -127,6 +128,12 @@ async def build_bundle() -> bytes:
                for d in db.rows("SELECT * FROM devices ORDER BY id")]
     accs = [{"account": _mask_email(a["email"], accounts), "ok": a["ok"], "message": a.get("message"),
              "checked_at": _iso(a.get("checked_at"))} for a in plume.accounts()]
+    # certificats importés : l'état seulement (ni nom, ni équipe, ni numéro de série, ni clé)
+    certs = [{"id": c["id"], "device_id": c["device_id"], "state": imported_cert.state_of(c),
+              "expires_at": _iso(c["expires_at"]), "platforms": c["profile_platforms"],
+              "app_id_pattern": "wildcard" if (c["profile_app_id"] or "").endswith("*") else "single",
+              "all_devices": bool(c["all_devices"]), "revoked": bool(c["revoked_at"]),
+              "check_state": c["check_state"], "checked_at": _iso(c["checked_at"])} for c in imported_cert.rows()]
     renewals = [{**r, "started": _iso(r["started"]), "finished": _iso(r["finished"])}
                 for r in db.rows("SELECT * FROM renewals ORDER BY id DESC LIMIT 200")]
     shown = {k: v["value"] for k, v in settings.describe().items()}
@@ -158,7 +165,7 @@ async def build_bundle() -> bytes:
         z.writestr("README.txt", readme)
         z.writestr("system.json", clean(system))
         z.writestr("diagnostics.json", clean(diagnostics))
-        z.writestr("apps.json", clean({"apps": apps, "devices": devices, "accounts": accs}))
+        z.writestr("apps.json", clean({"apps": apps, "devices": devices, "accounts": accs, "certificates": certs}))
         z.writestr("renewals.json", clean(renewals))
         z.writestr("events.txt", log_text())
         z.writestr("plumesign-output.txt", redact("\n\n".join(tails), secrets) or "(none yet)\n")

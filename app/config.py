@@ -64,6 +64,7 @@ def _default_data_dir() -> Path:
 
 DATA_DIR = Path(_env("TVSIGN_DATA") or _default_data_dir()).resolve()
 IPA_DIR = DATA_DIR / "ipas"
+CERT_DIR = DATA_DIR / "certs"            # imported certificates, sealed one file each (app/imported_cert.py)
 PLUME_HOME = DATA_DIR / "plume"          # holds PlumeImpactor/ (accounts, keys, anisette, pairings)
 DB_PATH = DATA_DIR / "tvsign.db"
 TMP_DIR = DATA_DIR / "tmp"
@@ -171,9 +172,16 @@ INSTALL_CHECK_HOURS = _num("TVSIGN_INSTALL_CHECK_HOURS", 6, 0, kind=float)
 # Reach the Apple TV with a unicast mDNS query sent to its last known (or manually entered) address
 # before the multicast search: needed when multicast is filtered (VLAN, bridged Docker).
 UNICAST_HINT = _flag("TVSIGN_UNICAST_HINT", True)
+# Revocation check (OCSP) of the imported certificates that apps use, in hours (0 = never). Only certificates
+# that an app is signed with are looked at; an unreachable responder never concludes anything.
+CERT_CHECK_HOURS = _num("TVSIGN_CERT_CHECK_HOURS", 12, 0, kind=float)
 
-for d in (DATA_DIR, IPA_DIR, PLUME_HOME, TMP_DIR):
+for d in (DATA_DIR, IPA_DIR, CERT_DIR, PLUME_HOME, TMP_DIR):
     d.mkdir(parents=True, exist_ok=True)
+try:
+    os.chmod(CERT_DIR, 0o700)      # private keys, even sealed: owner only (a no-op on Windows)
+except OSError:
+    pass
 
 
 def _pair_host() -> str:

@@ -72,6 +72,33 @@ CREATE TABLE IF NOT EXISTS renewals (
     outcome  TEXT NOT NULL,                 -- ok | error | skipped
     error    TEXT
 );
+-- Certificats importés (.p12 + profil) : ces lignes ne contiennent aucun secret, la clé et le profil sont dans
+-- <données>/certs/<id>.bin, scellés (app/imported_cert.py)
+CREATE TABLE IF NOT EXISTS imported_certs (
+    id                INTEGER PRIMARY KEY,
+    device_id         INTEGER REFERENCES devices(id) ON DELETE CASCADE,
+    name              TEXT NOT NULL,
+    subject           TEXT,                 -- nom du certificat (CN)
+    team_id           TEXT,
+    team_name         TEXT,
+    cert_serial       TEXT,                 -- hex majuscule, sans zéros de tête (comme apps.cert_serial)
+    cert_sha1         TEXT,
+    cert_not_after    REAL,
+    profile_uuid      TEXT,
+    profile_name      TEXT,
+    profile_app_id    TEXT,                 -- identifiant d'app du profil sans l'équipe : *, com.exemple.* ou com.exemple.app
+    profile_platforms TEXT,                 -- tvOS, iOS… séparés par des virgules
+    profile_expires   REAL,
+    all_devices       INTEGER NOT NULL DEFAULT 0,   -- profil d'entreprise : tous les appareils
+    expires_at        REAL,                 -- le plus tôt du certificat et du profil : quand les apps cessent de se lancer
+    revoked_at        REAL,
+    revoked_reason    TEXT,
+    checked_at        REAL,                 -- dernier contrôle de révocation (OCSP)
+    check_state       TEXT,                 -- good | revoked
+    notified_level    TEXT,                 -- dernière alerte d'expiration envoyée : 7d | 1d | expired | revoked
+    created_at        REAL NOT NULL,
+    updated_at        REAL
+);
 """
 
 
@@ -149,6 +176,9 @@ MIGRATIONS = [
     ("apps", "ui_family", "TEXT"),           # UIDeviceFamily de l'IPA, ex. « 1,2 »
     ("apps", "warnings", "TEXT"),            # limites du compte gratuit détectées dans l'IPA (codes séparés par des virgules)
     ("apps", "source_published_at", "TEXT"), # date de publication de la release installée (jamais de retour en arrière)
+    # signature avec un certificat importé (app/imported_cert.py) : apple_id (défaut, compte gratuit) | certificate
+    ("apps", "sign_mode", "TEXT NOT NULL DEFAULT 'apple_id'"),
+    ("apps", "cert_id", "INTEGER"),          # imported_certs.id du certificat choisi (sign_mode = certificate)
 ]
 
 

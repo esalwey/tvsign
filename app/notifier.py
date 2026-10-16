@@ -96,6 +96,23 @@ MESSAGES: dict[str, tuple[str, str]] = {
                            "{name}: Apple certificate revoked (another tool on the same account), re-signing"),
     "account_lost": ("Compte Apple {email} déconnecté : reconnecte-le dans tvsign. {reason}",
                      "Apple account {email} signed out: reconnect it in tvsign. {reason}"),
+    # certificat importé (.p12 + profil) : pas de renouvellement tous les 7 jours, on prévient avant la fin
+    "import_expiring": ("Le certificat importé « {name} » expire dans moins de {d} jour(s) (le {until}) : importe-en un "
+                        "nouveau pour {apps}, sinon ces apps cesseront de se lancer",
+                        "The imported certificate “{name}” expires in less than {d} day(s) (on {until}): import a new "
+                        "one for {apps}, or these apps will stop launching"),
+    "import_expiring_failing": ("{name} : le certificat importé expire dans moins de {d} jour(s) et l'installation "
+                                "échoue : {reason}",
+                                "{name}: the imported certificate expires in less than {d} day(s) and the install is "
+                                "failing: {reason}"),
+    "import_expired": ("Le certificat importé « {name} » a expiré : {apps} ne se lance plus. Importe un nouveau certificat "
+                       "et son profil (réglages de l'app › Avancé)",
+                       "The imported certificate “{name}” has expired: {apps} no longer launches. Import a new certificate "
+                       "and profile (app settings › Advanced)"),
+    "import_revoked": ("Le certificat importé « {name} » a été révoqué : {apps} ne peut plus être installée ni lancée. "
+                       "Importe un nouveau certificat et son profil, ou reviens à l'Apple ID",
+                       "The imported certificate “{name}” was revoked: {apps} can no longer be installed or launched. "
+                       "Import a new certificate and profile, or go back to the Apple ID"),
     "loop_stalled": ("tvsign : la boucle de renouvellement ne répond plus, redémarre le service",
                      "tvsign: the renewal loop is not responding, restart the service"),
 }
