@@ -345,7 +345,7 @@ test("assistant : les textes de l'installation valent pour une Apple TV, un iPho
 });
 test("menus cités : « Appareils › Appairer », jamais une section « Apple TV »", () => {
   for (const [k, [fr, en]] of Object.entries(I18N)) {
-    ok(!/section Apple TV|Apple TV section|écran principal › Apple TV|main screen › Apple TV|Apple TV › Appairer|Apple TV › Pair/.test(fr + " " + en), k);
+    ok(!/section Apple TV|Apple TV section|écran principal › Apple TV|main screen › Apple TV|Apple TV › (?:Appairer|Pair|Adresse|Address)/.test(fr + " " + en), k);
   }
   langue("en");
   ok(/main screen › Devices › Pair/.test(ev(`t("wiz_missing_tv")`)));
