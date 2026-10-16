@@ -18,7 +18,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import auth, backup, db, devices, diag, families, ipa, notifier, plume, proc, renew, selfupdate, settings
+from . import (auth, backup, db, devices, diag, families, imported_cert, ipa, notifier, plume, proc, renew, selfupdate,
+               settings)
 from .config import EDITION, MAX_UPLOAD_MB, ROOT, SHUTDOWN_DRAIN_SECONDS, TMP_DIR, VERSION, WINDOWS
 from .proc import SESSIONS
 from .util import replace_retry
@@ -28,6 +29,8 @@ from .util import replace_retry
 async def lifespan(_: FastAPI):
     db.init()
     settings.migrate()         # serveur anisette Android enregistré -> serveur par défaut
+    imported_cert.sweep_temp()     # clés d'une signature interrompue
+    imported_cert.settle()         # fichiers scellés sans certificat, clés d'une sauvegarde à sceller
     _purge_half_added()
     backup.prune_old()
     auth.init()
@@ -387,11 +390,13 @@ def state():
         d["renew_before_effective"] = settings.renew_before_hours_for(d)
         d["app_count"] = sum(1 for a in apps if a["device_id"] == d["id"] and a["enabled"])
     health = renew.health(now)
+    certs = [imported_cert.view(c, now) for c in imported_cert.rows()]     # ni clé ni profil : rien de secret
     accounts_ = plume.accounts()
     slots = renew.account_slots(apps, devices_, accounts_, default)
     for acc in accounts_:
         acc["slots"] = slots.get(acc["email"], [])
-        mine = [a for a in apps if a["enabled"] and renew._same_account(a["account_email"] or default, acc["email"])]
+        mine = [a for a in apps if a["enabled"] and not imported_cert.is_cert(a)
+                and renew._same_account(a["account_email"] or default, acc["email"])]
         acc["apps"] = len(mine)
         acc["app_ids"] = sum(renew.app_ids_used(a) for a in mine)      # estimation, voir renew.app_ids_used
     notices = []
@@ -415,9 +420,10 @@ def state():
         "apps": apps,
         "devices": devices_,
         "accounts": accounts_,
+        "certs": certs,
         "events": db.rows("SELECT * FROM events ORDER BY id DESC LIMIT 80"),
         "notices": notices,
-        "capabilities": {"usb_pairing": devices.usb_pairing_available()},
+        "capabilities": {"usb_pairing": devices.usb_pairing_available(), "imported_cert": imported_cert.AVAILABLE},
     }
 
 
@@ -439,6 +445,13 @@ def api_health(request: Request):
     for acc in plume.accounts():
         if acc["ok"] == 0:
             problems.append(f"compte {acc['email']} : reconnexion nécessaire")
+    for ident in imported_cert.rows():
+        used = [a["name"] for a in db.rows("SELECT name FROM apps WHERE enabled = 1 AND sign_mode = 'certificate' "
+                                           "AND cert_id = ?", ident["id"])]
+        if used and ident["revoked_at"]:
+            problems.append(f"certificat importé « {ident['name']} » révoqué ({', '.join(used)})")
+        elif used and ident["expires_at"] and 0 < ident["expires_at"] - now < 24 * 3600:
+            problems.append(f"certificat importé « {ident['name']} » : expire dans moins de 24 h ({', '.join(used)})")
     code = 503 if problems else 200
     if not auth.authenticated(request):
         return UTF8JSON({"ok": not problems, "count": len(problems)}, status_code=code)
@@ -785,6 +798,7 @@ async def device_delete(device_id: int, force: bool = False):
         if not force:
             raise HTTPException(502, str(e)) from None
         db.log(f"Apple TV « {d['name']} » retirée de la liste, appairage non effacé : {e}", "warn")
+    imported_cert.forget_device(device_id)        # ses certificats importés partent avec lui
     db.execute("DELETE FROM devices WHERE id = ?", device_id)
     return {"ok": True}
 
@@ -979,6 +993,8 @@ class AppPatch(BaseModel):
     channel: Optional[str] = None          # stable | beta (github)
     auto_update: Optional[bool] = None     # false : renouveler seulement, ne pas installer les nouvelles versions
     pinned_tag: Optional[str] = None       # github : seule cette version est suivie ("" : suivre la dernière)
+    sign_mode: Optional[str] = None        # apple_id (défaut) | certificate : voir imported_cert.py
+    cert_id: Optional[int] = None          # certificat importé choisi (sign_mode = certificate)
 
 
 def app_or_404(app_id: int) -> dict:
@@ -986,6 +1002,42 @@ def app_or_404(app_id: int) -> dict:
     if not a:
         raise HTTPException(404, "unknown_app")
     return a
+
+
+def _check_signing(a: dict, fields: dict) -> bool:
+    """Façon de signer d'une fiche (Apple ID gratuit, ou certificat importé) : valide ce que la requête demande et
+    complète `fields` (sign_mode, cert_id). Un certificat doit être celui de l'appareil de l'app, non expiré ni
+    révoqué, et son profil doit couvrir l'app. Sans choix de certificat, celui qui convient et dure le plus
+    longtemps est pris. Vrai si la façon de signer change."""
+    current = a.get("sign_mode") or imported_cert.APPLE_ID
+    mode = fields.get("sign_mode") or current
+    if mode not in imported_cert.MODES:
+        raise HTTPException(400, "invalid_sign_mode")
+    moving = fields.get("device_id") is not None and fields["device_id"] != a["device_id"]
+    if "sign_mode" not in fields and "cert_id" not in fields and not (moving and mode == imported_cert.CERTIFICATE):
+        return False
+    if mode == imported_cert.APPLE_ID:
+        fields["sign_mode"], fields["cert_id"] = imported_cert.APPLE_ID, None
+        changed = current != imported_cert.APPLE_ID
+    else:
+        device = db.row("SELECT * FROM devices WHERE id = ?", fields.get("device_id") or a["device_id"])
+        if not device:
+            raise HTTPException(400, "cert_needs_device")
+        wanted = fields.get("cert_id")
+        if wanted is None and not moving:
+            wanted = a.get("cert_id")
+        ident = imported_cert.row(wanted) if wanted else imported_cert.pick(device, a)
+        if wanted and not ident:
+            raise HTTPException(400, "unknown_cert")
+        problem = imported_cert.problem_for(ident, device, a)
+        if problem:
+            raise HTTPException(400, problem[0])
+        fields["sign_mode"], fields["cert_id"] = imported_cert.CERTIFICATE, ident["id"]
+        changed = current != imported_cert.CERTIFICATE or a.get("cert_id") != ident["id"]
+    if not changed:
+        fields.pop("sign_mode", None)
+        fields.pop("cert_id", None)
+    return changed
 
 
 @app.patch("/api/apps/{app_id}")
@@ -1037,6 +1089,7 @@ async def app_patch(app_id: int, body: AppPatch):
         if not target:
             raise HTTPException(400, "unknown_device")
         _check_app_device(a, target)
+    signing_changed = _check_signing(a, fields)
     source_changed = any(k in fields for k in ("source", "source_filter", "channel"))
     if source_changed:
         fields["source_tag"] = None        # nouvelle source : la prochaine release sera installée
@@ -1056,14 +1109,19 @@ async def app_patch(app_id: int, body: AppPatch):
                 (renew.app_dir(app_id) / "original.prev.ipa").unlink(missing_ok=True)
             except OSError:
                 pass
-    dest_changed = "device_id" in fields or "account_email" in fields
-    if dest_changed and _duplicate(app_id, a["bundle_id"], fields.get("account_email", a["account_email"]),
-                                   fields.get("device_id", a["device_id"])):
+    dest_changed = "device_id" in fields or "account_email" in fields or signing_changed
+    if ("device_id" in fields or "account_email" in fields) and _duplicate(
+            app_id, a["bundle_id"], fields.get("account_email", a["account_email"]),
+            fields.get("device_id", a["device_id"])):
         raise _already_added(fields.get("device_id", a["device_id"]))     # la TV visée a déjà cette app
     if dest_changed:
-        # autre appareil/compte : la signature déjà prête ne convient plus
+        # autre appareil/compte/façon de signer : la signature déjà prête ne convient plus
         (renew.app_dir(app_id) / "signed.ipa").unlink(missing_ok=True)
         fields["on_tv"] = fields["on_tv_checked_at"] = None     # la vérification visait l'ancienne TV
+    if signing_changed:
+        # l'app signée autrement est une autre app pour la TV (identifiant d'app différent) : rien n'y est encore installé
+        fields.update(status="pending", expires_at=None, signed_at=None, cert_serial=None, verified_at=None,
+                      notified_level=None, last_error=None)
     if dest_changed or source_changed or fields.get("enabled") == 1:
         # l'utilisateur a agi : on repart de zéro (plus d'attente, ni d'action requise, ni de délai croissant)
         fields.update(renew.CLEAR_BLOCK)
@@ -1115,6 +1173,15 @@ async def app_copy(app_id: int, body: AppCopy):
         _abort_add(new_id)
         db.log(f"{a['name']} : copie de l'IPA impossible : {e}", "error", app_id=app_id)   # chemins du serveur : dans le journal seulement
         raise HTTPException(500, "copy_failed") from None
+    if imported_cert.is_cert(a):
+        # un certificat importé est celui d'un appareil : la copie prend, si elle existe, celui de la TV visée
+        target = db.row("SELECT * FROM devices WHERE id = ?", body.device_id)
+        ident = imported_cert.pick(target, a)
+        if ident:
+            db.update("apps", new_id, sign_mode=imported_cert.CERTIFICATE, cert_id=ident["id"])
+        else:
+            db.log(f"{a['name']} : aucun certificat importé pour « {target['name']} », la copie se signe avec l'Apple ID",
+                   "warn", app_id=new_id)
     db.update("apps", new_id, enabled=1)
     db.log(f"App ajoutée : {a['name']} {a['version']} ({a['bundle_id']}), copie pour une autre Apple TV", app_id=new_id)
     renew.spawn(new_id, "ajout")
@@ -1369,14 +1436,14 @@ class _SelfDeletingFile(FileResponse):
 
 
 @app.get("/api/backup/export")
-async def backup_export(uploads: bool = False):
+async def backup_export(uploads: bool = False, certs: bool = False):
     if proc.busy():
         # connexion Apple (code 2FA en attente) ou appairage en cours : plumesign est tenu, l'export
         # resterait suspendu jusqu'à 15 min sans rien dire
         raise HTTPException(409, "busy")
     try:
         async with plume._locked():      # accounts.json pas en cours de réécriture
-            path = await asyncio.to_thread(backup.export, uploads)
+            path = await asyncio.to_thread(backup.export, uploads, certs)
     except plume.Busy:
         raise HTTPException(503, "plumesign_busy") from None
     # l'archive contient les secrets : supprimée même si le téléchargement est interrompu
@@ -1423,6 +1490,7 @@ async def backup_import(file: UploadFile = File(...)):
 
 
 # ---------- routes ajoutées : notifications, journal, support (voir routes_extra.py) ----------
-from . import routes_extra  # noqa: E402
+from . import routes_cert, routes_extra  # noqa: E402
 
 app.include_router(routes_extra.router)
+app.include_router(routes_cert.router)

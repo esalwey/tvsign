@@ -3,6 +3,9 @@ store (Apple sessions, certificate keys, Apple TV pairings). Same format on Dock
 so an instance can move between machines without pairing again.
 
 The archive contains secrets: whoever holds it can use the Apple ID session.
+
+Imported certificates (a .p12 key with its profile, app/imported_cert.py) are left out unless the export asks
+for them (include_certs): the archive then holds their private keys in the clear, like the Apple session.
 """
 import json
 import shutil
@@ -12,8 +15,8 @@ import zipfile
 import zlib
 from pathlib import Path, PurePosixPath
 
-from . import db, settings
-from .config import DATA_DIR, DB_PATH, IPA_DIR, PLUME_HOME, TMP_DIR, VERSION
+from . import db, imported_cert, settings
+from .config import CERT_DIR, DATA_DIR, DB_PATH, IPA_DIR, PLUME_HOME, TMP_DIR, VERSION
 from .util import replace_retry
 
 FORMAT = "tvsign-backup"
@@ -34,7 +37,8 @@ def prune_old(days: float = KEEP_ASIDE_DAYS) -> None:
     elles contiennent la session Apple et les clés, elles ne doivent pas traîner indéfiniment."""
     cutoff = time.time() - days * 86400
     for base, pattern in ((DATA_DIR, "tvsign.db.pre-restore-*"), (DATA_DIR, "tvsign.db.pre-migrate-*"),
-                          (DATA_DIR, "ipas.pre-restore-*"), (PLUME_HOME, "PlumeImpactor.pre-restore-*")):
+                          (DATA_DIR, "ipas.pre-restore-*"), (DATA_DIR, "certs.pre-restore-*"),
+                          (PLUME_HOME, "PlumeImpactor.pre-restore-*")):
         for p in base.glob(pattern):
             try:
                 if p.stat().st_mtime < cutoff:
@@ -43,18 +47,18 @@ def prune_old(days: float = KEEP_ASIDE_DAYS) -> None:
                 pass
 
 
-def export(include_uploads: bool = False) -> Path:
+def export(include_uploads: bool = False, include_certs: bool = False) -> Path:
     """Builds the archive in TMP_DIR and returns its path (caller deletes it)."""
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out = TMP_DIR / f"tvsign-{stamp}.tvsign-backup"
     snap = TMP_DIR / f"db-{stamp}.sqlite"
     db.snapshot(snap)
     try:
-        _strip_local(snap)
+        _strip_local(snap, keep_certs=include_certs)
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
             z.writestr("manifest.json", json.dumps({
                 "format": FORMAT, "version": FORMAT_VERSION, "created": time.time(),
-                "tvsign_version": VERSION, "include_uploads": include_uploads,
+                "tvsign_version": VERSION, "include_uploads": include_uploads, "include_certs": include_certs,
             }, indent=1))
             z.write(snap, "tvsign.db")
             if STORE.is_dir():
@@ -66,21 +70,33 @@ def export(include_uploads: bool = False) -> Path:
                     f = IPA_DIR / str(a["id"]) / "original.ipa"
                     if f.exists():
                         z.write(f, f"ipas/{a['id']}/original.ipa")
+            if include_certs:
+                # opened here (they are sealed with this instance's key, which the archive does not carry) and
+                # sealed again by the instance that restores them
+                for ident_id, payload in imported_cert.export_payloads().items():
+                    z.writestr(f"certs/{ident_id}.json", json.dumps(payload))
     finally:
         snap.unlink(missing_ok=True)
     return out
 
 
-def _strip_local(snap: Path) -> None:
+def _strip_local(snap: Path, keep_certs: bool = False) -> None:
     """Retire de la copie exportée ce qui n'appartient qu'à cette instance : hash du mot de passe
     administrateur, version des sessions, sessions révoquées. Une restauration ne les reprend de toute
     façon pas (AUTH_LOCAL) ; une archive envoyée par courriel ou sauvegardée dans le cloud ne doit pas
-    permettre de chercher le mot de passe hors ligne."""
+    permettre de chercher le mot de passe hors ligne. Les certificats importés sont retirés aussi (fiches
+    comprises : ni nom, ni numéro de série) sauf demande ; les apps qui les utilisaient restent réglées sur
+    « certificat » et demandent d'en importer un, au lieu de passer en silence sur l'Apple ID."""
     conn = sqlite3.connect(snap)
     try:
+        conn.execute("PRAGMA secure_delete = ON")       # une ligne supprimée est effacée du fichier, pas seulement marquée libre
         conn.execute("DELETE FROM settings WHERE key IN ('admin_password', 'session_version', 'setup_done')")
         conn.execute("DELETE FROM revoked_sessions")
+        if not keep_certs:
+            conn.execute("DELETE FROM imported_certs")
+            conn.execute("UPDATE apps SET cert_id = NULL")
         conn.commit()
+        conn.execute("VACUUM")                           # et les pages libérées ne restent pas dans l'archive
     finally:
         conn.close()
 
@@ -223,6 +239,9 @@ def restore(archive: Path) -> dict:
                           and p.parts[2] == "original.ipa"):
                         dest = work / "ipas" / p.parts[1] / p.parts[2]
                         ipas.append(p.parts[1])
+                    elif (p.parts[0] == "certs" and len(p.parts) == 2 and p.parts[1].endswith(".json")
+                          and p.parts[1][:-5].isdigit()):
+                        dest = work / "certs" / p.parts[1]
                     else:
                         continue
                     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -252,6 +271,13 @@ def restore(archive: Path) -> dict:
                     _swap_dir(IPA_DIR, staged_ipas if staged_ipas.is_dir() else None,
                               IPA_DIR.with_name(f"ipas.pre-restore-{stamp}"), undo)
                 IPA_DIR.mkdir(parents=True, exist_ok=True)
+                # certificats importés : ceux de l'archive (s'il y en a), les actuels mis de côté dans tous les cas
+                # (leurs numéros désigneraient sinon des certificats d'une autre instance)
+                staged_certs = work / "certs"
+                if (CERT_DIR.exists() and any(CERT_DIR.iterdir())) or staged_certs.is_dir():
+                    _swap_dir(CERT_DIR, staged_certs if staged_certs.is_dir() else None,
+                              CERT_DIR.with_name(f"certs.pre-restore-{stamp}"), undo)
+                CERT_DIR.mkdir(parents=True, exist_ok=True)
                 if pre_db.exists():
                     undo.append(lambda: _put_back_db(pre_db))
                 replace_retry(new_db, DB_PATH)
@@ -266,6 +292,7 @@ def restore(archive: Path) -> dict:
                     db.execute("INSERT INTO revoked_sessions (sid, until) VALUES (?, ?) "
                                "ON CONFLICT(sid) DO UPDATE SET until = excluded.until", sid, until)
                 settings.migrate()      # la sauvegarde peut venir d'avant l'abandon des serveurs anisette Android
+                imported_cert.settle()  # clés de l'archive (en clair) : scellées avec la clé de cette instance
                 # Apps importées dont l'IPA n'est pas dans la sauvegarde : inutilisables, on le dit tout de suite
                 # (sinon l'échec n'apparaît qu'à la fenêtre de renouvellement, des jours plus tard).
                 missing = []
