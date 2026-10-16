@@ -607,8 +607,8 @@ class OneNotificationPerEpisode(unittest.TestCase):
         plume._LAST = {}
         plume._set_status(self.email, False, "session expirée, reconnexion nécessaire : " + plume.REAUTH_REASON)
         plume.ALERTED.discard(self.email)
-        self.device = db.execute("INSERT INTO devices (name, pair_identifier, udid, created_at) "
-                                 "VALUES ('Salon', 'pid-reconnect', 'UDID-RECONNECT', 0)")
+        self.device = db.execute("INSERT INTO devices (name, pair_identifier, udid, os_version, created_at) "
+                                 "VALUES ('Salon', 'pid-reconnect', 'UDID-RECONNECT', '18.0', 0)")
         self.apps = [db.execute(
             "INSERT INTO apps (name, source_type, device_id, account_email, created_at, enabled, status) "
             "VALUES (?, 'upload', ?, ?, 0, 1, 'pending')", f"App{i}", self.device, self.email) for i in range(2)]
@@ -675,8 +675,8 @@ class RefusedRenewals(unittest.TestCase):
             "accounts": {self.email: {"first_name": "R", "team_id": "TEAM"}}}), encoding="utf-8")
         plume._LAST = {}
         plume._set_status(self.email, True, "session valide")
-        self.device = db.execute("INSERT INTO devices (name, pair_identifier, udid, created_at) "
-                                 "VALUES ('Salon', 'pid-refused', 'UDID-REFUSED', 0)")
+        self.device = db.execute("INSERT INTO devices (name, pair_identifier, udid, os_version, created_at) "
+                                 "VALUES ('Salon', 'pid-refused', 'UDID-REFUSED', '18.0', 0)")
         self.app = db.execute(
             "INSERT INTO apps (name, source_type, device_id, account_email, created_at, enabled, status) "
             "VALUES ('Refused', 'upload', ?, ?, 0, 1, 'pending')", self.device, self.email)

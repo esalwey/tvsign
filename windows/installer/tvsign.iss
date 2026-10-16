@@ -64,6 +64,12 @@ fr.Continue=Désinstaller
 en.Continue=Uninstall
 fr.Cancel=Annuler
 en.Cancel=Cancel
+fr.FirewallTitle=Autorisation du Pare-feu Windows
+en.FirewallTitle=Windows Firewall permission
+fr.FirewallSub=À lire avant le premier lancement
+en.FirewallSub=Read before the first launch
+fr.FirewallNote=Au premier lancement, Windows affiche une alerte du Pare-feu Windows Defender à propos de plumesign (l'outil qui parle à l'Apple TV).%n%nCochez « Réseaux privés », puis cliquez sur « Autoriser l'accès ». Sans cela, tvsign ne voit pas l'Apple TV et l'appairage échoue.%n%nUn compte non administrateur ne peut pas accepter cette alerte : demandez à un administrateur de l'autoriser. Votre réseau domestique doit aussi être de type « Privé » (Paramètres > Réseau et Internet).
+en.FirewallNote=On first launch, Windows shows a Windows Defender Firewall alert about plumesign (the tool that talks to the Apple TV).%n%nTick "Private networks", then click "Allow access". Without it, tvsign can't see the Apple TV and pairing fails.%n%nA non-administrator account can't accept this alert: ask an administrator to allow it. Your home network must also be of type "Private" (Settings > Network & Internet).
 
 [Tasks]
 Name: "autostart"; Description: "{cm:AutoStart}"; GroupDescription: "{cm:Options}"
@@ -103,6 +109,13 @@ var
 begin
   if FileExists(ExpandConstant('{app}\{#AppExe}')) then
     Exec(ExpandConstant('{app}\{#AppExe}'), '--quit', '', SW_HIDE, ewWaitUntilTerminated, Code);
+end;
+
+{ After the files are copied: announce the Windows Firewall prompt the first discovery triggers. }
+procedure InitializeWizard();
+begin
+  CreateOutputMsgPage(wpInstalling, CustomMessage('FirewallTitle'), CustomMessage('FirewallSub'),
+    CustomMessage('FirewallNote'));
 end;
 
 { Before copying files (upgrade). }

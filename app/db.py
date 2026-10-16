@@ -134,6 +134,9 @@ MIGRATIONS = [
     ("apps", "prev_version", "TEXT"),
     ("apps", "prev_sha256", "TEXT"),
     ("apps", "fail_kind", "TEXT"),           # nature du dernier échec (le compteur d'échecs repart de 1 quand elle change)
+    ("apps", "verified_at", "REAL"),         # dernière fois où l'app a été vue installée sur l'Apple TV
+    ("apps", "installed_bundle", "TEXT"),    # bundle ID installé (celui de la signature, pas de l'IPA d'origine)
+    ("devices", "host_hint", "TEXT"),        # adresse IP ou nom d'hôte saisi à la main (mDNS bloqué)
 ]
 
 

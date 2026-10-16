@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import auth, backup, db, devices, diag, ipa, notifier, plume, proc, renew, selfupdate, settings
-from .config import MAX_UPLOAD_MB, ROOT, SHUTDOWN_DRAIN_SECONDS, TMP_DIR, VERSION
+from .config import MAX_UPLOAD_MB, ROOT, SHUTDOWN_DRAIN_SECONDS, TMP_DIR, VERSION, WINDOWS
 from .proc import SESSIONS
 from .util import replace_retry
 
@@ -354,6 +354,8 @@ def state():
         a["untracked_link"] = a["source_type"] == "url" and bool(a["source_tag"]) and not a["source_key"]
     health = renew.health(now)
     devices_ = db.rows("SELECT * FROM devices ORDER BY name")
+    for d in devices_:
+        d["busy"] = devices.lock(d["id"]).locked()     # une installation tient la connexion à cette TV
     accounts_ = plume.accounts()
     slots = renew.account_slots(apps, devices_, accounts_, default)
     for acc in accounts_:
@@ -368,6 +370,7 @@ def state():
     return {
         "now": now,
         "version": VERSION,
+        "windows": WINDOWS,
         "renew_before_hours": before,
         "renew_window": settings.renew_window(),
         "max_active_apps": renew.MAX_ACTIVE_APPS,
@@ -527,10 +530,20 @@ async def account_team(email: str, body: TeamChoice):
 
 # ---------- Apple TV ----------
 
+class Discover(BaseModel):
+    host: Optional[str] = None      # adresse IP ou nom d'hôte de la TV, quand le multicast est bloqué
+
+
 @app.post("/api/devices/discover")
-async def device_discover():
+async def device_discover(body: Optional[Discover] = None):
+    host = None
+    if body and (body.host or "").strip():
+        try:
+            host = devices.clean_host(body.host)
+        except ValueError:
+            raise HTTPException(400, "invalid_host") from None
     try:
-        return await devices.discover()
+        return await devices.discover(host)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, str(e))
 
@@ -560,38 +573,82 @@ def device_or_404(device_id: int) -> dict:
 async def device_refresh(device_id: int):
     device_or_404(device_id)
     try:
-        return await devices.refresh_info(device_id)
+        return await devices.refresh_info(device_id, wait=False)
+    except devices.Busy:
+        raise HTTPException(409, "device_busy") from None
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, str(e))
 
 
 @app.get("/api/devices/{device_id}/apps")
 async def device_apps(device_id: int):
+    device = device_or_404(device_id)      # hors du try : un 404 ne devient pas un 502
     try:
-        return await devices.installed_apps(device_or_404(device_id))
+        return await devices.installed_apps(device, wait=False)
+    except devices.Busy:
+        raise HTTPException(409, "device_busy") from None
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, str(e))
 
 
 class DevicePatch(BaseModel):
-    name: str
+    name: Optional[str] = None
+    host: Optional[str] = None      # adresse saisie à la main ; vide : la retirer
 
 
 @app.patch("/api/devices/{device_id}")
 def device_patch(device_id: int, body: DevicePatch):
     device_or_404(device_id)
-    db.update("devices", device_id, name=body.name.strip() or "Apple TV")
+    fields = {}
+    if body.name is not None:
+        fields["name"] = body.name.strip() or "Apple TV"
+    if body.host is not None:
+        try:
+            fields["host_hint"] = devices.clean_host(body.host)
+        except ValueError:
+            raise HTTPException(400, "invalid_host") from None
+    db.update("devices", device_id, **fields)
     return {"ok": True}
 
 
-@app.delete("/api/devices/{device_id}")
-async def device_delete(device_id: int):
+class Relocate(BaseModel):
+    host: Optional[str] = None      # nouvelle adresse ; absente : on retente avec celle déjà enregistrée
+
+
+@app.post("/api/devices/{device_id}/relocate")
+async def device_relocate(device_id: int, body: Optional[Relocate] = None):
+    """Retrouve la TV à l'adresse donnée (multicast bloqué, adresse changée) : l'adresse est enregistrée,
+    puis la TV est contactée directement. L'adresse reste enregistrée même si la TV dort."""
+    device_or_404(device_id)
+    if body and body.host is not None:
+        try:
+            db.update("devices", device_id, host_hint=devices.clean_host(body.host))
+        except ValueError:
+            raise HTTPException(400, "invalid_host") from None
+    try:
+        await devices.refresh_info(device_id, wait=False)
+    except devices.Busy:
+        raise HTTPException(409, "device_busy") from None
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, str(e))
     d = device_or_404(device_id)
+    return {"ok": True, "ip": d["last_ip"], "port": d["last_port"]}
+
+
+@app.delete("/api/devices/{device_id}")
+async def device_delete(device_id: int, force: bool = False):
+    d = device_or_404(device_id)
+    if devices.lock(device_id).locked() or any(
+            r["id"] in renew._RUNNING for r in db.rows("SELECT id FROM apps WHERE device_id = ?", device_id)):
+        # un renouvellement installe sur cette TV : l'appairage oublié, il se terminerait sans cible
+        raise HTTPException(409, "device_busy")
     # l'appairage d'abord : s'il reste dans le store, sync_store recrée la TV au prochain démarrage
     try:
         await devices.forget(d)
     except RuntimeError as e:
-        raise HTTPException(502, str(e)) from None
+        if not force:
+            raise HTTPException(502, str(e)) from None
+        db.log(f"Apple TV « {d['name']} » retirée de la liste, appairage non effacé : {e}", "warn")
     db.execute("DELETE FROM devices WHERE id = ?", device_id)
     return {"ok": True}
 
@@ -634,6 +691,22 @@ def _abort_add(app_id: int) -> None:
     shutil.rmtree(renew.app_dir(app_id), ignore_errors=True)
 
 
+def _already_added(device_id: int | None) -> HTTPException:
+    """409 qui nomme la TV concernée (« already_added:Salon »)."""
+    tv = db.row("SELECT name FROM devices WHERE id = ?", device_id) if device_id else None
+    name = (tv["name"] if tv else "").replace(":", " ").strip()
+    return HTTPException(409, f"already_added:{name}" if name else "already_added")
+
+
+def _duplicate(app_id: int, bundle_id: str | None, account: str | None, device_id: int | None) -> bool:
+    """Même app, même compte, même Apple TV : une 2e fiche signerait deux fois et les copies
+    s'écraseraient sur la TV. Sur une autre TV, rien ne se heurte : chaque fiche a sa signature, son
+    installation et son état."""
+    return bool(bundle_id) and bool(db.row(
+        "SELECT id FROM apps WHERE id != ? AND bundle_id = ? AND COALESCE(account_email, '') = ? "
+        "AND COALESCE(device_id, 0) = ?", app_id, bundle_id, account or "", device_id or 0))
+
+
 @app.post("/api/apps")
 async def app_create(
     source_type: str = Form(...),               # upload | github | url | preset
@@ -673,6 +746,12 @@ async def app_create(
             raise HTTPException(400, "unknown_account")
     else:
         account = plume.default_account()
+    if source_type != "upload" and db.row(
+            "SELECT id FROM apps WHERE source_type = ? AND source = ? AND COALESCE(asset_name, '') = ? "
+            "AND COALESCE(source_filter, '') = ? AND COALESCE(account_email, '') = ? "
+            "AND COALESCE(device_id, 0) = ?", source_type, source, asset_name or "",
+            (source_filter or "").strip(), account or "", device_id or 0):
+        raise _already_added(device_id)      # avant tout téléchargement
     # enabled = 0 tant que l'IPA n'est pas validée : la boucle de renouvellement ne voit pas l'app à moitié ajoutée
     app_id = db.execute(
         "INSERT INTO apps (name, source_type, source, source_filter, channel, preset, asset_name, device_id, "
@@ -703,10 +782,9 @@ async def app_create(
         if info["platform"] != "appletvos":
             raise HTTPException(400, f"not_tvos:{info['platform'] or 'unknown'}")
         _check_min_os(device_id, info)
-        # même app, même compte : une 2e fiche signerait deux fois et les copies s'écraseraient sur la TV
-        if db.row("SELECT id FROM apps WHERE id != ? AND bundle_id = ? AND COALESCE(account_email, '') = ?",
-                  app_id, info["bundle_id"], account or ""):
-            raise HTTPException(409, "already_added")
+        # même app, même compte, même Apple TV : une 2e fiche signerait deux fois et les copies s'écraseraient
+        if _duplicate(app_id, info["bundle_id"], account, device_id):
+            raise _already_added(device_id)
         sha = await asyncio.to_thread(renew._sha256_file, dest)   # identité du fichier : version installée / en attente
         db.update("apps", app_id, name=info["name"], bundle_id=info["bundle_id"], version=info["version"],
                   enabled=1, source_sha256=sha)
@@ -810,6 +888,9 @@ async def app_patch(app_id: int, body: AppPatch):
             except OSError:
                 pass
     dest_changed = "device_id" in fields or "account_email" in fields
+    if dest_changed and _duplicate(app_id, a["bundle_id"], fields.get("account_email", a["account_email"]),
+                                   fields.get("device_id", a["device_id"])):
+        raise _already_added(fields.get("device_id", a["device_id"]))     # la TV visée a déjà cette app
     if dest_changed:
         # autre appareil/compte : la signature déjà prête ne convient plus
         (renew.app_dir(app_id) / "signed.ipa").unlink(missing_ok=True)
@@ -828,6 +909,46 @@ async def app_patch(app_id: int, body: AppPatch):
         # version épinglée (ou libérée) : appliquée tout de suite, la mise à jour auto coupée n'y change rien
         renew.spawn(app_id, "mise à jour" if fields.get("pinned_tag") else "nouvelle version")
     return db.row("SELECT * FROM apps WHERE id = ?", app_id)
+
+
+class AppCopy(BaseModel):
+    device_id: int
+
+
+@app.post("/api/apps/{app_id}/copy")
+async def app_copy(app_id: int, body: AppCopy):
+    """La même app sur une autre Apple TV (même source, même compte) : une fiche par TV, chacune avec
+    son état, sa signature et son échéance. L'IPA déjà téléchargée est reprise, sans nouveau téléchargement."""
+    a = app_or_404(app_id)
+    if not a["enabled"] or not a["bundle_id"]:
+        # fiche en cours d'ajout : l'IPA n'est pas encore validée, elle pourrait être partielle
+        raise HTTPException(409, "app_not_ready")
+    if not db.row("SELECT id FROM devices WHERE id = ?", body.device_id):
+        raise HTTPException(400, "unknown_device")
+    account = a["account_email"] or plume.default_account()
+    if _duplicate(app_id, a["bundle_id"], account, body.device_id) or body.device_id == a["device_id"]:
+        raise _already_added(body.device_id)
+    src = renew.app_dir(app_id) / "original.ipa"
+    if not src.exists():
+        raise HTTPException(400, "ipa_missing")
+    # enabled = 0 tant que l'IPA n'est pas copiée : la boucle ne voit pas la fiche à moitié créée
+    new_id = db.execute(
+        "INSERT INTO apps (name, bundle_id, version, source_type, source, source_filter, source_tag, source_key, "
+        "source_sha256, channel, preset, asset_name, auto_update, pinned_tag, account_email, device_id, "
+        "created_at, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+        a["name"], a["bundle_id"], a["version"], a["source_type"], a["source"], a["source_filter"],
+        a["source_tag"], a["source_key"], a["source_sha256"], a["channel"], a["preset"], a["asset_name"],
+        a["auto_update"], a["pinned_tag"], account, body.device_id, time.time())
+    try:
+        await asyncio.to_thread(shutil.copy2, src, renew.app_dir(new_id) / "original.ipa")
+    except OSError as e:
+        _abort_add(new_id)
+        db.log(f"{a['name']} : copie de l'IPA impossible : {e}", "error", app_id=app_id)   # chemins du serveur : dans le journal seulement
+        raise HTTPException(500, "copy_failed") from None
+    db.update("apps", new_id, enabled=1)
+    db.log(f"App ajoutée : {a['name']} {a['version']} ({a['bundle_id']}), copie pour une autre Apple TV", app_id=new_id)
+    renew.spawn(new_id, "ajout")
+    return db.row("SELECT * FROM apps WHERE id = ?", new_id)
 
 
 @app.post("/api/apps/{app_id}/renew")

@@ -315,6 +315,15 @@
         </div>
         <p class="group__footer" data-i18n="account_change_note">Changing the account installs a second copy of the app: each free account signs under its own team.</p>
 
+        <div id="edit-copy-bloc" hidden>
+          <p class="group__header espace" data-i18n="copy_title">Same app on another Apple TV</p>
+          <div class="list">
+            <label class="field"><span>Apple TV</span><select id="edit-copy-tv"></select></label>
+            <div class="row"><div class="row__label"><p class="row__sub" data-i18n="copy_note">A separate card is created for that TV, with its own status and expiry; the app is not downloaded again.</p></div>
+              <div class="row__buttons"><button class="row__action row__action--go" type="button" id="edit-copy" data-i18n="copy_add">Add to this TV</button></div></div>
+          </div>
+        </div>
+
         <div data-for="github">
           <p class="group__header espace" data-i18n="github_source">GitHub source</p>
           <div class="list">
@@ -388,7 +397,34 @@
       <div class="sheet__body">
         <ol class="consigne" id="pair-consigne"></ol>
         <div id="pair-list" aria-live="polite"></div>
+        <details class="details" id="pair-manuel">
+          <summary data-i18n="pair_manual">The TV isn't found? Enter its address</summary>
+          <p class="group__footer" data-i18n="pair_manual_note">If your network blocks discovery (separate VLAN, Docker without host network, firewall), give the TV's IP address (Apple TV Settings › Network).</p>
+          <div class="list">
+            <label class="field"><span data-i18n="tv_address">IP address or name</span><input id="pair-host" inputmode="url" placeholder="192.168.1.20" autocomplete="off" spellcheck="false"></label>
+          </div>
+          <div class="actions-form"><button type="button" class="btn" id="pair-host-go" data-i18n="search_here">Search at this address</button></div>
+        </details>
         <div id="pair-session" aria-live="polite"></div>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Feuille : adresse d'une Apple TV (multicast bloqué, adresse changée) -->
+  <dialog class="sheet" id="dlg-addr" aria-labelledby="t-addr">
+    <form id="form-addr" method="dialog">
+      <header class="sheet__bar">
+        <button class="sheet__link" type="button" data-close data-i18n="cancel">Cancel</button>
+        <h2 id="t-addr" data-i18n="tv_address_title">TV address</h2>
+        <button class="sheet__link sheet__link--done" id="addr-submit" value="ok" data-i18n="save_test">Save and test</button>
+      </header>
+      <div class="sheet__body">
+        <p class="group__footer" data-i18n="addr_note">tvsign finds the TV on its own. If your network blocks discovery, or the TV got a new address, enter it here: tvsign then contacts it directly. Leave empty to go back to automatic discovery.</p>
+        <div class="list">
+          <label class="field"><span data-i18n="tv_address">IP address or name</span><input name="host" inputmode="url" placeholder="192.168.1.20" autocomplete="off" spellcheck="false"></label>
+        </div>
+        <p class="erreur" id="addr-error" role="alert"></p>
+        <p class="statut" id="addr-ok" role="status"></p>
       </div>
     </form>
   </dialog>

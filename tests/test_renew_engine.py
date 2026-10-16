@@ -89,8 +89,8 @@ class Base(unittest.TestCase):
             "accounts": {e: {"first_name": e.split("@")[0], "team_id": team} for e in emails}}), encoding="utf-8")
 
     def add_device(self, name="Salon", udid="UDID1") -> int:
-        return db.execute("INSERT INTO devices (name, pair_identifier, udid, pairing_udid, created_at) "
-                          "VALUES (?, ?, ?, ?, 0)", name, udid, udid, udid)
+        return db.execute("INSERT INTO devices (name, pair_identifier, udid, pairing_udid, os_version, created_at) "
+                          "VALUES (?, ?, ?, ?, '18.0', 0)", name, udid, udid, udid)
 
     def add_app(self, name="App", **over) -> int:
         cols = dict(name=name, source_type="upload", created_at=0, enabled=1, status="ok", version="1.0",
@@ -567,7 +567,10 @@ class RenewRun(Base):
 
         async def refresh(app, force=False):
             return False
-        patches = [mock.patch.object(renew, "_phase", phase), mock.patch.object(devices, "check_reachable", check_reachable),
+
+        async def confirm_installed(device, bundle_id):
+            return time.time()          # la TV a l'app (la liste des apps de la TV a ses propres tests)
+        patches = [mock.patch.object(devices, "confirm_installed", confirm_installed), mock.patch.object(renew, "_phase", phase), mock.patch.object(devices, "check_reachable", check_reachable),
                    mock.patch.object(plume, "ensure_device", ensure_device), mock.patch.object(plume, "sign", sign),
                    mock.patch.object(devices, "install", install), mock.patch.object(renew, "refresh_source", refresh),
                    mock.patch.object(renew, "notify", _no_notify),

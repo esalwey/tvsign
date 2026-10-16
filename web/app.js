@@ -37,6 +37,7 @@ function depotGithub(v) {
 function apiError(detail, status) {
   const [code, arg, arg2] = String(detail || "").split(":");
   const k = "err_" + code;
+  if (arg && I18N[k + "_n"]) return t(k + "_n", { n: arg, m: arg2 });     // variante qui nomme l'objet (ex. la TV)
   if (I18N[k]) return t(k, { n: arg, m: arg2 });
   if (detail) return String(detail);
   return status >= 500 ? t("err_server") : status === 404 ? t("err_not_found") : status === 422 ? t("err_invalid") : t("err_status", { n: status });
@@ -97,6 +98,9 @@ const CAUSES = [
   // Ces deux messages listent des numéros de série et des noms d'équipe : à tester avant les motifs génériques.
   [/CERT_LIMIT/, "c_certlimit"],
   [/NO_TEAM|MULTIPLE_TEAMS|TEAM_NOT_FOUND/, "c_team"],
+  [/adresse introuvable/i, "c_host_unresolved"],
+  [/oubli de l'appairage/i, "c_forget_failed"],
+  [/recherche des Apple TV/i, "c_discover_failed"],
   [/arrêté par le système|killed by the system/i, "c_oom"],
   [/ntfy|notification .*échouée|notify_failed/i, "c_ntfy"],
   [/maximum number of (installed )?(apps|app ?ids?)|too many (installed )?(apps|app ?ids?)|app ?id limit|limit of \d+ (apps|app ?ids)|limite du compte gratuit|reached the maximum number/i, "c_limit"],
@@ -124,6 +128,7 @@ const CAUSES = [
   [/reconnexion|-22406|HTTP Some\(401\)|unauthori[sz]ed|session .*(expir|invalid)|not logged|log ?in required/i, "c_session"],
   [/plumesign occupé/i, "c_busy"],
   [/ouverte sur l'Apple TV|app ouverte sur la TV|installd ne progresse plus/i, "c_app_open"],
+  [/n'est plus installée|n'apparaît pas dans les apps/i, "c_not_installed"],
   [/plumesign trop ancien/i, "c_plumesign_old"],
   [/réseau ou Apple injoignable/i, "c_apple_net"],
   [/identifiant d'app changé/i, "c_bundle"],
@@ -400,6 +405,7 @@ function carteApp(a, now, s) {
       <div><dt>Apple TV</dt><dd>${a.device_id ? esc(a.device_name || "Apple TV") : `<span class="texte-err">${t("none_f")}</span>`}</dd></div>
       <div><dt>${t("account")}</dt><dd>${compte ? esc(compte) : t("default_account")}</dd></div>
       ${essai ? `<div><dt>${t("last_attempt")}</dt><dd>${essai}</dd></div>` : a.signed_at ? `<div><dt>${t("signed")}</dt><dd>${esc(relatif(a.signed_at, now))}</dd></div>` : ""}
+      ${a.verified_at ? `<div><dt>${t("verified_on_tv")}</dt><dd>${esc(relatif(a.verified_at, now))}</dd></div>` : ""}
       ${a.bad_tag && !a.update_tag ? `<div><dt>${t("skipped_version")}</dt><dd class="mono">${esc(a.source_type === "url" ? redactUrl(a.bad_tag) : a.bad_tag)}</dd></div>` : ""}
     </dl>
     <div class="app__actions">
@@ -416,7 +422,8 @@ function carteApp(a, now, s) {
 const trigger = (x) => ({ auto: t("tr_auto"), manuel: t("tr_manual"), ajout: t("tr_added"), "nouvelle version": t("tr_new_version"),
   "nouvelle source": t("tr_new_source"), "nouvelle destination": t("tr_new_dest"), "nouvelle IPA": t("tr_new_ipa"),
   "mise à jour": t("tr_update"), "retour arrière": t("tr_rollback"),
-  reconnexion: t("tr_reconnect"), appairage: t("tr_paired") }[x] || x);
+  reconnexion: t("tr_reconnect"), appairage: t("tr_paired"),
+  "nouvel appairage": t("tr_repaired"), "app absente": t("tr_missing") }[x] || x);
 
 // ---------- synthèse globale ----------
 const boucleArretee = (h, now) => !!h && (h.loop_stalled || (!!h.last_loop_at && now - h.last_loop_at > 3 * (h.check_interval || 600) + 120));
@@ -539,7 +546,7 @@ function renderDevices(s, now) {
       <span class="row__icon row__icon--${COULEUR[ton]}">${ICONS.tv}</span>
       <div class="row__label">
         <p class="row__title">${esc(d.name)}</p>
-        <p class="row__sub"><span class="etat etat--${ton}">${mot}</span> · ${esc(d.model || t("unknown_model"))} · tvOS ${esc(d.os_version || "?")}${d.last_ip ? ` · ${esc(d.last_ip)}` : ""}</p>
+        <p class="row__sub"><span class="etat etat--${ton}">${mot}</span> · ${esc(d.model || t("unknown_model"))} · tvOS ${esc(d.os_version || "?")}${d.last_ip ? ` · ${esc(d.last_ip)}` : ""}${d.host_hint ? ` · ${esc(t("manual_addr", { host: d.host_hint }))}` : ""}${d.busy ? ` · ${esc(t("tv_busy"))}` : ""}</p>
         <p class="row__sub">${esc(t("last_contact", { when: relatif(d.last_seen, now) }))}${apps.length ? ` · ${esc(apps.join(", "))}` : ""}</p>
         ${d.legacy_pairing ? `<p class="row__sub">${t("legacy_row")}</p>`
           : errRecente ? `<p class="row__sub texte-err">${esc(enClair(d.last_error).titre)} ${d.last_error_at ? `(${esc(relatif(d.last_error_at, now))})` : ""}</p>` : ""}
@@ -547,6 +554,7 @@ function renderDevices(s, now) {
       <div class="row__buttons">
         ${d.pairing_lost || d.legacy_pairing ? `<button class="row__action row__action--go" data-open="dlg-pair">${t("repair")}</button>` : ""}
         ${d.legacy_pairing ? "" : `<button class="row__action" data-refresh-dev="${d.id}">${t("test_connection")}</button>`}
+        ${d.legacy_pairing ? "" : `<button class="row__action" data-addr-dev="${d.id}">${t("address")}</button>`}
         <button class="row__action row__action--danger" data-del-dev="${d.id}" data-nom="${esc(d.name)}">${t("forget")}</button>
       </div>
     </div>`;
@@ -708,6 +716,7 @@ document.addEventListener("click", async (ev) => {
     return;
   }
   if (d.edit) return openEdit(+d.edit);
+  if (d.addrDev) return openAddr(+d.addrDev);
   if (d.team) return openTeam(d.team);
   if (d.replace) {
     // le sélecteur de fichier est un <input> permanent (hors des sections redessinées) : un rendu de
@@ -759,7 +768,14 @@ document.addEventListener("click", async (ev) => {
     if (d.delDev) {
       const deps = (STATE?.apps || []).filter((a) => String(a.device_id) === d.delDev).map((a) => a.name);
       const msg = t("confirm_del_tv", { name: d.nom }) + (deps.length ? "\n\n" + t("confirm_del_tv_apps", { apps: deps.join(", ") }) : "");
-      if (confirm(msg)) await api(`/api/devices/${d.delDev}`, { method: "DELETE" });
+      if (confirm(msg)) {
+        try { await api(`/api/devices/${d.delDev}`, { method: "DELETE" }); }
+        catch (e) {
+          // l'appairage n'a pas pu être effacé (plumesign absent ou bloqué…) : on propose de retirer la TV quand même
+          if (e.status !== 502 || !confirm(t("confirm_force_del_tv", { why: enClair(e.message).titre }))) throw e;
+          await api(`/api/devices/${d.delDev}?force=1`, { method: "DELETE" });
+        }
+      }
     }
     if (d.check) {
       await busy(b, "data-check", t("checking"), async () => {
@@ -815,7 +831,7 @@ if (store.get("tvsign.journal.ouvert") === "1") $("#journal-bloc").open = true;
 function openDialog(id) {
   if (!STATE && id !== "dlg-login") return flash("err", t("sum_unreachable_t"), " " + t("retry_moment"));
   if (id === "dlg-app") fillAppForm();
-  if (id === "dlg-pair") scan();
+  if (id === "dlg-pair") { $("#pair-manuel").open = false; $("#pair-host").value = ""; scan(); }   // une adresse saisie avant ne doit pas masquer la recherche automatique
   if (id === "dlg-login") {
     $("#login-session").innerHTML = ""; $("#login-error").textContent = "";
     $("#login-submit").disabled = false;
@@ -985,8 +1001,66 @@ function openEdit(id) {
   f.pinned_tag.value = a.pinned_tag || "";
   $$("#form-edit [data-for]").forEach((el) => (el.hidden = !el.dataset.for.split(" ").includes(a.source_type)));
   $("#edit-error").textContent = "";
+  // la même app sur une autre TV : les TV qui ne l'ont pas encore (même compte)
+  const compteApp = a.account_email || a.effective_account || "";
+  const candidates = STATE.devices.filter((d) => !d.legacy_pairing && d.id !== a.device_id
+    && !STATE.apps.some((x) => x.id !== a.id && a.bundle_id && x.bundle_id === a.bundle_id
+      && (x.account_email || x.effective_account || "") === compteApp && x.device_id === d.id));
+  $("#edit-copy-bloc").hidden = !candidates.length || !a.device_id;
+  $("#edit-copy-tv").innerHTML = candidates.map((d) => `<option value="${d.id}">${esc(d.name)}</option>`).join("");
   $("#dlg-edit").showModal();
 }
+$("#edit-copy").onclick = async () => {
+  const a = EDIT, sel = $("#edit-copy-tv"), err = $("#edit-error"), btn = $("#edit-copy");
+  if (!a || !sel.value) return;
+  btn.disabled = true; err.textContent = "";
+  try {
+    const tv = sel.selectedOptions[0].text;
+    await api(`/api/apps/${a.id}/copy`, { json: { device_id: +sel.value } });
+    $("#dlg-edit").close();
+    flash("ok", t("copied_tv_t"), " " + t("copied_tv", { tv }));
+  } catch (e) {
+    err.textContent = e.message;
+  } finally {
+    btn.disabled = false;
+    refresh();
+  }
+};
+
+// ---------- adresse d'une Apple TV (multicast bloqué, adresse changée) ----------
+let ADDR = null;
+function openAddr(id) {
+  const d = STATE?.devices.find((x) => x.id === id);
+  if (!d) return;
+  ADDR = d;
+  const f = $("#form-addr");
+  $("#t-addr").textContent = t("tv_address_for", { name: d.name });
+  f.host.value = d.host_hint || "";
+  f.host.placeholder = d.last_ip || "192.168.1.20";
+  $("#addr-error").textContent = ""; $("#addr-ok").innerHTML = "";
+  $("#dlg-addr").showModal();
+}
+$("#form-addr").addEventListener("submit", async (ev) => {
+  if (ev.submitter && ev.submitter.value !== "ok") return;
+  ev.preventDefault();
+  const f = ev.target, err = $("#addr-error"), ok = $("#addr-ok"), btn = $("#addr-submit");
+  btn.disabled = true; err.textContent = "";
+  ok.innerHTML = `<span class="etat etat--cours">${t("connecting")}</span>`;
+  try {
+    const r = await api(`/api/devices/${ADDR.id}/relocate`, { json: { host: f.host.value.trim() } });
+    ok.innerHTML = "";
+    f.closest("dialog").close();
+    flash("ok", t("tv_ok_t"), " " + t("tv_found_at", { ip: r.ip || "" }));
+  } catch (e) {
+    ok.innerHTML = "";
+    // l'adresse est enregistrée même si la TV ne répond pas (en veille) : on le dit
+    err.textContent = e.status === 502 ? t("addr_saved_unreachable", { why: enClair(e.message).titre })
+      : e.status === 409 ? t("addr_saved_busy") : e.message;
+  } finally {
+    btn.disabled = false;
+    refresh();
+  }
+});
 $("#form-edit").addEventListener("submit", async (ev) => {
   if (ev.submitter && ev.submitter.value !== "ok") return;
   ev.preventDefault();
@@ -1117,15 +1191,15 @@ $("#dlg-login").addEventListener("close", () => { annulerSession("login"); $("#l
 $("#dlg-pair").addEventListener("close", () => annulerSession("pair"));
 
 // ---------- appairage ----------
-async function scan() {
+async function scan(host) {
   const list = $("#pair-list");
   annulerSession("pair");
   $("#pair-consigne").innerHTML = t("pair_steps");
   $("#pair-session").innerHTML = "";
-  $("#pair-rescan").disabled = true;
+  $("#pair-rescan").disabled = $("#pair-host-go").disabled = true;
   list.innerHTML = `<p class="statut"><span class="etat etat--cours">${t("searching")}</span></p>`;
   try {
-    const r = await api("/api/devices/discover", { method: "POST" });
+    const r = await api("/api/devices/discover", { method: "POST", json: host ? { host } : {} });
     const vues = r.paired.filter((d) => d.device_id).map((d) => (STATE?.devices || []).find((x) => x.id === d.device_id)?.name || d.name);
     list.innerHTML = (r.pairable.length ? `<div class="list">${r.pairable.map((d, i) => `
       <div class="row">
@@ -1133,16 +1207,18 @@ async function scan() {
         <div class="row__label"><p class="row__title">${esc(d.name)}</p><p class="row__sub">${esc(d.ip)}</p></div>
         <div class="row__buttons"><button type="button" class="row__action row__action--go" data-pair-idx="${i}">${t("pair")}</button></div>
       </div>`).join("")}</div>`
-      : `<div class="vide"><p>${t("pair_none")}</p><p>${t("pair_none_hint")}</p></div>`)
+      : `<div class="vide"><p>${t(host ? "pair_none_host" : "pair_none")}</p><p>${t(host ? "pair_none_host_hint" : "pair_none_hint")}</p>${STATE?.windows && !host ? `<p>${t("pair_none_hint_win")}</p>` : ""}</div>`)
       + (vues.length ? `<p class="group__footer">${esc(t("pair_already_visible", { names: [...new Set(vues)].join(", ") }))}</p>` : "");
     list.onclick = (e) => {
       const b = e.target.closest("[data-pair-idx]");
       if (b) startPair(r.pairable[b.dataset.pairIdx]);
     };
+    if (!r.pairable.length) $("#pair-manuel").open = true;     // rien trouvé : l'adresse à la main est la suite
   } catch (e) {
-    list.innerHTML = `<p class="erreur">${esc(e.message)}</p>`;
+    list.innerHTML = `<p class="erreur">${esc(enClair(e.message).titre)}</p>`;
+    $("#pair-manuel").open = true;
   } finally {
-    $("#pair-rescan").disabled = false;
+    $("#pair-rescan").disabled = $("#pair-host-go").disabled = false;
   }
 }
 async function startPair(d) {
@@ -1154,7 +1230,10 @@ async function startPair(d) {
     $("#pair-session").innerHTML = `<p class="erreur">${esc(e.message)}</p>`;
   }
 }
-$("#pair-rescan").onclick = scan;
+// « Chercher » n'envoie l'adresse que si la section est ouverte et le champ rempli
+$("#pair-rescan").onclick = () => scan($("#pair-manuel").open ? $("#pair-host").value.trim() || undefined : undefined);
+$("#pair-host-go").onclick = () => scan($("#pair-host").value.trim() || undefined);
+$("#pair-host").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("#pair-host-go").click(); } });
 // Annuler / Fermer : type=button, pour qu'Entrée dans un champ déclenche l'action principale
 $$("dialog [data-close]").forEach((b) => (b.onclick = () => b.closest("dialog").close("cancel")));
 
@@ -1279,10 +1358,14 @@ const WIZ_RENDU = {
   check: () => {
     const d = WIZ.diag;
     const bloquant = d && d.checks.some((c) => c.status === "error" && ["plumesign", "event_loop"].includes(c.id));
+    // Windows : la recherche des Apple TV fait apparaître l'alerte du pare-feu ; on l'annonce, puis on lance
+    const attente = !!STATE?.windows && !d && !WIZ.diagEnCours;
     return `${titreEtape("wiz_check_title", t("wiz_check_text"))}
+      ${STATE?.windows ? `<div class="banner banner--info"><p><strong>${t("fw_title")}</strong>${t("fw_text")}</p></div>` : ""}
+      ${attente ? `<button class="btn btn--primary" type="button" id="wiz-diag">${t("run_check")}</button>` : ""}
       ${WIZ.diagEnCours && !d ? `<p class="statut"><span class="etat etat--cours">${t("checking")}</span></p>` : d ? listeDiag(d) : ""}
       ${bloquant ? `<p class="erreur">${t("wiz_check_blocking")}</p>` : ""}
-      <p class="group__footer"><button class="lien lien--inline" type="button" id="wiz-diag" ${WIZ.diagEnCours ? "disabled" : ""}>${t("run_again")}</button></p>`;
+      ${attente ? "" : `<p class="group__footer"><button class="lien lien--inline" type="button" id="wiz-diag" ${WIZ.diagEnCours ? "disabled" : ""}>${t("run_again")}</button></p>`}`;
   },
   account: () => {
     const accs = STATE?.accounts || [];
@@ -1347,14 +1430,18 @@ function detailDiag(c, d) {
 function listeDiag(d) {
   return `<div class="list">${d.checks.map((c) => {
     const ton = c.status === "ok" ? "ok" : c.status === "warn" ? "warn" : "err";
-    const conseil = c.status !== "ok" ? t(`diag_${c.id}_fix`) : "";
+    // le conseil réseau dépend du cas : TV joignable en direct, conteneur Docker en pont, pare-feu Windows
+    const cleConseil = c.id === "mdns"
+      ? (c.value?.direct ? "diag_mdns_direct" : c.value?.bridge ? "diag_mdns_bridge" : d.platform === "win32" ? "diag_mdns_fix_win" : "diag_mdns_fix")
+      : `diag_${c.id}_fix`;
+    const conseil = c.status !== "ok" ? t(cleConseil) : "";
     return `<div class="row">
       <span class="row__icon row__icon--${COULEUR[ton]}">${c.status === "ok" ? ICONS.ok : ICONS.alerte}</span>
       <div class="row__label">
         <p class="row__title">${t("diag_" + c.id)}</p>
         <p class="row__sub"><span class="etat etat--${ton}">${t("diag_" + c.status)}</span>${c.id === "plumesign" && c.value ? ` · <span class="mono">${esc(c.value)}</span>` : ""}</p>
         <p class="row__sub">${esc(detailDiag(c, d))}</p>
-        ${conseil && conseil !== `diag_${c.id}_fix` ? `<p class="row__sub">${esc(conseil)}</p>` : ""}
+        ${conseil && conseil !== cleConseil ? `<p class="row__sub">${esc(conseil)}</p>` : ""}
       </div>
     </div>`;
   }).join("")}</div>`;
@@ -1409,7 +1496,7 @@ $("#wiz-suivant").onclick = async () => {
 function avancer() {
   WIZ.i = Math.min(ETAPES.length - 1, WIZ.i + 1);
   const e = ETAPES[WIZ.i];
-  if (e === "check" && !WIZ.diag) lancerDiag(() => { $("#wiz-corps")._html = null; renderWizard(); });
+  if (e === "check" && !WIZ.diag && !STATE?.windows) lancerDiag(() => { $("#wiz-corps")._html = null; renderWizard(); });
   if (e === "app" && !PRESETS) presets().then(() => { $("#wiz-corps")._html = null; renderWizard(); });
   renderWizard();
   $("#wiz-titre")?.focus?.();

@@ -145,7 +145,7 @@ fn txt(service: &ResolvedService, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn trim_local(hostname: &str) -> String {
+pub(crate) fn trim_local(hostname: &str) -> String {
     hostname
         .trim_end_matches('.')
         .trim_end_matches(".local")

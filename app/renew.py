@@ -531,10 +531,12 @@ def backoff_seconds(fails: int, transient: bool = False, left: float | None = No
 
 
 def _retry_at(app: dict, now: float, transient: bool = False, fails: int = 1, kind: str | None = None,
-              slow: bool = False) -> float:
+              slow: bool = False, waited: bool = False) -> float:
     """Prochain essai, jamais après l'expiration (une dernière tentative juste avant). `slow` : Apple a
     refusé la requête (-80045, 429) et limite les essais, chaque nouvel essai peut prolonger le blocage :
-    on espace beaucoup (APPLE_BACKOFF_MINUTES), un peu moins près de l'expiration (30 min au plus)."""
+    on espace beaucoup (APPLE_BACKOFF_MINUTES), un peu moins près de l'expiration (30 min au plus).
+    `waited` : l'installation vient d'attendre la fermeture d'une app ouverte (APP_WAIT_MINUTES) : un nouvel
+    essai tout de suite renverrait l'IPA pour autant d'attente de plus, le délai normal (RETRY_MINUTES) s'applique."""
     exp = app["expires_at"]
     if kind:
         delay = BLOCKED_RETRY_HOURS.get(kind, 6) * 3600
@@ -542,6 +544,8 @@ def _retry_at(app: dict, now: float, transient: bool = False, fails: int = 1, ki
             delay = min(delay, 2 * 3600)
     else:
         delay = backoff_seconds(fails, transient, exp - now if exp else None)
+        if waited:
+            delay = max(delay, RETRY_MINUTES * 60)
         if slow:
             delay = max(delay, APPLE_BACKOFF_MINUTES * 60)
             if exp and exp - now < 12 * 3600:
@@ -568,7 +572,7 @@ def failure_fields(app: dict, now: float, exc: BaseException, transient: bool, o
     nature = ("update:" if optional else "") + (kind or ("slow" if slow else "transient" if transient else "other"))
     fails = _next_fails(app, nature)
     return dict(fail_count=fails, fail_kind=nature, needs_action=kind,
-                next_attempt_at=_retry_at(app, now, transient, fails, kind, slow))
+                next_attempt_at=_retry_at(app, now, transient, fails, kind, slow, isinstance(exc, devices.AppInUse)))
 
 
 def _reusable_signature(app: dict, original, signed, now: float) -> float | None:
@@ -812,7 +816,9 @@ async def _renew(app_id: int, trigger: str) -> None:
         # quittées, une app « avec processus » n'est donc pas forcément à l'écran. Seul installd
         # sait si l'app est réellement utilisée : il met alors l'installation en attente (étape 3).
         _phase(app_id, "checking")
-        if not device["udid"]:
+        if not device["udid"] or not device["os_version"]:
+            # identité de la TV pas encore confirmée par la TV elle-même (infos manquées juste après
+            # l'appairage) : l'UDID enregistré chez Apple doit être le sien, pas celui de l'appairage
             await devices.refresh_info(device["id"])
             device = db.row("SELECT * FROM devices WHERE id = ?", device["id"])
         else:
@@ -891,6 +897,9 @@ async def _renew(app_id: int, trigger: str) -> None:
             expires = await deliver()
         except Exception as first:  # noqa: BLE001
             expires = await _fall_back(app_id, first, deliver, signed)
+        # « valide » seulement si la TV a bien l'app (jamais un succès présumé d'après le seul code de sortie)
+        bundle = devices.signed_bundle(app_dir(app_id), app)
+        verified_at = await devices.confirm_installed(device, bundle)
 
         now = time.time()
         # ce qui tourne maintenant sur la TV (« version » est la dernière téléchargée ; après un repli sur la
@@ -899,6 +908,7 @@ async def _renew(app_id: int, trigger: str) -> None:
         fields = dict(status="ok", signed_at=now, expires_at=expires, next_attempt_at=None, last_error=None,
                       notified_level=None, fail_count=0, fail_kind=None, needs_action=None, update_error=None,
                       cert_serial=_serials(signed, email), installed_ipa=done["source_sha256"],
+                      verified_at=verified_at, installed_bundle=bundle,
                       installed_version=done.get("version"), installed_tag=done.get("source_tag"))
         if expires - now <= settings.renew_before_hours() * 3600 + CHECK_INTERVAL:
             # profil déjà dans la fenêtre de renouvellement (réglage au maximum, profil plus court que prévu) :
@@ -1105,9 +1115,10 @@ def _account_valid(email: str) -> None:
 
 
 def _device_paired(device_id: int) -> None:
-    """Apple TV (ré)appairée : les apps qui attendaient l'appairage repartent."""
-    waiting = db.rows("SELECT * FROM apps WHERE enabled = 1 AND status = 'error' AND device_id = ? "
-                      "AND needs_action = 'pairing'", device_id)
+    """Apple TV (ré)appairée : ses apps en échec ou en attente repartent tout de suite au lieu d'attendre la fin
+    du délai de réessai. Une limite du compte ou une session à rouvrir ne dépendent pas de l'appairage : laissées."""
+    waiting = db.rows("SELECT * FROM apps WHERE enabled = 1 AND status IN ('error', 'pending') AND device_id = ? "
+                      "AND (needs_action IS NULL OR needs_action = 'pairing')", device_id)
     if waiting:
         _resume(waiting, "appairage")
 
@@ -1294,6 +1305,10 @@ async def _release_pass() -> None:
     HEALTH["last_release_check_at"] = time.time()
 
 
+async def _installed_pass() -> None:
+    await _guarded("vérification des apps installées", devices.audit_installed())
+
+
 async def _selfupdate_pass() -> None:
     await _guarded("recherche de mise à jour de tvsign", selfupdate.check())
 
@@ -1340,6 +1355,8 @@ async def tick(now: float, last_account_check: float, last_release_check: float)
         if (urgent(app, now) or settings.in_renew_window(now)) and spawn(app["id"], "nouvelle version"):
             launched.add(app["id"])
     _background("selfupdate", _selfupdate_pass)         # une recherche par jour au plus (réseau : hors de la boucle)
+    await _guarded("appairages des Apple TV", devices.check_store())
+    _background("installed", _installed_pass)           # contrôle des apps présentes sur chaque TV (réseau : hors de la boucle)
     # Les tâches lancées ci-dessus n'ont pas encore démarré (_RUNNING est vide pour elles) : sans cette
     # exclusion, une app expirée dont la re-signature démarre recevrait une alerte « EXPIRÉ » à tort.
     await _guarded("alertes d'expiration", _check_expired(time.time(), launched | set(_RUNNING)))

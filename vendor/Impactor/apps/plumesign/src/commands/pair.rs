@@ -9,7 +9,8 @@ use idevice::IdeviceError;
 use idevice::RsdService;
 use idevice::installation_proxy::InstallationProxyClient;
 use plume_utils::wireless::{
-    PairingStore, RsdConnection, ServiceKind, discover, locate, locate_and_connect, pair,
+    Hint, MDNS_PORT, PairingStore, RsdConnection, ServiceKind, discover, discover_at, locate_and_connect_via,
+    locate_via, pair,
 };
 
 use crate::get_data_path;
@@ -145,6 +146,20 @@ pub struct TargetArgs {
         default_value_t = 10
     )]
     pub timeout: u64,
+    /// Ask this address directly (unicast mDNS) before browsing the network: finds a device whose
+    /// multicast announcements do not reach this host (VLAN, Docker bridge network, firewall)
+    #[arg(long = "hint-ip", value_name = "IP", value_parser = parse_scoped_ip)]
+    pub hint_ip: Option<ScopedIp>,
+    /// mDNS port to query on the hint address
+    #[arg(long = "hint-port", value_name = "PORT", default_value_t = MDNS_PORT, hide = true)]
+    pub hint_port: u16,
+}
+
+impl TargetArgs {
+    fn hint(&self) -> Option<Hint> {
+        self.hint_ip
+            .map(|ip| Hint::at(ip.socket_addr(self.hint_port)))
+    }
 }
 
 #[derive(Debug, Args)]
@@ -221,6 +236,13 @@ pub struct DiscoverArgs {
     /// Print one JSON object per device instead of text
     #[arg(long = "json")]
     pub json: bool,
+    /// Query this address directly (unicast mDNS) instead of browsing the network: for a device
+    /// whose multicast announcements do not reach this host
+    #[arg(long = "ip", value_name = "IP", value_parser = parse_scoped_ip)]
+    pub ip: Option<ScopedIp>,
+    /// mDNS port to query on that address
+    #[arg(long = "mdns-port", value_name = "PORT", default_value_t = MDNS_PORT, hide = true)]
+    pub mdns_port: u16,
 }
 
 #[derive(Debug, Args)]
@@ -300,7 +322,14 @@ async fn run_pair(store: &PairingStore, args: PairArgs) -> Result<()> {
 
     // Report the identifier the device advertises once paired, proven by its
     // auth tag, since that is what later commands are given.
-    let identifier = match locate(store, &device.udid, Duration::from_secs(5)).await {
+    let identifier = match locate_via(
+        store,
+        &device.udid,
+        Some(Hint::at(ip.socket_addr(MDNS_PORT))),
+        Duration::from_secs(5),
+    )
+    .await
+    {
         Ok(located) => Some(located.service_identifier),
         Err(e) => {
             log::warn!("Could not see the paired device advertise itself yet: {e}");
@@ -319,10 +348,11 @@ async fn run_pair(store: &PairingStore, args: PairArgs) -> Result<()> {
 }
 
 async fn connect(store: &PairingStore, host: &str, target: &TargetArgs) -> Result<RsdConnection> {
-    let connection = locate_and_connect(
+    let connection = locate_and_connect_via(
         store,
         &target.identifier,
         host,
+        target.hint(),
         Duration::from_secs(target.timeout),
     )
     .await?;
@@ -1025,7 +1055,11 @@ fn flush_stdout() {
 }
 
 async fn run_discover(store: &PairingStore, args: DiscoverArgs) -> Result<()> {
-    let devices = discover(Duration::from_secs(args.timeout)).await?;
+    let timeout = Duration::from_secs(args.timeout);
+    let devices = match args.ip {
+        Some(ip) => discover_at(Hint::at(ip.socket_addr(args.mdns_port)), timeout).await?,
+        None => discover(timeout).await?,
+    };
 
     if devices.is_empty() {
         log::warn!("No devices found. Check that the device is awake and on this network.");

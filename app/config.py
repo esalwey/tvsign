@@ -163,6 +163,11 @@ RENEW_TIMEOUT_MINUTES = max(_num("TVSIGN_RENEW_TIMEOUT_MINUTES", 60, 1, kind=flo
 SHUTDOWN_DRAIN_SECONDS = _num("TVSIGN_SHUTDOWN_DRAIN_SECONDS", 240, 0)
 # How long plumesign looks for an Apple TV on the network, in seconds.
 DEVICE_TIMEOUT = _num("TVSIGN_DEVICE_TIMEOUT", 10, 1)
+# Periodic check that the apps are really present on the Apple TV, in hours (0 = never).
+INSTALL_CHECK_HOURS = _num("TVSIGN_INSTALL_CHECK_HOURS", 6, 0, kind=float)
+# Reach the Apple TV with a unicast mDNS query sent to its last known (or manually entered) address
+# before the multicast search: needed when multicast is filtered (VLAN, bridged Docker).
+UNICAST_HINT = _flag("TVSIGN_UNICAST_HINT", True)
 
 for d in (DATA_DIR, IPA_DIR, PLUME_HOME, TMP_DIR):
     d.mkdir(parents=True, exist_ok=True)

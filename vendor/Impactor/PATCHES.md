@@ -325,6 +325,33 @@ described there and exist once).
 - Tests: tunnel address scope, verify error mapping, link-local choice, atomic store, scoped ip
   parsing, extension matching, PIN normalisation.
 
+## Unicast discovery (plume_utils, plumesign)
+
+`crates/plume_utils/src/wireless/unicast.rs` (new), `tunnel.rs`, `discovery.rs`, `mod.rs`,
+`apps/plumesign/src/commands/pair.rs`
+
+Unlike the entries above, this one is also kept as `vendor/patches/0001-tvsign-unicast-discovery.patch`,
+which `scripts/vendor-impactor.*` applies on top of a fresh export of the fork (and lists in
+VENDORED.txt). The patch is made against the fork alone: its `pair.rs` and `tunnel.rs` hunks do not know
+the changes of "Wireless pairing" above, so after those are ported to the fork, rebase the patch (the
+script stops with "does not apply" until then). The merged tree is the reference.
+
+- `unicast.rs`: a plain DNS query sent straight to UDP 5353 of one address (RFC 6762 legacy unicast) for
+  `_remotepairing._tcp` / `_remotepairing-manual-pairing._tcp`; builds the same `DiscoveredDevice` the
+  multicast browse would. `Hint { addr }` keeps the IPv6 scope id (`Hint::at`, `Hint::new`,
+  `Hint::with_port`); the address of the answering device keeps it too.
+- `tunnel.rs`: `locate_via` / `locate_and_connect_via` ask the hint first, then browse. One `judge()`
+  decides what an announcement means for both paths: found, refused (the device asked for rejects our
+  keys), or foreign (collected for `judge_foreign`, the "only device with that name" rule of "Wireless
+  pairing"). The remembered `service_identifier` of the record is used by both.
+- `pair.rs`: `pair discover --ip`, `--hint-ip` (a numeric scope is accepted: `fe80::1%12`) and
+  `--hint-port` (hidden) on the targeted commands; `pair --ip` verifies the identifier through the same
+  direct query.
+- Environment `TVSIGN_UNICAST_HINT=0` (read by tvsign, not by plumesign) stops tvsign from passing a hint.
+- Tests: DNS encoding/parsing, compressed names and pointer loops, assembling a device, a fake responder on
+  loopback (direct answer, split PTR/SRV/TXT, silence), `locate_via` through a hint, a foreign tag never
+  taken for our device.
+
 ## Misc
 
 - `crates/plume_utils/src/cgbi.rs`: a CgBI PNG with a zero or huge dimension, or a huge inflated size,

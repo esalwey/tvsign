@@ -5,6 +5,7 @@ Each check returns {id, status: ok|warn|error, detail, value}; the UI translates
 """
 import asyncio
 import email.utils
+import ipaddress
 import json
 import os
 import shutil
@@ -13,8 +14,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
-from . import plume, settings
+from . import db, devices, plume, settings
 from .config import DATA_DIR, PASSWORD_FILE_ERROR, PLUMESIGN, VERSION, WINDOWS
 
 DEFAULT_ANISETTE = settings.DEFAULT_ANISETTE
@@ -51,6 +53,36 @@ async def _plumesign() -> dict:
     return _check("plumesign", "ok", str(PLUMESIGN), v)
 
 
+def _bridge_network() -> bool:
+    """Conteneur Docker sur le réseau « bridge » (seule une interface eth0 en 172.16/12) : le multicast
+    de la maison n'y arrive pas, il faut network_mode: host."""
+    if WINDOWS or not Path("/.dockerenv").exists():
+        return False
+    try:
+        names = [n.name for n in Path("/sys/class/net").iterdir() if n.name != "lo"]
+        addrs = {i[4][0] for i in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)}
+    except OSError:
+        return False
+    private = ipaddress.ip_network("172.16.0.0/12")
+    return len(names) == 1 and bool(addrs) and all(ipaddress.ip_address(a) in private for a in addrs)
+
+
+async def _direct_answers() -> int:
+    """Apple TV déjà connues qui répondent à une requête mDNS envoyée directement à leur adresse :
+    le multicast est filtré mais tvsign les joint quand même."""
+    async def one(ip: str) -> int:
+        try:
+            return len(await plume.discover(2, ip=ip))
+        except Exception:  # noqa: BLE001 - plumesign ancien, adresse injoignable…
+            return 0
+    ips = set()
+    for d in db.rows("SELECT host_hint, last_ip FROM devices"):
+        ip = await devices.resolve_host(d["host_hint"]) or d["last_ip"]
+        if ip:
+            ips.add(ip)
+    return sum(await asyncio.gather(*(one(ip) for ip in ips))) if ips else 0
+
+
 async def _mdns() -> dict:
     try:
         found = await plume.discover(4)
@@ -59,7 +91,15 @@ async def _mdns() -> dict:
     ours = sum(1 for d in found if d.get("udid"))
     pairable = sum(1 for d in found if d["kind"] == "pairable")
     detail = f"{len(found)} announcement(s), {ours} paired with tvsign, {pairable} waiting to be paired"
-    return _check("mdns", "ok" if found else "warn", detail, {"total": len(found), "ours": ours, "pairable": pairable})
+    value = {"total": len(found), "ours": ours, "pairable": pairable, "bridge": False, "direct": 0}
+    if found:
+        return _check("mdns", "ok", detail, value)
+    value["bridge"] = _bridge_network()
+    value["direct"] = await _direct_answers()
+    if value["direct"]:
+        # multicast does not get through, but the TV's known address answers: renewals work
+        return _check("mdns", "warn", f"{detail}; {value['direct']} Apple TV(s) answering directly at their address", value)
+    return _check("mdns", "warn", detail, value)
 
 
 def _tcp(host: str, port: int = 443) -> str:

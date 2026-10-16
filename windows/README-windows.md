@@ -44,13 +44,14 @@ L'appairage ne se fait **qu'une seule fois**. Le PC et l'Apple TV doivent être 
 Si l'Apple TV n'apparaît pas :
 - vérifiez que l'écran de l'étape 2 est bien ouvert sur la TV ;
 - vérifiez que le PC n'est pas connecté à un VPN ni au Wi-Fi « invité » de la box ;
-- voyez la section 4 sur le pare-feu.
+- voyez la section 4 sur le pare-feu ;
+- si rien n'y fait (réseau de la box qui isole les appareils, VLAN), ouvrez **Appairer**, dépliez **TV introuvable ? Saisis son adresse**, saisissez l'adresse IP de l'Apple TV (*Réglages > Réseau* sur la TV) puis **Rechercher à cette adresse**. Plus tard, le bouton **Adresse** de la ligne de la TV permet d'indiquer une nouvelle adresse si elle change.
 
 Si un jour la TV est réinitialisée, ou si vous retirez « tvsign » de la liste des appareils dans ses réglages, tvsign affichera « Appairage perdu ». Il suffira alors de refaire ces étapes.
 
 ## 4. L'invite du pare-feu Windows
 
-Au premier appairage, Windows peut afficher une fenêtre **« Le Pare-feu Windows Defender a bloqué certaines fonctionnalités de cette application »** au sujet de **plumesign**.
+L'installeur vous prévient de cette fenêtre sur sa dernière page, et l'assistant de tvsign l'annonce avant de lancer la vérification de l'environnement (étape « Vérification »). Au premier appairage ou à la première vérification, Windows peut afficher une fenêtre **« Le Pare-feu Windows Defender a bloqué certaines fonctionnalités de cette application »** au sujet de **plumesign**.
 
 - **plumesign** est l'outil fourni avec tvsign qui parle à l'Apple TV et aux serveurs d'Apple.
 - Il doit **écouter le réseau local** pour trouver l'Apple TV, qui s'annonce sur le réseau comme une imprimante ou une enceinte AirPlay.

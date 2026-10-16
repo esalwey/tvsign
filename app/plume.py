@@ -825,13 +825,17 @@ async def version() -> str | None:
     return res.output.strip() or None if res.ok else None
 
 
-async def discover(seconds: int = 6) -> list[dict]:
-    """Annonces mDNS des Apple TV. Lecture seule : n'ouvre aucune connexion vers les TV."""
+async def discover(seconds: int = 6, ip: str | None = None) -> list[dict]:
+    """Annonces mDNS des Apple TV. Lecture seule : n'ouvre aucune connexion vers les TV.
+    Avec `ip` (multicast bloqué), la requête mDNS est envoyée directement à cette adresse."""
     e = env()
     e["RUST_LOG"] = "warn"
-    res = await run(PLUMESIGN, "pair", "discover", "-t", seconds, "--json", env=e,
+    extra = ["--ip", ip] if ip else []
+    res = await run(PLUMESIGN, "pair", "discover", "-t", seconds, "--json", *extra, env=e,
                     timeout=seconds + 30, split=True)
     if not res.ok:
+        if ip and re.search(r"unexpected argument|unrecognized", res.err, re.I):
+            raise RuntimeError("plumesign trop ancien pour chercher à une adresse : mets-le à jour avec tvsign")
         raise RuntimeError(f"recherche des Apple TV : {res.tail(2)}")
     found = []
     for line in res.output.splitlines():
