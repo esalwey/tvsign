@@ -195,6 +195,7 @@
             <p class="row__title" data-i18n="backup_export">Export a backup</p>
             <p class="row__sub" data-i18n="backup_export_sub">Database, Apple sessions, certificate keys and Apple TV pairings.</p>
             <label class="case"><input type="checkbox" id="backup-uploads"> <span data-i18n="backup_uploads">Include uploaded .ipa files</span></label>
+            <div><label class="case"><input type="checkbox" id="backup-certs"> <span data-i18n="backup_certs">Include imported certificates and their private keys</span></label></div>
           </div>
           <div class="row__buttons"><button class="row__action row__action--go" id="backup-export" type="button" data-i18n="export">Export</button></div>
         </div>
@@ -370,6 +371,41 @@
             </div>
           </div>
         </div>
+
+        <details class="details avance" id="edit-advanced">
+          <summary data-i18n="advanced">Advanced</summary>
+          <p class="group__header espace" data-i18n="ic_title">Signing</p>
+          <div class="list" role="radiogroup" data-i18n-aria="ic_method">
+            <label class="row row--choix"><input type="radio" name="sign_mode" value="apple_id">
+              <span class="row__label"><span class="row__title" data-i18n="ic_apple_id">Apple ID (free, renews every 7 days)</span></span></label>
+            <label class="row row--choix"><input type="radio" name="sign_mode" value="certificate">
+              <span class="row__label"><span class="row__title" data-i18n="ic_certificate">Imported certificate</span></span></label>
+          </div>
+          <div id="edit-cert-bloc" hidden>
+            <div class="list espace-haut">
+              <label class="field"><span data-i18n="ic_cert">Certificate</span><select name="cert_id"></select></label>
+              <div class="row" id="edit-cert-row" hidden>
+                <div class="row__label"><p class="row__sub" id="edit-cert-info"></p></div>
+                <div class="row__buttons">
+                  <button class="row__action" type="button" id="edit-cert-check" data-i18n="ic_check">Check revocation</button>
+                  <button class="row__action row__action--danger" type="button" id="edit-cert-remove" data-i18n="ic_remove">Remove</button>
+                </div>
+              </div>
+            </div>
+            <p class="group__header espace" data-i18n="ic_import_title">Import a certificate</p>
+            <div class="list">
+              <label class="field"><span data-i18n="ic_import_as">Import as</span><select name="cert_target"></select></label>
+              <label class="field"><span data-i18n="ic_p12">Certificate and key (.p12)</span><input type="file" name="cert_p12" accept=".p12,.pfx"></label>
+              <label class="field"><span data-i18n="ic_password">.p12 password</span><input name="cert_password" type="password" autocomplete="new-password" spellcheck="false"></label>
+              <label class="field"><span data-i18n="ic_profile">Profile (.mobileprovision)</span><input type="file" name="cert_profile" accept=".mobileprovision"></label>
+            </div>
+            <p class="erreur" id="edit-cert-error" role="alert"></p>
+            <p class="statut" id="edit-cert-ok" role="status"></p>
+            <div class="actions-form"><button class="btn" type="button" id="edit-cert-import" data-i18n="ic_import_btn">Check and save</button></div>
+          </div>
+          <p class="erreur" id="edit-cert-unavailable" role="status" hidden data-i18n="ic_unavailable">The cryptography package is missing on this server.</p>
+          <p class="group__footer" data-i18n="ic_note">For advanced use.</p>
+        </details>
         <p class="erreur" id="edit-error" role="alert"></p>
       </div>
     </form>

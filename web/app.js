@@ -31,6 +31,10 @@ const ICONS = {
 const OS_NAME = { tvos: "tvOS", ios: "iOS", ipados: "iPadOS", visionos: "visionOS" };
 const estMobile = (famille) => famille === "ios" || famille === "ipados";   // iPhone / iPad
 const platformOf = (famille) => (estMobile(famille) ? "iphoneos" : "appletvos");
+// Signature par un certificat importé (réglages de l'app › Avancé) : l'app n'est pas renouvelée tous les 7 jours
+const estCert = (a) => a.sign_mode === "certificate";
+const certDe = (a) => (STATE?.certs || []).find((c) => c.id === a.cert_id) || null;
+const certsDe = (deviceId) => (STATE?.certs || []).filter((c) => c.device_id === deviceId);
 
 async function api(path, opts = {}) {
   const { json, quiet, ...init } = opts;
@@ -161,6 +165,10 @@ function etatApp(a, now, s) {
   if (a.status === "error" && a.needs_action) return ["err", t("st_action")];
   if (a.status === "error") return ["err", exp && exp - now < 24 * 3600 ? t("st_failed_soon") : t("st_failed")];
   if (!exp) return ["warn", t("st_to_install")];
+  if (estCert(a)) {       // pas de renouvellement : seule la fin du certificat ou du profil est à prévoir
+    if (exp - now < 7 * 86400) return ["warn", t("st_cert_expiring")];
+    return a.tv_present === false ? ["warn", t("st_not_on_tv")] : ["ok", t("st_valid")];
+  }
   if (exp - now < fenetre) {
     // le moment est passé mais la plage horaire choisie n'est pas ouverte : rien n'est en retard
     if (a.window_wait && s.renew_window) return ["neutre", t("st_window", { h: s.renew_window[0] })];
@@ -224,7 +232,7 @@ function noteMaj(a, now) {
 function jauge(a, now, s, ton) {
   const exp = a.expires_at;
   if (!exp) return "";
-  const debut = a.signed_at && a.signed_at < exp ? a.signed_at : exp - 7 * 86400;
+  const debut = a.signed_at && a.signed_at < exp ? a.signed_at : exp - (estCert(a) ? 365 : 7) * 86400;
   const total = Math.max(1, exp - debut);
   const pct = Math.min(100, Math.max(0, ((exp - now) / total) * 100));
   const renouv = a.renew_at ?? exp - fenetreRenouv(a, s) * 3600;
@@ -237,9 +245,9 @@ function jauge(a, now, s, ton) {
         : `<span class="validite__chiffre validite__chiffre--err">${t("st_expired")}</span><span class="validite__unite">${t("no_longer_launches")}</span>`}</p>
       <div class="jauge jauge--${ton}" role="img" aria-label="${esc(label)}">
         <span class="jauge__plein" style="width:${pct.toFixed(1)}%"></span>
-        ${reste > 0 ? `<span class="jauge__repere" style="left:${(100 - posRenouv).toFixed(1)}%" title="${esc(t("auto_renewal"))}"></span>` : ""}
+        ${reste > 0 && !estCert(a) ? `<span class="jauge__repere" style="left:${(100 - posRenouv).toFixed(1)}%" title="${esc(t("auto_renewal"))}"></span>` : ""}
       </div>
-      <p class="validite__legende"><span>${esc(t("expires", { date: fmtDate(exp) }))}</span>${a.enabled && reste > 0 && a.status !== "error" && !a.running ? `<span>${esc(t("auto_renewal_when", { when: renouv <= now ? t("asap") : relatif(renouv, now) }))}</span>` : ""}</p>
+      <p class="validite__legende"><span>${esc(t("expires", { date: fmtDate(exp) }))}</span>${estCert(a) && reste > 0 ? `<span>${esc(t("ic_no_renewal"))}</span>` : a.enabled && reste > 0 && a.status !== "error" && !a.running ? `<span>${esc(t("auto_renewal_when", { when: renouv <= now ? t("asap") : relatif(renouv, now) }))}</span>` : ""}</p>
     </div>`;
 }
 
@@ -280,6 +288,17 @@ function versionRefusee(a) {
     </div>`;
 }
 
+// Certificat importé qui va finir (dans moins de 7 jours) : rien n'est renouvelé tout seul, il faut en importer un nouveau.
+function noteCert(a, now) {
+  if (!estCert(a) || !a.expires_at || a.expires_at - now >= 7 * 86400 || a.expires_at <= now) return "";
+  if (a.last_error && /^c_ic_/.test(enClair(a.last_error).cle || "")) return "";       // la carte d'erreur du certificat le dit déjà
+  return `<div class="probleme probleme--info" role="status">
+      <span class="probleme__ic">${ICONS.cle}</span>
+      <div class="probleme__texte"><p class="probleme__titre">${esc(t("ic_soon_t", { when: relatif(a.expires_at, now) }))}</p><p>${esc(t("ic_soon"))}</p></div>
+      <button class="btn btn--petit" data-edit="${a.id}" data-key="edit-c-${a.id}" aria-label="${esc(t("settings") + " " + a.name)}">${t("settings")}</button>
+    </div>`;
+}
+
 // Limites du compte gratuit repérées dans l'IPA (extensions, push, iCloud, domaines associés).
 function avertissementsApp(a) {
   const w = (a.warnings || "").split(",").filter(Boolean);
@@ -316,7 +335,8 @@ function problemeApp(a, now) {
     : ["c_lost", "c_legacy"].includes(e.cle) ? `<button class="btn btn--petit" data-open="dlg-pair">${t("pair")}</button>`
     : e.cle === "c_certlimit" ? `<a class="btn btn--petit" href="#/settings">${t("settings")}</a>`
     : e.cle === "c_ipa_missing" && a.source_type === "upload" ? `<button class="btn btn--petit" data-replace="${a.id}">${t("replace_ipa")}</button>`
-    : ["c_no_tv", "c_source", "c_bundle", "c_digest", "c_gh_missing", "c_no_release"].includes(e.cle) ? `<button class="btn btn--petit" data-edit="${a.id}" data-key="edit-p-${a.id}">${t("settings")}</button>` : "";
+    : ["c_no_tv", "c_source", "c_bundle", "c_digest", "c_gh_missing", "c_no_release", "c_ic_none", "c_ic_revoked", "c_ic_expired",
+       "c_ic_missing", "c_ic_device", "c_ic_profile"].includes(e.cle) ? `<button class="btn btn--petit" data-edit="${a.id}" data-key="edit-p-${a.id}">${t("settings")}</button>` : "";
   const details = e.brut && (e.brut.length > 110 || e.connu)
     ? `<details class="details" data-key="err-${a.id}"><summary>${t("tech_details")}</summary><pre class="log">${esc(nettoyer(e.brut) || e.brut)}</pre></details>` : "";
   return `<div class="probleme" role="group" aria-label="${esc(t("last_problem"))}">
@@ -357,6 +377,7 @@ function carteApp(a, now, s) {
     </div>
     ${jauge(a, now, s, ton)}
     ${noteApp(a, now)}
+    ${noteCert(a, now)}
     ${noteConfiance(a, now)}
     ${avertissementsApp(a)}
     ${problemeApp(a, now)}
@@ -364,7 +385,8 @@ function carteApp(a, now, s) {
     ${versionRefusee(a)}
     <dl class="meta">
       <div><dt>${t("device")}</dt><dd>${a.device_id ? esc(a.device_name || t("device")) : `<span class="texte-err">${t("none_m")}</span>`}</dd></div>
-      <div><dt>${t("account")}</dt><dd>${compte ? esc(compte) : t("default_account")}</dd></div>
+      ${estCert(a) ? `<div><dt>${t("ic_card_signing")}</dt><dd>${esc(t("ic_card_cert", { name: certDe(a)?.name || "?" }))}</dd></div>`
+        : `<div><dt>${t("account")}</dt><dd>${compte ? esc(compte) : t("default_account")}</dd></div>`}
       ${essai ? `<div><dt>${t("last_attempt")}</dt><dd>${essai}</dd></div>` : a.signed_at ? `<div><dt>${t("signed")}</dt><dd>${esc(relatif(a.signed_at, now))}</dd></div>` : ""}
       ${a.verified_at ? `<div><dt>${t("verified_on_tv")}</dt><dd>${esc(relatif(a.verified_at, now))}</dd></div>` : ""}
       ${a.bad_tag && !a.update_tag ? `<div><dt>${t("skipped_version")}</dt><dd class="mono">${esc(a.source_type === "url" ? redactUrl(a.bad_tag) : a.bad_tag)}</dd></div>` : ""}
@@ -388,7 +410,7 @@ function synthese(s, now) {
   const expirees = actives.filter((a) => a.expires_at && a.expires_at <= now);
   const echecs = actives.filter((a) => a.status === "error" || !a.device_id);
   const lim = 2 * ((h && h.check_interval) || 600) + 300;   // une passe ne fait que lancer les renouvellements (ils tournent à part)
-  const enRetard = actives.filter((a) => !a.running && a.status !== "error" && a.expires_at && a.expires_at > now
+  const enRetard = actives.filter((a) => !estCert(a) && !a.running && a.status !== "error" && a.expires_at && a.expires_at > now
     && (a.renew_at ?? a.expires_at - fenetreRenouv(a, s) * 3600) < now - lim);
   const arret = boucleArretee(h, now);
   const cours = s.apps.filter((a) => a.running);
@@ -403,9 +425,11 @@ function synthese(s, now) {
   if (attente.length) return ["warn", t("st_waiting_app"), t("wait_app_t", { name: attente.map((a) => a.name).join(", ") })];
   if (cours.length) return ["cours", t("st_renewing"), t("sum_running", { names: cours.map((a) => a.name).join(", ") })];
   if (!s.apps.length) return ["neutre", t("sum_empty_t"), t("sum_empty")];
-  const prochaine = actives.filter((a) => a.expires_at).sort((x, y) => x.expires_at - y.expires_at)[0];
+  const prochaine = actives.filter((a) => a.expires_at && !estCert(a)).sort((x, y) => x.expires_at - y.expires_at)[0];
+  const certifiee = actives.filter((a) => a.expires_at && estCert(a)).sort((x, y) => x.expires_at - y.expires_at)[0];
   // aucune app active avec un profil valide (toutes en pause, ou pas encore installées) : pas de « à jour » vert
-  if (!prochaine) return ["neutre", t("sum_idle_t"), t("sum_idle")];
+  if (!prochaine && !certifiee) return ["neutre", t("sum_idle_t"), t("sum_idle")];
+  if (!prochaine) return ["ok", t("sum_ok_t"), t("ic_sum_cert", { when: fmtDate(certifiee.expires_at) })];
   const quand = Math.max(now, prochaine.renew_at ?? prochaine.expires_at - fenetreRenouv(prochaine, s) * 3600);
   return ["ok", t("sum_ok_t"), t("sum_next", { when: quand <= now + 60 ? t("now") : relatif(quand, now) })];
 }
@@ -1070,8 +1094,105 @@ function openEdit(id) {
       && (x.account_email || x.effective_account || "") === compteApp && x.device_id === d.id));
   $("#edit-copy-bloc").hidden = !candidates.length || !a.device_id;
   $("#edit-copy-tv").innerHTML = candidates.map((d) => `<option value="${d.id}">${esc(d.name)}</option>`).join("");
+  // Avancé › signature : Apple ID (par défaut) ou certificat importé
+  const dispo = STATE.capabilities?.imported_cert !== false;
+  f.sign_mode.value = estCert(a) ? "certificate" : "apple_id";
+  f.querySelector('input[name="sign_mode"][value="certificate"]').disabled = !dispo && !estCert(a);
+  $("#edit-cert-unavailable").hidden = dispo;
+  $("#edit-advanced").open = estCert(a) || (a.status === "error" && /^c_ic_/.test(enClair(a.last_error).cle || ""));
+  for (const id of ["#edit-cert-error", "#edit-cert-ok"]) $(id).textContent = "";
+  f.cert_password.value = ""; f.cert_p12.value = ""; f.cert_profile.value = "";
+  syncSign(a.cert_id);
   $("#dlg-edit").showModal();
 }
+
+// ---------- signature par un certificat importé (réglages d'une app › Avancé) ----------
+const jour = (ts) => new Date(ts * 1000).toLocaleDateString(LOCALE(), { day: "numeric", month: "short", year: "numeric" });
+function infoCert(c) {
+  const etat = c.state === "revoked" ? t("ic_state_revoked") : c.state === "missing" ? t("ic_state_missing")
+    : c.state === "expired" ? t("ic_state_expired", { date: jour(c.expires_at) })
+    : t(c.state === "expiring" ? "ic_state_expiring" : "ic_state_ok", { date: jour(c.expires_at) });
+  const parts = [c.team_name || c.team_id, (c.platforms || []).join(" / "),
+    c.profile_app_id === "*" ? t("ic_scope_all") : t("ic_scope_ids", { id: c.profile_app_id }), etat];
+  if (c.checked_at) parts.push(t("ic_checked", { when: relatif(c.checked_at, maintenant()) }));
+  if ((c.apps || []).length) parts.push(t("ic_used_by", { apps: c.apps.join(", ") }));
+  return parts.filter(Boolean).join(" · ");
+}
+// Liste des certificats de l'appareil choisi dans la feuille, et façons d'importer (nouveau, ou remplacement du choisi).
+function syncSign(choisi) {
+  const f = $("#form-edit"), a = EDIT;
+  const cert = f.sign_mode.value === "certificate";
+  $("#edit-cert-bloc").hidden = !cert;
+  if (!cert) return;
+  const deviceId = +f.device_id.value || a.device_id;
+  const liste = deviceId ? certsDe(deviceId) : [];
+  const courant = choisi ?? (+f.cert_id.value || null);
+  f.cert_id.innerHTML = liste.length
+    ? liste.map((c) => `<option value="${c.id}" ${c.id === courant ? "selected" : ""}>${esc(c.name)}</option>`).join("")
+    : `<option value="">${esc(t(deviceId ? "ic_none_yet" : "ic_needs_device"))}</option>`;
+  if (liste.length && !liste.some((c) => c.id === courant)) f.cert_id.value = String(liste[0].id);
+  const c = liste.find((x) => String(x.id) === f.cert_id.value);
+  $("#edit-cert-row").hidden = !c;
+  $("#edit-cert-info").textContent = c ? infoCert(c) : "";
+  f.cert_target.innerHTML = `<option value="new">${esc(t("ic_as_new"))}</option>`
+    + (c ? `<option value="${c.id}">${esc(t("ic_as_replace", { name: c.name }))}</option>` : "");
+  if (c && ["expired", "revoked", "missing"].includes(c.state)) f.cert_target.value = String(c.id);
+  $("#edit-cert-import").disabled = !deviceId;
+}
+$("#form-edit").addEventListener("change", (e) => {
+  if (e.target.name === "sign_mode" || e.target.name === "device_id") syncSign();
+  else if (e.target.name === "cert_id") syncSign(+e.target.value || null);
+});
+$("#form-edit").elements.cert_password.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); $("#edit-cert-import").click(); }     // Entrée importe, elle n'enregistre pas la feuille
+});
+$("#edit-cert-import").onclick = async (ev) => {
+  const b = ev.currentTarget, f = $("#form-edit"), a = EDIT, err = $("#edit-cert-error"), ok = $("#edit-cert-ok");
+  err.textContent = ""; ok.textContent = "";
+  const p12 = f.cert_p12.files[0], profil = f.cert_profile.files[0];
+  if (!p12 || !profil) return (err.textContent = t("ic_import_missing"));
+  const fd = new FormData();
+  fd.append("device_id", +f.device_id.value || a.device_id);
+  fd.append("p12", p12); fd.append("profile", profil); fd.append("password", f.cert_password.value);
+  fd.append("app_id", a.id);
+  if (f.cert_target.value !== "new") fd.append("replace_id", f.cert_target.value);
+  await busy(b, "id", t("ic_importing"), async () => {
+    try {
+      const r = await api("/api/certs", { method: "POST", body: fd });
+      f.cert_password.value = ""; f.cert_p12.value = ""; f.cert_profile.value = "";
+      await refresh();
+      syncSign(r.cert.id);
+      ok.textContent = [t("ic_imported_t") + ".", t(f.cert_target.value === "new" ? "ic_imported" : "ic_replaced"),
+        ...(r.warnings || []).map((w) => t("ic_warn_" + w))].join(" ");
+    } catch (e) { err.textContent = e.message; }
+  });
+};
+$("#edit-cert-check").onclick = async (ev) => {
+  const b = ev.currentTarget, f = $("#form-edit"), id = +f.cert_id.value, err = $("#edit-cert-error"), ok = $("#edit-cert-ok");
+  err.textContent = ""; ok.textContent = "";
+  if (!id) return;
+  await busy(b, "id", t("checking"), async () => {
+    try {
+      const r = await api(`/api/certs/${id}/check`, { method: "POST" });
+      await refresh();
+      syncSign(id);
+      if (r.state === "revoked") err.textContent = t("ic_check_revoked_t");
+      else ok.textContent = r.state === "good" ? t("ic_check_good_t") : t("ic_check_unknown");
+    } catch (e) { err.textContent = e.message; }
+  });
+};
+$("#edit-cert-remove").onclick = async () => {
+  const f = $("#form-edit"), id = +f.cert_id.value, err = $("#edit-cert-error"), ok = $("#edit-cert-ok");
+  const c = (STATE?.certs || []).find((x) => x.id === id);
+  err.textContent = ""; ok.textContent = "";
+  if (!c || !confirm(t("ic_confirm_remove", { name: c.name }))) return;
+  try {
+    await api(`/api/certs/${id}`, { method: "DELETE" });
+    await refresh();
+    syncSign();
+    ok.textContent = t("ic_removed_t");
+  } catch (e) { err.textContent = e.message; }
+};
 $("#edit-copy").onclick = async () => {
   const a = EDIT, sel = $("#edit-copy-tv"), err = $("#edit-error"), btn = $("#edit-copy");
   if (!a || !sel.value) return;
@@ -1143,19 +1264,28 @@ $("#form-edit").addEventListener("submit", async (ev) => {
     if (!/^https:\/\//.test(src)) return (err.textContent = t("https_only"));
     if (src !== a.source) body.source = src;
   }
+  const mode = f.sign_mode.value;
+  if (mode !== (estCert(a) ? "certificate" : "apple_id")) body.sign_mode = mode;
+  if (mode === "certificate") {
+    const cid = +f.cert_id.value;
+    if (!cid) { $("#edit-advanced").open = true; return (err.textContent = t("ic_pick_one")); }
+    if (body.sign_mode || cid !== a.cert_id) { body.sign_mode = "certificate"; body.cert_id = cid; }
+  }
   if (a.source_type !== "upload" && (f.auto_update.value === "1") !== (a.auto_update !== 0)) body.auto_update = f.auto_update.value === "1";
   if (a.source_type === "github" && f.pinned_tag.value.trim() !== (a.pinned_tag || "")) body.pinned_tag = f.pinned_tag.value.trim();
   if (!Object.keys(body).length) return f.closest("dialog").close();
   if (body.account_email && !confirm(t("confirm_account_change", { name: a.name, email: body.account_email }))) return;
+  if (body.sign_mode && !confirm(t(body.sign_mode === "certificate" ? "ic_confirm_switch" : "ic_confirm_back", { name: a.name }))) return;
   const btn = $("#edit-submit");
   btn.disabled = true;
   try {
     await api(`/api/apps/${a.id}`, { method: "PATCH", json: body });
     f.closest("dialog").close();
-    const relance = "device_id" in body || "account_email" in body;
+    const relance = "device_id" in body || "account_email" in body || "sign_mode" in body || "cert_id" in body;
     let lance = null;
     if (relance && a.enabled) lance = await api(`/api/apps/${a.id}/renew`, { method: "POST" });   // nouvelle destination : installer tout de suite
-    flash("ok", t("saved_t"), !lance ? "" : lance.started === false ? " " + t("dest_after") : " " + t("dest_now"));
+    const seulementSignature = ("sign_mode" in body || "cert_id" in body) && !("device_id" in body || "account_email" in body);
+    flash("ok", t("saved_t"), !lance ? "" : lance.started === false ? " " + t("dest_after") : " " + t(seulementSignature ? "ic_sign_now" : "dest_now"));
   } catch (e) {
     err.textContent = e.message;
   } finally {
@@ -1865,7 +1995,8 @@ $("#backup-export").onclick = async (ev) => {
   err.textContent = "";
   await busy(b, "id", t("preparing"), async () => {
     try {
-      const r = await fetch("/api/backup/export" + ($("#backup-uploads").checked ? "?uploads=true" : ""), { credentials: "same-origin", headers: { "X-Tvsign": "1" } });
+      const options = [$("#backup-uploads").checked && "uploads=true", $("#backup-certs").checked && "certs=true"].filter(Boolean).join("&");
+      const r = await fetch("/api/backup/export" + (options ? "?" + options : ""), { credentials: "same-origin", headers: { "X-Tvsign": "1" } });
       if (!r.ok) {
         const data = await r.json().catch(() => ({}));
         if (r.status === 401) demarrer();

@@ -36,6 +36,13 @@ const CAUSES = [
   // Ces deux messages listent des numéros de série et des noms d'équipe : à tester avant les motifs génériques.
   [/CERT_LIMIT/, "c_certlimit"],
   [/NO_TEAM|MULTIPLE_TEAMS|TEAM_NOT_FOUND/, "c_team"],
+  // certificat importé (.p12 + profil) : les messages de imported_cert.py
+  [/aucun certificat importé/i, "c_ic_none"],
+  [/certificat importé révoqué/i, "c_ic_revoked"],
+  [/(certificat|profil)( ou profil)? importé expiré/i, "c_ic_expired"],
+  [/certificat importé (introuvable|illisible)/i, "c_ic_missing"],
+  [/certificat importé .{0,80}autre appareil/i, "c_ic_device"],
+  [/profil importé .{0,80}(est fait pour|ne couvre)|profil importé refusé|refusés? par le profil importé/i, "c_ic_profile"],
   [/adresse introuvable/i, "c_host_unresolved"],
   [/oubli de l'appairage/i, "c_forget_failed"],
   [/recherche des Apple TV/i, "c_discover_failed"],
@@ -185,6 +192,14 @@ const EVENEMENTS = [
   [/^Mot de passe de l'interface modifié$/, "ev_pw_changed", []],
   [/^Mot de passe de l'interface retiré$/, "ev_pw_removed", []],
   [/^Arrêt demandé : fin des renouvellements en cours avant de s'arrêter$/, "ev_stopping", []],
+  [/^Certificat importé « (.+) » ajouté pour « (.+) », valable jusqu'au (.+)$/, "ev_cert_added", ["name", "tv", "until"]],
+  [/^Certificat importé « (.+) » remplacé pour « (.+) », valable jusqu'au (.+)$/, "ev_cert_replaced", ["name", "tv", "until"]],
+  [/^Certificat importé « (.+) » supprimé$/, "ev_cert_removed", ["name"]],
+  [/^(.+) : signature avec le certificat importé « (.+) »$/, "ev_sign_cert", ["name", "cert"]],
+  [/^(.+) : installée avec le certificat importé \((.+)\), valable jusqu'au (.+) \(pas de renouvellement automatique.*\)$/, "ev_installed_cert", ["name", "trigger", "until"]],
+  [/^Certificat importé « (.+) » : expire le (.+) \((.+)\), importe-en un nouveau$/, "ev_cert_expiring", ["name", "until", "apps"]],
+  [/^Certificat importé « (.+) » révoqué \((.+)\) : (.+)$/, "ev_cert_revoked_ident", ["name", "why", "apps"]],
+  [/^(.+) : aucun certificat importé pour « (.+) », la copie se signe avec l'Apple ID$/, "ev_cert_copy_apple", ["name", "tv"]],
 ];
 function evenementTexte(message) {
   const brut = String(message || "");
@@ -203,7 +218,7 @@ function evenementTexte(message) {
 const declencheur = (x) => ({ auto: t("tr_auto"), manuel: t("tr_manual"), ajout: t("tr_added"), "nouvelle version": t("tr_new_version"),
   "nouvelle source": t("tr_new_source"), "nouvelle destination": t("tr_new_dest"), "présence": t("tr_presence"), "nouvelle IPA": t("tr_new_ipa"),
   "mise à jour": t("tr_update"), "retour arrière": t("tr_rollback"), reconnexion: t("tr_reconnect"), appairage: t("tr_paired"),
-  "nouvel appairage": t("tr_repaired"), "app absente": t("tr_missing") }[x] || x);
+  "nouvel appairage": t("tr_repaired"), "app absente": t("tr_missing"), "nouveau certificat": t("tr_new_cert") }[x] || x);
 
 // ---------- diagnostic ----------
 // Détail d'un contrôle : le serveur l'écrit en anglais (dossier de support) ; l'interface le traduit d'après son code et sa valeur.
