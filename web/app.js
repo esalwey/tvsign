@@ -96,7 +96,6 @@ const CAUSES = [
   [/(GrandSlam|GSA|developer services) (answered|returned) HTTP 50[234]|Apple answered HTTP 50[234] to the anisette|Apple répond HTTP 50[234]|50[234] Service Temporarily Unavailable/i, "c_gsa_503"],
   [/SMS 2FA refused|Access to this Apple Developer Service was denied|refuse les codes par SMS/i, "c_sms_denied"],
   [/-22411\b/, "c_never_signed_in"],
-  [/only accepts Windows anisette|ne fournit pas de données Windows/i, "c_anisette_unsupported"],
   [/-22421\b|-22409\b|-80009\b|MID is invalid|-45061|not provisioned/i, "c_anisette_refused"],
   [/anisette/i, "c_anisette"],
   [/reconnexion|-22406|HTTP Some\(401\)|unauthori[sz]ed|session .*(expir|invalid)|not logged|log ?in required/i, "c_session"],
@@ -1104,16 +1103,32 @@ const WIZ_RENDU = {
   },
 };
 
+// Serveurs anisette du diagnostic : chacun avec ce qu'il annonce (client info, user agent) ou la raison pour
+// laquelle il ne répond pas. Aucun n'est jugé sur la plateforme qu'il annonce : seul Apple dit si ses données conviennent.
+function lignesServeurs(v) {
+  const lignes = v.servers.map((s) => {
+    const dernier = v.last_good && v.last_good.server === s.url ? ` · ${esc(t("diag_server_last"))}` : "";
+    const annonce = s.reachable ? [s.client_info, s.user_agent].filter(Boolean).join(" · ") : s.error;
+    return `<p class="row__sub"><span class="etat etat--${s.reachable ? "ok" : "err"}">${t(s.reachable ? "diag_server_up" : "diag_server_down")}</span> <span class="mono">${esc(s.url)}</span>${dernier}<br><span class="mono">${esc(annonce)}</span></p>`;
+  });
+  if (v.override) {
+    const pair = [v.override.client_info, v.override.user_agent].filter(Boolean).join(" · ");
+    lignes.push(`<p class="row__sub">${esc(t("diag_override"))} <span class="mono">${esc(pair)}</span></p>`);
+  }
+  return lignes.join("");
+}
+
 function listeDiag(d) {
   return `<div class="list">${d.checks.map((c) => {
     const ton = c.status === "ok" ? "ok" : c.status === "warn" ? "warn" : "err";
     const conseil = c.status !== "ok" ? t(`diag_${c.id}_fix`) : "";
+    const detail = c.id === "anisette" && Array.isArray(c.value?.servers) ? lignesServeurs(c.value) : `<p class="row__sub">${esc(c.detail)}</p>`;
     return `<div class="row">
       <span class="row__icon row__icon--${COULEUR[ton]}">${c.status === "ok" ? ICONS.ok : ICONS.alerte}</span>
       <div class="row__label">
         <p class="row__title">${t("diag_" + c.id)}</p>
         <p class="row__sub"><span class="etat etat--${ton}">${t("diag_" + c.status)}</span>${c.id === "plumesign" && c.value ? ` · <span class="mono">${esc(c.value)}</span>` : ""}</p>
-        <p class="row__sub">${esc(c.detail)}</p>
+        ${detail}
         ${conseil && conseil !== `diag_${c.id}_fix` ? `<p class="row__sub">${esc(conseil)}</p>` : ""}
       </div>
     </div>`;

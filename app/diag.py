@@ -103,35 +103,44 @@ def _client_info(url: str) -> tuple[dict | None, str]:
     return data, ""
 
 
-def _windows(data: dict | None) -> bool:
-    """Le serveur annonce des données Windows. Un client_info qui n'est pas du texte (réponse JSON étrange)
-    ne l'est pas : jamais d'exception ici, le diagnostic doit toujours répondre."""
-    info = data.get("client_info") if isinstance(data, dict) else None
-    return isinstance(info, str) and "windows" in info.lower()
+def _server_line(url: str, data: dict | None, err: str) -> dict:
+    """Ce qu'on sait d'un serveur : joignable ou non, et le client info / user agent qu'il annonce. Un texte
+    étrange n'est jamais une exception ici, le diagnostic doit toujours répondre."""
+    if data is None:
+        return {"url": url, "reachable": False, "client_info": None, "user_agent": None, "error": err or "injoignable"}
+    user_agent = data.get("user_agent")
+    return {"url": url, "reachable": True, "client_info": data["client_info"].strip(),
+            "user_agent": user_agent.strip() if isinstance(user_agent, str) else None, "error": ""}
 
 
 async def _anisette() -> dict:
-    """Serveur anisette : joignable, et il fournit des données Windows (les seules qu'Apple accepte).
-    Avec le serveur par défaut, le serveur de repli prend le relais quand il ne répond pas."""
-    found = []
-    for url in settings.anisette_servers():
-        data, err = await asyncio.to_thread(_client_info, url)
-        found.append((url, data, err))
-        if _windows(data):
-            break
-    url, data, err = found[-1]
-    if _windows(data):
-        if len(found) > 1:
-            first_url, first_data, first_err = found[0]
-            why = first_err or f"répond « {first_data['client_info']} »"
-            return _check("anisette", "warn", f"{first_url} inutilisable ({why}) : repli sur {url}", url)
-        return _check("anisette", "ok", f"{url} : {data['client_info']}", url)
-    if data:
-        # plumesign refuse un tel serveur sans rien envoyer à Apple : les renouvellements échoueront
-        return _check("anisette", "error",
-                      f"{url} répond « {data['client_info']} » : Apple n'accepte que des données Windows, "
-                      "plumesign n'utilisera pas ce serveur (laisser le réglage vide pour le serveur par défaut)", url)
-    return _check("anisette", "error", " ; ".join(f"{u} : {e or 'données non Windows'}" for u, _, e in found), url)
+    """Serveurs anisette : chacun est interrogé (client info annoncé, joignable ou non). N'importe quel serveur
+    anisette v3 qui répond est utilisable, quelle que soit la plateforme qu'il annonce : seul Apple dit si les
+    données conviennent, et plumesign passe au serveur suivant quand l'un échoue ou qu'Apple refuse ses données."""
+    urls = settings.anisette_servers()
+    answers = await asyncio.gather(*(asyncio.to_thread(_client_info, url) for url in urls))
+    servers = [_server_line(url, data, err) for url, (data, err) in zip(urls, answers)]
+    last = plume.last_server()
+    forced = {"client_info": settings.anisette_client_info() or None,
+              "user_agent": settings.anisette_user_agent() or None}
+    value = {"servers": servers, "last_good": last, "override": forced if any(forced.values()) else None}
+
+    def line(s: dict) -> str:
+        return f"{s['url']} : {s['client_info']}" if s["reachable"] else f"{s['url']} : {s['error']}"
+
+    up = [s for s in servers if s["reachable"]]
+    extra = " ; identité client forcée par les réglages" if value["override"] else ""
+    if not up:
+        return _check("anisette", "error", "aucun serveur anisette ne répond : " + " ; ".join(line(s) for s in servers) + extra, value)
+    first = servers[0]
+    if first["reachable"]:
+        detail = line(first)
+        if servers[1:]:
+            detail += " ; en repli : " + " ; ".join(line(s) for s in servers[1:])
+        return _check("anisette", "ok", detail + extra, value)
+    return _check("anisette", "warn",
+                  f"{first['url']} ne répond pas ({first['error']}) : repli sur {up[0]['url']} ({up[0]['client_info']})"
+                  + extra, value)
 
 
 def _disk() -> dict:

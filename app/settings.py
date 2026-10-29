@@ -6,20 +6,22 @@ which are never exposed through /api/settings.
 """
 import os
 import re
-import urllib.parse
 
 from . import db
 
-# Serveur anisette par défaut de plumesign : il fournit des données Windows, les seules qu'Apple accepte
-# encore. Le serveur de repli prend le relais quand il ne répond pas (réglage vide seulement).
-DEFAULT_ANISETTE = "https://ani.jkcoxson.com"
-FALLBACK_ANISETTE = "https://ani2.stikstore.app"
-# Serveurs anisette « Android » : depuis le 12 octobre 2026 Apple refuse leurs données (erreur -80045,
-# puis HTTP 503). Une adresse qui pointe vers l'un d'eux est remplacée par le serveur par défaut.
-LEGACY_ANISETTE_HOSTS = frozenset({
-    "ani.sidestore.app", "ani.stikstore.app", "anisette.crystall1ne.dev",
-    "ani3server.fly.dev", "ani.jaydenha.uk", "omni.ethxn.xyz",
-})
+# Serveurs anisette essayés par plumesign, dans cet ordre (c'est aussi la liste de omnisette, voir
+# vendor/Impactor/PATCHES.md) : le premier qui répond et dont Apple accepte les données sert, et le dernier
+# qui a marché passe en tête la fois suivante. Aucune plateforme n'est imposée : la liste change au gré de
+# l'écosystème (Android jusqu'au 12 octobre 2026, Windows jusqu'au 22, macOS depuis), les données d'un serveur
+# partent avec le client info et le user agent qu'il annonce, et c'est la réponse d'Apple qui décide.
+DEFAULT_ANISETTE_SERVERS = (
+    "https://mac-ani.jkcoxson.com",
+    "https://ani.iloader.app",
+    "https://new.ani.sidestore.io",
+    "https://ani3.stikstore.app",
+    "https://ani.jkcoxson.com",
+)
+DEFAULT_ANISETTE = DEFAULT_ANISETTE_SERVERS[0]
 
 
 class Spec:
@@ -30,28 +32,6 @@ class Spec:
 def _url(value: str) -> None:
     if value and not re.match(r"^https?://[^\s/]+", value):
         raise ValueError("adresse http(s):// attendue")
-
-
-def anisette_host(url: str) -> str:
-    """Hôte (minuscules, sans port ni identifiants) d'une adresse de serveur anisette."""
-    value = (url or "").strip()
-    try:
-        parts = urllib.parse.urlsplit(value if "://" in value else "//" + value)
-        return (parts.hostname or "").lower().rstrip(".")
-    except ValueError:
-        return ""
-
-
-def is_legacy_anisette(url: str) -> bool:
-    """Serveur anisette Android, dont Apple refuse les données."""
-    return anisette_host(url) in LEGACY_ANISETTE_HOSTS
-
-
-def _anisette(value: str) -> None:
-    _url(value)
-    if value and is_legacy_anisette(value):
-        raise ValueError(f"serveur anisette Android, refusé par Apple depuis le 12 octobre 2026 : "
-                         f"laisser vide pour le serveur par défaut ({anisette_host(DEFAULT_ANISETTE)})")
 
 
 def _hours(value: float) -> None:
@@ -65,12 +45,32 @@ def _language(value: str) -> None:
         raise ValueError("auto, en ou fr")
 
 
+def _fallback(value: str) -> None:
+    if value not in ("on", "off"):
+        raise ValueError("on ou off")
+
+
+def _header(value: str) -> None:
+    """Une valeur d'en-tête HTTP : ASCII imprimable et espaces (plumesign ignorerait le reste)."""
+    if value and not all(c == " " or (c.isascii() and c.isprintable()) for c in value):
+        raise ValueError("caractères ASCII imprimables seulement")
+    if len(value) > 300:
+        raise ValueError("300 caractères au plus")
+
+
 PUBLIC: dict[str, Spec] = {
     "language": Spec("auto", str, ["TVSIGN_LANGUAGE"], _language),
     "ntfy_url": Spec("", str, ["TVSIGN_NTFY_URL"], _url),
     "renew_before_hours": Spec(60.0, float, ["TVSIGN_RENEW_BEFORE_HOURS"], _hours),
-    # vide = serveur par défaut de plumesign (DEFAULT_ANISETTE, repli FALLBACK_ANISETTE)
-    "anisette_url": Spec("", str, ["TVSIGN_ANISETTE_URL", "PLUMESIGN_ANISETTE_URL", "ANISETTE_URL_V3"], _anisette),
+    # vide = les serveurs par défaut de plumesign (DEFAULT_ANISETTE_SERVERS) ; une adresse est essayée en
+    # premier, les serveurs par défaut derrière elle (sauf si anisette_fallback = off)
+    "anisette_url": Spec("", str, ["TVSIGN_ANISETTE_URL", "PLUMESIGN_ANISETTE_URL", "ANISETTE_URL_V3"], _url),
+    # off : le serveur choisi est utilisé seul, sans repli sur les serveurs par défaut
+    "anisette_fallback": Spec("on", str, ["TVSIGN_ANISETTE_FALLBACK"], _fallback),
+    # Issue de secours, vide par défaut : le client info et le user agent envoyés à Apple à la place de ceux
+    # que le serveur annonce (ils vont par paire : changer les deux)
+    "anisette_client_info": Spec("", str, ["TVSIGN_ANISETTE_CLIENT_INFO", "PLUMESIGN_ANISETTE_CLIENT_INFO"], _header),
+    "anisette_user_agent": Spec("", str, ["TVSIGN_ANISETTE_USER_AGENT", "PLUMESIGN_ANISETTE_USER_AGENT"], _header),
 }
 
 
@@ -178,22 +178,6 @@ def update(values: dict) -> dict:
     return describe()
 
 
-def migrate() -> None:
-    """Au démarrage : un serveur anisette Android enregistré (réglage ou variable d'environnement) ne
-    marche plus, on le remplace par le serveur par défaut et on le dit dans le journal."""
-    stored = raw_get("anisette_url")
-    if stored and is_legacy_anisette(stored):
-        raw_set("anisette_url", None)
-        db.log(f"Serveur anisette {stored} remplacé par le serveur par défaut ({DEFAULT_ANISETTE}) : "
-               "Apple refuse les données des serveurs anisette Android depuis le 12 octobre 2026 "
-               "(erreur -80045)", "warn")
-    for name in PUBLIC["anisette_url"].envs:
-        value = os.environ.get(name, "").strip()
-        if value and is_legacy_anisette(value):
-            db.log(f"{name}={value} pointe vers un serveur anisette Android, refusé par Apple : ignoré, "
-                   f"le serveur par défaut ({DEFAULT_ANISETTE}) est utilisé. Retire cette variable.", "warn")
-
-
 def renew_before_hours() -> float:
     return float(get("renew_before_hours"))
 
@@ -203,9 +187,22 @@ def ntfy_url() -> str:
 
 
 def anisette_url() -> str:
-    """Serveur anisette choisi par l'utilisateur ; vide = serveur par défaut avec son serveur de repli.
-    Une adresse de serveur Android n'est jamais renvoyée (valeur invalide : défaut)."""
+    """Serveur anisette choisi par l'utilisateur, essayé en premier ; vide = les serveurs par défaut.
+    Aucun serveur n'est refusé d'après son nom : c'est sa réponse, puis celle d'Apple, qui décident."""
     return get("anisette_url")
+
+
+def anisette_fallback() -> bool:
+    """False si l'utilisateur a désactivé le repli sur les serveurs par défaut (serveur choisi seul)."""
+    return get("anisette_fallback") != "off"
+
+
+def anisette_client_info() -> str:
+    return get("anisette_client_info")
+
+
+def anisette_user_agent() -> str:
+    return get("anisette_user_agent")
 
 
 def same_server(a: str, b: str) -> bool:
@@ -214,9 +211,13 @@ def same_server(a: str, b: str) -> bool:
 
 
 def anisette_servers() -> list[str]:
-    """Serveurs que plumesign essaiera, dans l'ordre. Comme lui : le réglage vide, ou l'adresse par défaut
-    saisie telle quelle, donne le serveur par défaut et son repli ; tout autre serveur est utilisé seul."""
+    """Serveurs que plumesign essaiera, dans l'ordre, comme lui : le serveur choisi par l'utilisateur
+    d'abord, puis les serveurs par défaut (sans lui une seconde fois) ; le repli désactivé, le serveur
+    choisi est seul (sans serveur choisi : le premier des serveurs par défaut). Le dernier serveur qui a
+    marché passe en tête chez plumesign, ce que cette liste ne dit pas (voir plume.last_server)."""
     custom = anisette_url()
-    if custom and not same_server(custom, DEFAULT_ANISETTE):
-        return [custom]
-    return [DEFAULT_ANISETTE, FALLBACK_ANISETTE]
+    first = custom or DEFAULT_ANISETTE
+    servers = [first]
+    if anisette_fallback():
+        servers += [s for s in DEFAULT_ANISETTE_SERVERS if not same_server(s, first)]
+    return servers

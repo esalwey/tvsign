@@ -17,7 +17,7 @@ scripts\vendor-impactor.ps1 [-ImpactorDir path] [-Ref ref]   # Windows
 Only committed files are copied (`git archive`), never `target/` or local edits. The source commit
 is recorded in `vendor/Impactor/VENDORED.txt`.
 
-Some changes were made in place, not in the fork (for instance the Windows anisette of 1.0.1):
+Some changes were made in place, not in the fork (for instance the anisette servers and the Apple sign-in of 1.0.1 and 1.0.2):
 [`vendor/Impactor/PATCHES.md`](../vendor/Impactor/PATCHES.md) lists them. Port them to the fork before
 the next run of the script, otherwise the script overwrites them.
 

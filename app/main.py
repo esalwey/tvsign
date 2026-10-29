@@ -24,7 +24,6 @@ from .proc import SESSIONS
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     db.init()
-    settings.migrate()         # serveur anisette Android enregistré -> serveur par défaut
     backup.prune_old()
     auth.init()
     renew.startup()            # un renouvellement interrompu ne reste pas « en cours »
