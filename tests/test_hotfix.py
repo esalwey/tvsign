@@ -28,8 +28,9 @@ from app.proc import Result  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 ANISETTE_ENVS = ("TVSIGN_ANISETTE_URL", "PLUMESIGN_ANISETTE_URL", "ANISETTE_URL_V3", "TVSIGN_ANISETTE_FALLBACK",
                  "TVSIGN_ANISETTE_CLIENT_INFO", "PLUMESIGN_ANISETTE_CLIENT_INFO", "TVSIGN_ANISETTE_USER_AGENT",
-                 "PLUMESIGN_ANISETTE_USER_AGENT", "PLUMESIGN_ANISETTE_FALLBACK_URL")
-ANISETTE_SETTINGS = ("anisette_url", "anisette_fallback", "anisette_client_info", "anisette_user_agent")
+                 "PLUMESIGN_ANISETTE_USER_AGENT", "PLUMESIGN_ANISETTE_FALLBACK_URL", "TVSIGN_ANISETTE_SERVERS")
+ANISETTE_SETTINGS = ("anisette_url", "anisette_fallback", "anisette_client_info", "anisette_user_agent",
+                    "anisette_servers", "anisette_migrated")
 DEFAULTS = ["https://mac-ani.jkcoxson.com", "https://ani.iloader.app", "https://new.ani.sidestore.io",
             "https://ani3.stikstore.app", "https://ani.jkcoxson.com"]
 # Les serveurs que 1.0.1 refusait d'après leur nom (Android), et les deux serveurs « Windows » de ses défauts :
@@ -98,7 +99,7 @@ class ServerList(AnisetteCase):
         for value in (DEFAULTS[2], DEFAULTS[2] + "/", DEFAULTS[2].replace("new.", "NEW.")):
             settings.raw_set("anisette_url", value)
             servers = settings.anisette_servers()
-            self.assertEqual(servers[0], value.strip(), value)
+            self.assertEqual(servers[0], settings.normalize_server(value), value)
             self.assertEqual(len(servers), len(DEFAULTS), value)
             self.assertEqual(sum(settings.same_server(s, DEFAULTS[2]) for s in servers), 1, value)
 
@@ -117,16 +118,107 @@ class ServerList(AnisetteCase):
         self.assertTrue(settings.same_server("https://A.example/", "https://a.example"))
         self.assertFalse(settings.same_server("https://a.example", "https://b.example"))
 
-    def test_nothing_is_migrated_and_nothing_is_said_at_start(self):
-        # 1.0.1 remplaçait un serveur Android enregistré par le défaut, avec une ligne dans le journal
-        self.assertFalse(hasattr(settings, "migrate"))
-        for name in ("main.py", "backup.py"):
-            self.assertNotIn("settings.migrate", (ROOT / "app" / name).read_text(encoding="utf-8"), name)
+    def test_no_name_is_replaced_at_run_time_and_nothing_is_said_without_the_migration(self):
+        # 1.0.1 remplaçait un serveur Android enregistré par le défaut à chaque lecture ; ici une valeur
+        # enregistrée est lue telle quelle, quel que soit son nom (le nettoyage de migrate() est unique)
         for host in OLD_ANDROID + OLD_WINDOWS_DEFAULTS:
             settings.raw_set("anisette_url", f"https://{host}")
             self.assertEqual(settings.anisette_url(), f"https://{host}", host)         # gardé tel quel
             self.assertEqual(settings.describe()["anisette_url"]["source"], "db", host)
         self.assertEqual(self.logged, [])
+        self.assertIn("settings.migrate()", (ROOT / "app" / "main.py").read_text(encoding="utf-8"))
+
+    def test_the_cleanup_after_an_update_runs_once(self):
+        # 1.0.0 : un serveur Android enregistré passerait en tête de la liste ; il est effacé une fois
+        settings.raw_set("anisette_url", "https://ani.sidestore.app")
+        settings.migrate()
+        self.assertEqual(settings.anisette_url(), "")
+        self.assertEqual(settings.anisette_servers(), DEFAULTS)
+        self.assertTrue(any("ani.sidestore.app" in m for _, m in self.logged), self.logged)
+        self.assertIsNone(settings.raw_get("anisette_fallback"), "rien à désactiver : plus de serveur choisi")
+        # le même nom saisi après la mise à jour est un serveur comme un autre
+        settings.update({"anisette_url": "https://ani.sidestore.app"})
+        settings.migrate()
+        self.assertEqual(settings.anisette_url(), "https://ani.sidestore.app")
+
+    def test_a_server_chosen_before_the_update_stays_alone_as_it_was(self):
+        # 1.0.1 utilisait un serveur choisi seul : sans choix explicite, le repli sur les serveurs publics ne
+        # s'ouvre pas tout seul au profit de qui avait épinglé son serveur
+        settings.raw_set("anisette_url", "https://anisette.example.org")
+        settings.migrate()
+        self.assertEqual(settings.raw_get("anisette_fallback"), "off")
+        self.assertFalse(settings.anisette_fallback())
+        self.assertEqual(settings.anisette_servers(), ["https://anisette.example.org"])
+        self.assertEqual(plume.env()["PLUMESIGN_ANISETTE_FALLBACK_URL"], "none")
+        self.assertTrue(any("anisette.example.org" in m for _, m in self.logged), self.logged)
+        # le choix peut être refait
+        settings.update({"anisette_fallback": "on"})
+        settings.migrate()
+        self.assertTrue(settings.anisette_fallback())
+        self.assertEqual(settings.anisette_servers(), ["https://anisette.example.org"] + DEFAULTS)
+
+    def test_a_choice_already_made_and_a_fresh_install_are_left_alone(self):
+        settings.migrate()                       # installation neuve : rien d'écrit, sauf le drapeau
+        self.assertIsNone(settings.raw_get("anisette_fallback"))
+        settings.raw_set(settings.MIGRATED_KEY, None)
+        settings.raw_set("anisette_url", "https://anisette.example.org")
+        settings.raw_set("anisette_fallback", "on")
+        settings.migrate()
+        self.assertEqual(settings.raw_get("anisette_fallback"), "on")
+        self.assertEqual(settings.raw_get("anisette_url"), "https://anisette.example.org")
+
+    def test_the_list_of_servers_is_one_setting_for_tvsign_and_plumesign(self):
+        # la liste est lue de la même façon par plumesign (PLUMESIGN_ANISETTE_FALLBACK_URL) et par tvsign
+        # (diagnostic, dernier serveur), sans recompiler
+        settings.update({"anisette_servers": "https://a.example, https://b.example/ ; c.example"})
+        self.assertEqual(settings.anisette_servers(), ["https://a.example", "https://b.example", "https://c.example"])
+        self.assertEqual(plume.env()["PLUMESIGN_ANISETTE_FALLBACK_URL"],
+                         "https://a.example, https://b.example/ ; c.example")
+        # un serveur choisi passe devant la liste
+        settings.update({"anisette_url": "https://own.example"})
+        self.assertEqual(settings.anisette_servers()[0], "https://own.example")
+        self.assertEqual(len(settings.anisette_servers()), 4)
+        # le repli désactivé : le serveur choisi seul ; sans serveur choisi, le premier de la liste seul
+        settings.update({"anisette_fallback": "off"})
+        self.assertEqual(settings.anisette_servers(), ["https://own.example"])
+        settings.update({"anisette_url": ""})
+        self.assertEqual(settings.anisette_servers(), ["https://a.example"])
+        self.assertEqual(plume.env()["PLUMESIGN_ANISETTE_FALLBACK_URL"], "https://a.example")
+        settings.update({"anisette_fallback": "on", "anisette_servers": "none"})
+        self.assertEqual(settings.anisette_servers(), [DEFAULTS[0]])
+        # une adresse qui n'en est pas une est refusée, une liste vide rend les serveurs par défaut
+        with self.assertRaises(ValueError):
+            settings.update({"anisette_servers": "ftp://x.example"})
+        settings.update({"anisette_servers": None})
+        self.assertEqual(settings.anisette_servers(), DEFAULTS)
+        self.assertNotIn("PLUMESIGN_ANISETTE_FALLBACK_URL", plume.env())
+
+    def test_plumesigns_own_variable_is_a_source_of_the_list(self):
+        os.environ["PLUMESIGN_ANISETTE_FALLBACK_URL"] = "https://x.example https://y.example"
+        info = settings.describe()["anisette_servers"]
+        self.assertTrue(info["locked"])
+        self.assertEqual(info["env"], "PLUMESIGN_ANISETTE_FALLBACK_URL")
+        self.assertEqual(settings.anisette_servers(), ["https://x.example", "https://y.example"])
+        self.assertEqual(plume.env()["PLUMESIGN_ANISETTE_FALLBACK_URL"], "https://x.example https://y.example")
+        # la liste vue par tvsign est celle de plumesign : le dernier serveur qui a marché est lu pour elle
+        servers = settings.anisette_servers()
+        d = plume.STORE / plume.ANISETTE_DIR
+        d.mkdir(parents=True, exist_ok=True)
+        last = d / plume.LAST_SERVER_FILE
+        last.write_text(json.dumps({"server": servers[1], "servers": servers}), encoding="utf-8")
+        try:
+            self.assertEqual(plume.last_server()["server"], servers[1])
+        finally:
+            last.unlink(missing_ok=True)
+
+    def test_the_interface_shows_the_list_instead_of_a_host_name(self):
+        for name in ("index.html", "i18n.js"):
+            text = (ROOT / "web" / name).read_text(encoding="utf-8")
+            for line in text.splitlines():
+                if "anisette_note" in line or 'name="anisette_url"' in line:
+                    self.assertNotIn("jkcoxson", line, name)
+        self.assertIn("anisette-actual", (ROOT / "web" / "index.html").read_text(encoding="utf-8"))
+        self.assertIn("anisette-actual", (ROOT / "web" / "app.js").read_text(encoding="utf-8"))
 
     def test_old_values_in_the_environment_are_used_not_ignored(self):
         for name in ("TVSIGN_ANISETTE_URL", "PLUMESIGN_ANISETTE_URL", "ANISETTE_URL_V3"):
@@ -197,29 +289,89 @@ class LegacyIdentity(AnisetteCase):
         self.assertIn(f'pub const LAST_SERVER_FILE: &str = "{plume.LAST_SERVER_FILE}";', rust)
         self.assertIn('format!("{}.plist", server_key(server))', rust)
 
-    def test_resetting_the_identities_removes_all_of_them_and_not_twice_an_hour(self):
+    def test_resetting_forgets_the_identity_of_the_refused_server_only_and_not_twice_an_hour(self):
         for f in self.states:
             f.write_bytes(b"new")
         self.last.write_text("{}", encoding="utf-8")
         self.legacy[0].write_bytes(b"old")
-        plume._RESET_AT = 0.0
+        plume._RESET_AT.clear()
+        # plumesign a quitté le premier serveur pour le second : ce sont les données du second qu'Apple refuse
+        log = ("[2026-10-29T10:00:00Z WARN  plume_core::auth::account::login] Apple refuses the data (-22409): "
+               "the data of https://mac-ani.jkcoxson.com are given up, using https://ani.iloader.app instead")
         try:
-            self.assertTrue(plume.reset_anisette("test"))
-            for f in self.states:
-                self.assertFalse(f.exists(), f.name)
+            self.assertTrue(plume.reset_anisette("test", log))
+            self.assertTrue(self.states[0].exists(), "l'identité d'un serveur qui marche reste")
+            self.assertFalse(self.states[1].exists(), "celle du serveur refusé est oubliée")
             self.assertTrue(self.last.exists())          # quel serveur a marché n'est pas une identité
             self.assertTrue(self.legacy[0].exists())
-            self.states[0].write_bytes(b"newer")
-            self.assertFalse(plume.reset_anisette("test again"))       # moins d'une heure plus tard
-            self.assertTrue(self.states[0].exists())
+            self.assertTrue(any("ani.iloader.app" in m for _, m in self.logged), self.logged)
+            self.states[1].write_bytes(b"newer")
+            self.assertFalse(plume.reset_anisette("test again", log))      # moins d'une heure plus tard
+            self.assertTrue(self.states[1].exists())
+            # un autre serveur a sa propre garde : la sienne n'est pas entamée
+            self.assertTrue(plume.reset_anisette("other", "using https://mac-ani.jkcoxson.com instead"))
+            self.assertFalse(self.states[0].exists())
         finally:
-            plume._RESET_AT = 0.0
+            plume._RESET_AT.clear()
             self.legacy[0].unlink(missing_ok=True)
 
+    def test_without_a_switch_in_the_log_the_server_is_the_one_apple_accepted_last_or_the_first(self):
+        servers = settings.anisette_servers()
+        plume._RESET_AT.clear()
+        for f in self.states:
+            f.write_bytes(b"new")
+        # rien de retenu, pas de repli dans le journal : le premier de la liste
+        self.assertEqual(plume.refused_server("Authentication SRP error -22409: x"), servers[0])
+        self.last.write_text(json.dumps({"server": servers[1], "servers": servers}), encoding="utf-8")
+        self.assertEqual(plume.refused_server("Authentication SRP error -22409: x"), servers[1])
+        self.assertEqual(plume.refused_server("a using https://x.example instead b"), "https://x.example")
+        self.assertTrue(plume.reset_anisette("test"))
+        self.assertTrue(self.states[0].exists())
+        self.assertFalse(self.states[1].exists())
+        plume._RESET_AT.clear()
+
+    def test_the_file_name_of_an_identity_is_the_one_plumesign_computes(self):
+        # les mêmes cas que le test Rust a_server_key_is_a_safe_file_name_of_the_server
+        expected = {
+            "https://mac-ani.jkcoxson.com": "mac-ani.jkcoxson.com",
+            "https://MAC-ani.jkcoxson.com/": "mac-ani.jkcoxson.com",
+            "mac-ani.jkcoxson.com": "mac-ani.jkcoxson.com",
+            "http://mac-ani.jkcoxson.com": "mac-ani.jkcoxson.com",
+            "https://mac-ani.jkcoxson.com:443": "mac-ani.jkcoxson.com",
+            "https://u:p@mac-ani.jkcoxson.com./?a#b": "mac-ani.jkcoxson.com",
+            "http://127.0.0.1:6969": "127.0.0.1_6969",
+            "https://example.org/anisette/one": "example.org_anisette_one",
+            "": "server",
+            "https://": "server",
+            "https://con.example": "_con.example",
+            "https://nul": "_nul",
+        }
+        for url, key in expected.items():
+            self.assertEqual(plume.server_key(url), key, url)
+        long_key = plume.server_key("https://" + "a" * 200 + ".example.org")
+        self.assertLessEqual(len(long_key), 89)
+        self.assertNotEqual(long_key, plume.server_key("https://" + "b" * 200 + ".example.org"))
+        for nasty in ("../../etc/passwd", "https://a/b\\c", "https://[::1]:8080/", ".."):
+            key = plume.server_key(nasty)
+            self.assertTrue(key and not set(key) & set("/\\:"), (nasty, key))
+
     def test_nothing_to_reset_is_not_a_reset(self):
-        plume._RESET_AT = 0.0
+        plume._RESET_AT.clear()
         self.assertFalse(plume.reset_anisette("test"))
-        self.assertEqual(plume._RESET_AT, 0.0)
+        self.assertEqual(plume._RESET_AT, {})
+
+    def test_the_identity_of_an_earlier_version_goes_to_the_server_of_the_user(self):
+        # un serveur choisi reprend l'identité unique d'avant (même identifiant d'appareil, pas de nouveau
+        # provisionnement) ; sans serveur choisi elle est abandonnée
+        self.legacy[1].write_bytes(b"old")
+        settings.update({"anisette_url": "https://own.example"})
+        self.assertTrue(plume.note_legacy_anisette())
+        self.assertIn("https://own.example", self.logged[-1][1])
+        self.assertIn("reprise", self.logged[-1][1])
+        settings.update({"anisette_url": ""})
+        self.logged.clear()
+        self.assertTrue(plume.note_legacy_anisette())
+        self.assertIn("abandonnée", self.logged[-1][1])
 
     def test_the_server_that_worked_last_is_read_from_plumesigns_file(self):
         servers = settings.anisette_servers()
@@ -568,7 +720,7 @@ class Failures(unittest.TestCase):
         self.email = "classify@example.com"
         self.reset_calls = []
         self.saved = plume.reset_anisette
-        plume.reset_anisette = lambda reason: self.reset_calls.append(reason) or True
+        plume.reset_anisette = lambda reason, output="": self.reset_calls.append((reason, output)) or True
 
     def tearDown(self):
         plume.reset_anisette = self.saved
@@ -646,6 +798,29 @@ class Failures(unittest.TestCase):
         for output in (SYNC_22421, BAD_MD_22409, MID_80009):
             self.assertIsInstance(self.fail(output), plume.Transient, output)
         self.assertEqual(len(self.reset_calls), 3)
+
+    SWITCHED = ("[2026-10-29T10:00:00Z WARN  plume_core::auth::account::login] Apple refuses the data (-80045): the "
+                "data of https://mac-ani.jkcoxson.com are given up, using https://ani.iloader.app instead\n"
+                "[2026-10-29T10:00:01Z INFO  omnisette::remote_anisette_v3] anisette server https://ani.iloader.app "
+                "announces `x` with user agent `y`\n")
+
+    def test_the_message_holds_the_error_not_the_log_lines_of_a_server_switch(self):
+        # the journal of a switch says "Apple refuses the data (-80045)": it is not why the command failed, and
+        # the web interface would file an unrelated error under "Apple blocked"
+        e = self.fail(self.SWITCHED + "Error: Developer API error 8200: something about the team")
+        self.assertIsNot(type(e), plume.AppleRefused)
+        self.assertNotIn("-80045", str(e))
+        self.assertNotIn("given up", str(e))
+        self.assertIn("8200", str(e))
+        e = self.fail(self.SWITCHED + "Error: Anisette error: no anisette server could be used: a: x | b: y")
+        self.assertIsInstance(e, plume.Transient)
+        self.assertNotIn("-80045", str(e))
+        self.assertIn("no anisette server could be used", str(e))
+
+    def test_the_reset_goes_to_the_server_the_log_names(self):
+        self.fail(self.SWITCHED + SYNC_22421)
+        self.assertEqual(len(self.reset_calls), 1)
+        self.assertEqual(plume.refused_server(self.reset_calls[0][1]), "https://ani.iloader.app")
 
     def test_anything_else_stays_a_plain_error(self):
         e = self.fail("Error: NO_TEAM: this Apple ID has no developer team")
@@ -1069,7 +1244,7 @@ class LoginSession(unittest.TestCase):
         self.scenario = None
         self.resets = []
         self.real_reset = plume.reset_anisette
-        plume.reset_anisette = lambda reason: self.resets.append(reason) or True
+        plume.reset_anisette = lambda reason, output="": self.resets.append((reason, output)) or True
         self.logged = []
         self.real_log = db.log
         db.log = lambda message, level="info", app_id=None: self.logged.append((level, message))
@@ -1242,11 +1417,14 @@ class DocumentationMatchesDefaults(unittest.TestCase):
     def test_settings_help_text(self):
         i18n = (ROOT / "web" / "i18n.js").read_text(encoding="utf-8")
         note = next(l for l in i18n.splitlines() if l.lstrip().startswith("anisette_note"))
-        self.assertIn("mac-ani.jkcoxson.com", note)
+        # the note names no host: the interface shows the list the settings really resolve to
+        self.assertNotIn("jkcoxson", note)
+        self.assertNotIn("iloader", note)
         for old in self.OLD_RULES + ("ani2.stikstore.app",):
             self.assertNotIn(old, i18n, old)
         html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
-        self.assertIn(f'placeholder="{settings.DEFAULT_ANISETTE}"', html)
+        self.assertNotIn(settings.DEFAULT_ANISETTE, html)
+        self.assertIn('name="anisette_servers"', html)
         self.assertNotIn("ani.sidestore.app", html)
         for old in self.OLD_RULES + ("ani2.stikstore.app",):
             self.assertNotIn(old, html, old)

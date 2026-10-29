@@ -28,6 +28,7 @@ async def lifespan(_: FastAPI):
     auth.init()
     renew.startup()            # un renouvellement interrompu ne reste pas « en cours »
     plume.import_existing_store()
+    settings.migrate()         # nettoyage unique des rÃ©glages anisette d'une version prÃ©cÃ©dente
     plume.note_legacy_anisette()
     await devices.sync_store()
     if settings.raw_get("onboarded") is None and (db.rows("SELECT id FROM apps LIMIT 1")
@@ -695,6 +696,9 @@ def app_delete(app_id: int):
 def settings_get(request: Request):
     return {
         "settings": settings.describe(),
+        # les serveurs anisette rÃ©ellement essayÃ©s, dans l'ordre, et ceux par dÃ©faut : l'interface les montre
+        # au lieu de les recopier en dur
+        "anisette": {"servers": settings.anisette_servers(), "defaults": list(settings.DEFAULT_ANISETTE_SERVERS)},
         "auth": {"enabled": auth.enabled(), "has_password": auth.has_password(),
                  "password_from_env": bool(auth.PASSWORD_ENV), "trusted": auth.trusted(request)},
         "version": VERSION,

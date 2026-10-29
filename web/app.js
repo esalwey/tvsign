@@ -1204,6 +1204,8 @@ async function chargerReglages() {
     label.querySelector(".verrou")?.remove();
     if (s.locked) label.insertAdjacentHTML("beforeend", `<span class="verrou" title="${esc(t("set_by_env", { env: s.env }))}">${esc(s.env)}</span>`);
   }
+  const actual = $("#anisette-actual");
+  if (actual) actual.textContent = Array.isArray(REGLAGES.anisette?.servers) ? t("anisette_actual", { list: REGLAGES.anisette.servers.join(" â ") }) : "";
   $("#version").textContent = REGLAGES.version;
   // des apps importées : sans leur .ipa dans la sauvegarde, elles sont à réimporter après une restauration
   const cb = $("#backup-uploads");

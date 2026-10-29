@@ -141,17 +141,19 @@
       <section class="group">
         <h2 class="group__header" data-i18n="signing_service">Signing service</h2>
         <div class="list">
-          <label class="field"><span data-i18n="anisette_server">Anisette server</span><input name="anisette_url" type="url" placeholder="https://mac-ani.jkcoxson.com" autocomplete="off" spellcheck="false"></label>
+          <label class="field"><span data-i18n="anisette_server">Anisette server</span><input name="anisette_url" type="url" placeholder="https://…" autocomplete="off" spellcheck="false"></label>
           <label class="field"><span data-i18n="anisette_fallback">If it fails</span>
             <select name="anisette_fallback">
               <option value="on" data-i18n="anisette_fallback_on">Try the default servers</option>
               <option value="off" data-i18n="anisette_fallback_off">Try no other server</option>
             </select></label>
         </div>
-        <p class="group__footer" data-i18n="anisette_note">Used to sign in to Apple. Leave empty: tvsign tries mac-ani.jkcoxson.com, then the other default servers, and keeps the one that worked. A server of your own is tried first.</p>
+        <p class="group__footer" data-i18n="anisette_note">Used to sign in to Apple. Leave empty: tvsign tries the default servers one after the other and keeps the one that worked. A server of your own is tried first.</p>
+        <p class="group__footer" id="anisette-actual"></p>
         <details class="journal-bloc espace-haut">
           <summary class="group__header" data-i18n="anisette_advanced">Advanced</summary>
           <div class="list">
+            <label class="field"><span data-i18n="anisette_servers">Server list</span><input name="anisette_servers" type="text" placeholder="https://…, https://…" autocomplete="off" spellcheck="false"></label>
             <label class="field"><span data-i18n="anisette_client_info">Client info</span><input name="anisette_client_info" type="text" placeholder="&lt;Mac15,7&gt; &lt;macOS;27.0;26A5378j&gt; &lt;com.apple.AuthKit/1 (com.apple.akd/1.0)&gt;" autocomplete="off" spellcheck="false"></label>
             <label class="field"><span data-i18n="anisette_user_agent">User agent</span><input name="anisette_user_agent" type="text" placeholder="akd/1.0 CFNetwork/811.5.4" autocomplete="off" spellcheck="false"></label>
           </div>

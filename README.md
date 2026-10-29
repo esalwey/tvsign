@@ -191,19 +191,31 @@ changes every few weeks (the servers have produced Android, then Windows, then m
 - Each server has its own anisette identity (device identifier and provisioning), so switching servers
   never reuses what another one provisioned: the files `anisette/<server>.plist` in the `PlumeImpactor`
   folder, created by themselves and provisioned again whenever the server or Apple says one is not valid.
-  The single identity of the previous versions (`state.plist`, `anisette-state-windows.plist`) is deleted.
+  The single identity of the previous versions (`state.plist`, `anisette-state-windows.plist`) is kept for a
+  server you chose yourself, where it is still valid (same device identifier, nothing provisioned again), and
+  deleted once any server has used it or a default server saves its own: the default servers serve other data
+  than they did then.
 - A server you choose yourself (Settings, or `TVSIGN_ANISETTE_URL`) is tried first, with the default servers
   behind it. Set Settings › "If this server fails" to "Try no other server" (or `TVSIGN_ANISETTE_FALLBACK=off`)
-  to use it alone. No server is refused or replaced because of its name: the servers of the earlier
-  versions are ordinary servers now, and a setting that names one is kept.
-- To change the default list without a new version, set `PLUMESIGN_ANISETTE_FALLBACK_URL` in the environment
-  of tvsign: the servers to try behind the first one, separated by spaces or commas (`none` for no other).
+  to use it alone. A server chosen before the update (1.0.1 used it alone) stays alone: the update sets
+  "Try no other server" once, so that your Apple ID's anisette traffic does not start going to public servers
+  by itself; switch it back to "Try the default servers" to get the failover. No server is refused or
+  replaced because of its name: the servers of the earlier versions are ordinary servers now, and a setting
+  that names one is kept (only a server of version 1.0.0 still stored by the update is cleared, once).
+- To change the list without a new version, when one of the default servers is retired: Settings › Advanced ›
+  "Server list", `TVSIGN_ANISETTE_SERVERS` or `PLUMESIGN_ANISETTE_FALLBACK_URL` in the environment of tvsign.
+  The servers to try, separated by spaces or commas, replace the default list (behind your own server, when
+  you chose one; `none` for no other). Settings shows the servers really tried, in order, and the
+  diagnostic, `last-server.json` and `plumesign` all use that same list.
 - Escape hatch (advanced, empty by default): Settings › Advanced, `TVSIGN_ANISETTE_CLIENT_INFO` and
   `TVSIGN_ANISETTE_USER_AGENT` replace the client info and the user agent sent to Apple. They go as a
   pair; for example `<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>` with
   `akd/1.0 CFNetwork/811.5.4`. `plumesign` reads `PLUMESIGN_ANISETTE_CLIENT_INFO` and
   `PLUMESIGN_ANISETTE_USER_AGENT`. `PLUMESIGN_ANISETTE_ALLOW_ANY_PLATFORM` of version 1.0.1 is still
-  accepted and does nothing.
+  accepted and does nothing. Three more values of `plumesign` follow Apple's tools and can be changed in the
+  same way: `PLUMESIGN_XCODE_VERSION` (the Xcode version sent), `PLUMESIGN_ANISETTE_BAG_CLIENT_INFO` (the Mac
+  client info of the second lookup of Apple's provisioning addresses) and `PLUMESIGN_ANISETTE_CLIENT_ID` (the
+  client identifier written in place of `com.apple.dt.Xcode`, or `keep`).
 - Settings › Diagnostics lists each server, whether it answers and what it announces. `plumesign` writes
   which server it tried, why it left one, and which one it keeps in its log lines.
 - Accounts that were already connected keep renewing as long as Apple accepts their session. If it
@@ -216,8 +228,9 @@ If signing in still fails:
   type it. Codes by text message are refused by Apple for now (HTTP 403): use a trusted Apple device.
 - **`-22411`**: this Apple ID has never signed in on an Apple device. Sign it in once on an iPhone,
   iPad, Mac or Apple TV, then try again.
-- **`-80045`**: with the default servers, tvsign has already tried the data of each one, once. Apple refuses
-  this account or this connection. It is not a tvsign problem and retrying makes it worse (Apple limits the
+- **`-80045`**: tvsign has tried the data of one other server at most (and none when the server that worked last
+  is the one refused: its data were fine a moment ago). Apple refuses this account or this connection. It is
+  not a tvsign problem and retrying makes it worse (Apple limits the
   attempts): wait several hours, from another network if you can, then sign in once. Apps already installed
   keep working until they expire.
 - **HTTP 503**: Apple's servers are busy (tvsign tries once more, then takes the data of the next anisette
@@ -419,20 +432,32 @@ version 1.0.2 :
   ne réutilise jamais ce qu'un autre a provisionné. Ce sont les fichiers `anisette/<serveur>.plist` du dossier
   `PlumeImpactor`, créés tout seuls et provisionnés de nouveau chaque fois que le serveur ou Apple dit que l'un
   n'est plus valide. L'identité unique des versions précédentes (`state.plist`, `anisette-state-windows.plist`)
-  est supprimée.
+  est reprise par un serveur que vous avez choisi, où elle reste valide (même identifiant d'appareil, rien à
+  provisionner de nouveau), et supprimée dès qu'un serveur s'en est servi ou qu'un serveur par défaut enregistre
+  la sienne : les serveurs par défaut servent d'autres données qu'à l'époque.
 - Un serveur choisi par vos soins (Réglages, ou `TVSIGN_ANISETTE_URL`) est essayé en premier, les serveurs par
   défaut derrière lui. Réglages › « Si ce serveur échoue » sur « N'en essayer aucun autre » (ou
-  `TVSIGN_ANISETTE_FALLBACK=off`) l'utilise seul. Aucun serveur n'est refusé ni remplacé d'après son nom : les
-  serveurs des versions précédentes sont des serveurs comme les autres, et un réglage qui en désigne un est gardé.
-- Pour changer la liste par défaut sans nouvelle version, définir `PLUMESIGN_ANISETTE_FALLBACK_URL` dans
-  l'environnement de tvsign : les serveurs à essayer derrière le premier, séparés par des espaces ou des
-  virgules (`none` pour aucun autre).
+  `TVSIGN_ANISETTE_FALLBACK=off`) l'utilise seul. Un serveur choisi avant la mise à jour (1.0.1 l'utilisait
+  seul) le reste : la mise à jour règle une fois « N'en essayer aucun autre », pour que le trafic anisette de
+  votre Apple ID ne parte pas tout seul vers des serveurs publics ; remettez « Essayer les serveurs par défaut »
+  pour avoir le repli. Aucun serveur n'est refusé ni remplacé d'après son nom : les serveurs des versions
+  précédentes sont des serveurs comme les autres, et un réglage qui en désigne un est gardé (seul un serveur de
+  la version 1.0.0 encore enregistré est effacé par la mise à jour, une fois).
+- Pour changer la liste sans nouvelle version, le jour où l'un des serveurs par défaut est retiré : Réglages ›
+  Avancé › « Liste des serveurs », `TVSIGN_ANISETTE_SERVERS` ou `PLUMESIGN_ANISETTE_FALLBACK_URL` dans
+  l'environnement de tvsign. Les serveurs à essayer, séparés par des espaces ou des virgules, remplacent la
+  liste par défaut (derrière votre serveur, si vous en avez choisi un ; `none` pour aucun autre). Les Réglages
+  montrent les serveurs réellement essayés, dans l'ordre, et le diagnostic, `last-server.json` et `plumesign`
+  utilisent tous cette même liste.
 - Issue de secours (avancé, vide par défaut) : Réglages › Avancé, `TVSIGN_ANISETTE_CLIENT_INFO` et
   `TVSIGN_ANISETTE_USER_AGENT` remplacent le client info et le user agent envoyés à Apple. Ils vont par
   paire ; par exemple `<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>` avec
   `akd/1.0 CFNetwork/811.5.4`. `plumesign` lit `PLUMESIGN_ANISETTE_CLIENT_INFO` et
   `PLUMESIGN_ANISETTE_USER_AGENT`. `PLUMESIGN_ANISETTE_ALLOW_ANY_PLATFORM` de la version 1.0.1 est toujours
-  acceptée et ne fait plus rien.
+  acceptée et ne fait plus rien. Trois autres valeurs de `plumesign` suivent les outils d'Apple et se changent
+  de la même façon : `PLUMESIGN_XCODE_VERSION` (la version d'Xcode envoyée), `PLUMESIGN_ANISETTE_BAG_CLIENT_INFO`
+  (le client info Mac de la seconde recherche des adresses de provisionnement d'Apple) et
+  `PLUMESIGN_ANISETTE_CLIENT_ID` (l'identifiant client écrit à la place de `com.apple.dt.Xcode`, ou `keep`).
 - Réglages › Diagnostic liste chaque serveur, s'il répond et ce qu'il annonce. `plumesign` écrit dans ses
   lignes de journal quel serveur il a essayé, pourquoi il en est parti et lequel il garde.
 - Les comptes déjà connectés continuent d'être renouvelés tant qu'Apple accepte leur session. Sinon le
@@ -446,7 +471,8 @@ Si la connexion échoue encore :
   403) : utilisez un appareil Apple de confiance.
 - **`-22411`** : cet Apple ID n'a jamais été connecté sur un appareil Apple. Connectez-le une fois sur
   un iPhone, un iPad, un Mac ou une Apple TV, puis réessayez.
-- **`-80045`** : avec les serveurs par défaut, tvsign a déjà essayé les données de chacun, une fois. Apple
+- **`-80045`** : tvsign a essayé les données d'un autre serveur au plus (et d'aucun si le serveur qui a marché
+  en dernier est celui refusé : ses données étaient bonnes il y a un instant). Apple
   refuse ce compte ou cette connexion. Ce n'est pas un problème de tvsign et insister l'aggrave (Apple
   limite les essais) : attendez plusieurs heures, depuis un autre réseau si possible, puis connectez-vous une
   seule fois. Les apps déjà installées continuent de fonctionner jusqu'à leur expiration.
