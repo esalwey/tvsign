@@ -54,7 +54,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # ---------- 3. runtime ----------
 FROM python:${PYTHON_VERSION}-slim-${DEBIAN}
-ARG TVSIGN_VERSION=1.0.1-dev
+ARG TVSIGN_VERSION=1.0.2-dev
 RUN apt-get update \
     && apt-get install -y --no-install-recommends tini tzdata ca-certificates \
     && (command -v setpriv >/dev/null || apt-get install -y --no-install-recommends setpriv) \
