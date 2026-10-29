@@ -4,7 +4,7 @@ mod utils;
 
 pub use apple_codesign::{AppleCodesignError, SettingsScope, SigningSettings, UnifiedSigner};
 
-pub use omnisette::{AnisetteConfiguration, DEFAULT_ANISETTE_URL_V3};
+pub use omnisette::{AnisetteConfiguration, ClientOverrides, DEFAULT_ANISETTE_SERVERS_V3, DEFAULT_ANISETTE_URL_V3};
 
 pub use utils::{CertificateIdentity, MachO, MachOExt, MobileProvision};
 

@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::Error;
 
 use crate::auth::Account;
-use crate::auth::account::snippet;
+use crate::auth::account::{MAX_SERVER_SWITCHES, snippet};
 use crate::auth::anisette_data::AnisetteData;
 use crate::developer::qh::QHResponseMeta;
 use crate::developer::v1::V1ErrorResponse;
@@ -61,7 +61,50 @@ impl DeveloperSession {
     /// first request fails for such an identity, ask GrandSlam once (a throwaway Apple ID, no
     /// account is touched) and try again with synchronized data. Best effort: the first error is the
     /// one reported when the synchronization does not happen.
+    ///
+    /// A portal that answers HTTP 503 (its page, not a plist) is refusing the data of the anisette
+    /// server in use, or is overloaded: the data of the next server are tried, once per server. The
+    /// server whose data the portal accepts is remembered for the next time.
     pub(crate) async fn new_synchronizing(
+        adsid: String,
+        xcode_gs_token: String,
+        anisette: AnisetteData,
+    ) -> Result<Self, Error> {
+        let mut anisette = anisette;
+        let mut switches = 0;
+        loop {
+            let tried = Self::new_synchronizing_with(adsid.clone(), xcode_gs_token.clone(), anisette.clone()).await;
+            match tried {
+                Err(first @ Error::DeveloperHttp { status: 503, .. }) if switches < MAX_SERVER_SWITCHES => {
+                    switches += 1;
+                    match anisette.from_other_server().await {
+                        Ok(Some(next)) => {
+                            log::warn!(
+                                "the developer portal refuses the data of {} ({first}): using {} instead",
+                                anisette.server.as_deref().unwrap_or("the anisette server"),
+                                next.server.as_deref().unwrap_or("another anisette server")
+                            );
+                            anisette = next;
+                        }
+                        Ok(None) => return Err(first),
+                        Err(e) => {
+                            log::warn!("the other anisette servers cannot be used either: {e}");
+                            return Err(first);
+                        }
+                    }
+                }
+                Ok(session) => {
+                    // the portal accepted these data: this server is the one to try first next time
+                    session.anisette.lock().await.confirm_server();
+                    return Ok(session);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// [`Self::new_synchronizing`] with the data of one server.
+    async fn new_synchronizing_with(
         adsid: String,
         xcode_gs_token: String,
         anisette: AnisetteData,

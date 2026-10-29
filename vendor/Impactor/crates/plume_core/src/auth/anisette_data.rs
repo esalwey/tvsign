@@ -26,6 +26,10 @@ pub struct AnisetteData {
     /// The anisette identity was provisioned while these headers were produced: Apple has never
     /// seen it, its first GrandSlam request will be answered with hsc 434 (synchronize).
     pub fresh_identity: bool,
+    /// The anisette server that produced these data (`None` when they did not come from one of the
+    /// servers of the configuration). The identity, the synchronization and Apple's verdict on the
+    /// data all belong to this server.
+    pub server: Option<String>,
 }
 
 /// The client info as the server reported it. Only a client identifier that GrandSlam blocks
@@ -52,6 +56,7 @@ impl AnisetteData {
     pub async fn new(config: AnisetteConfiguration) -> Result<Self, Error> {
         let mut b = AnisetteHeaders::get_anisette_headers_provider(config.clone())?;
         let base_headers = b.provider.get_authentication_headers().await?;
+        let server = b.provider.server_used();
 
         Ok(AnisetteData {
             base_headers,
@@ -62,8 +67,35 @@ impl AnisetteData {
                 .unwrap_or_else(|| DEFAULT_USER_AGENT.to_string()),
             fresh_identity: b.provider.identity_is_new(),
             // the server that answered is the first one tried by the next refresh
-            config: config.set_preferred_url_v3(b.provider.server_used()),
+            config: config.set_preferred_url_v3(server.clone()),
+            server,
         })
+    }
+
+    /// Apple answered about the account: it accepts the data of the server that produced these. That
+    /// server is the one to try first next time, by this process and by the next ones.
+    pub fn confirm_server(&self) {
+        if let Some(server) = &self.server {
+            omnisette::remember_server(
+                self.config.configuration_path(),
+                self.config.configured_servers_v3(),
+                server,
+            );
+        }
+    }
+
+    /// Apple refuses the data of the server that produced these (or the server fails to go on with
+    /// them): the data of the next server, which this sign-in then keeps to. `None` when there is no
+    /// other server left to try.
+    pub async fn from_other_server(&self) -> Result<Option<Self>, Error> {
+        let mut config = self.config.clone();
+        let Some(refused) = self.server.clone().or_else(|| config.servers_v3().first().cloned()) else {
+            return Ok(None);
+        };
+        if !config.refuse_server_v3(&refused) {
+            return Ok(None);
+        }
+        Self::new(config).await.map(Some)
     }
 
     pub fn needs_refresh(&self) -> bool {
@@ -88,9 +120,16 @@ impl AnisetteData {
     /// that has lost the identity (-45061) makes a new one instead: the data are then those of an
     /// identity Apple has never seen (`fresh_identity`), which is asked to synchronize in its turn.
     pub async fn resync(&self, sim: &str) -> Result<Self, Error> {
-        let mut b = AnisetteHeaders::get_anisette_headers_provider(self.config.clone())?;
+        // the sim belongs to the identity of the server that produced the data: it goes to that
+        // server and to no other one, which could do nothing with it
+        let config = match &self.server {
+            Some(server) => self.config.only_server_v3(server),
+            None => self.config.clone(),
+        };
+        let mut b = AnisetteHeaders::get_anisette_headers_provider(config)?;
         let headers = b.provider.resync_anisette_headers(sim).await?;
         let base_headers = b.provider.normalize_headers(headers);
+        let server = b.provider.server_used();
 
         Ok(AnisetteData {
             base_headers,
@@ -100,7 +139,8 @@ impl AnisetteData {
                 .user_agent()
                 .unwrap_or_else(|| self.user_agent.clone()),
             fresh_identity: b.provider.identity_is_new(),
-            config: self.config.clone().set_preferred_url_v3(b.provider.server_used()),
+            config: self.config.clone().set_preferred_url_v3(server.clone()),
+            server,
         })
     }
 
@@ -207,6 +247,7 @@ mod tests {
             config: AnisetteConfiguration::default(),
             user_agent: "akd/1.0 CFNetwork/808.1.4".to_string(),
             fresh_identity: false,
+            server: None,
         }
     }
 

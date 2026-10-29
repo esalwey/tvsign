@@ -5,8 +5,10 @@
 //! the new anisette data, the two-factor decisions (code already pushed, SMS refused), the retries of a
 //! shed request and the absence of any retry of a refusal like -80045, the identity that Apple does not
 //! know (-45061: provisioned again through the imitation of the anisette server and of Apple's
-//! provisioning service, then synchronized in its turn), the switch to the other anisette server when
-//! Apple refuses the data of the first, and the developer portal's view of the same data.
+//! provisioning service, then synchronized in its turn), the switch to the next anisette server when
+//! Apple refuses the data of the first (-80045, an HTML 503, -45061 or -22421 that stay), the memory of
+//! the server Apple accepted, the client info and user agent whatever the servers announce (or the
+//! override that replaces them), and the developer portal's view of the same data.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -17,7 +19,7 @@ use std::time::SystemTime;
 
 use aes::cipher::{BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
 use hmac::{Hmac, KeyInit, Mac};
-use omnisette::AnisetteConfiguration;
+use omnisette::{AnisetteConfiguration, ClientOverrides};
 use plist::{Dictionary, Value};
 use sha2::{Digest, Sha256};
 use srp::groups::G2048;
@@ -26,8 +28,15 @@ use crate::Error;
 use crate::auth::anisette_data::AnisetteData;
 use crate::auth::{Account, TEST_GSA_HOST, TwoFactorAction, TwoFactorMethod, TwoFactorRequest};
 
+/// What the anisette servers announce today (October 2026): a Mac.
+const CLIENT_INFO: &str = "<MacBookPro13,3> <Mac OS X;10.12.6;16G29> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
+const USER_AGENT: &str = "akd/1.0 CFNetwork/811.5.4 Darwin/16.7.0";
+/// What they announced until 2026-10-22: Windows. And the Android of the servers of September. Nothing
+/// in the sign-in depends on which: the pair of the server goes to Apple, and Apple's answer decides.
 const WINDOWS: &str = "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iTunes/12.12.4.1)>";
-const USER_AGENT: &str = "akd/1.0 CFNetwork/808.1.4";
+const WINDOWS_USER_AGENT: &str = "akd/1.0 CFNetwork/808.1.4";
+const ANDROID: &str = "<Pixel 7> <Android;13;TQ3A.230901.001> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
+const ANDROID_USER_AGENT: &str = "akd/1.0 CFNetwork/978.0.7";
 const SIM: &str = "AAAABBGFET7Nxs5itiAQRCfpaNWSpTdMIEYMyWrRJwE=";
 const BEFORE_SYNC: &str = "otp-before-sync";
 const AFTER_SYNC: &str = "otp-after-sync";
@@ -221,20 +230,48 @@ fn serve_with_provisioning(
 
 // ---------------------------------------------------------------- the anisette server
 
-/// An anisette server whose plain `get_headers` give the one-time password `plain_otp` (and
-/// `AFTER_SYNC` when Apple's synchronization data come with the request). It also speaks the
-/// provisioning socket; the third result is the identifiers that were provisioned through it.
-fn anisette_server_giving(
+/// The one-time password a server whose plain one is `plain` gives once Apple's synchronization data
+/// came with the request.
+fn synced_otp(plain: &str) -> String {
+    if plain == BEFORE_SYNC {
+        AFTER_SYNC.to_string()
+    } else {
+        format!("{plain}-synced")
+    }
+}
+
+/// An anisette server that announces `client_info` and `user_agent`, whose plain `get_headers` give
+/// the one-time password `plain_otp` (and its synchronized one when Apple's synchronization data come
+/// with the request). It also speaks the provisioning socket; the third result is the identifiers
+/// that were provisioned through it.
+fn anisette_server_announcing(
     plain_otp: &'static str,
+    client_info: &'static str,
+    user_agent: &'static str,
 ) -> (String, Arc<Mutex<Vec<Req>>>, Arc<Mutex<Vec<String>>>) {
+    anisette_server(plain_otp, client_info, user_agent, false)
+}
+
+/// [`anisette_server_announcing`]; with `fails_to_synchronize` the server answers an error to the
+/// request that carries Apple's synchronization data (but gives plain data without them).
+fn anisette_server(
+    plain_otp: &'static str,
+    client_info: &'static str,
+    user_agent: &'static str,
+    fails_to_synchronize: bool,
+) -> (String, Arc<Mutex<Vec<Req>>>, Arc<Mutex<Vec<String>>>) {
+    let synced = synced_otp(plain_otp);
     serve_with_provisioning(move |req| match req.path.as_str() {
         "/v3/client_info" => Resp::json(
             200,
-            &format!(r#"{{"client_info":"{WINDOWS}","user_agent":"{USER_AGENT}"}}"#),
+            &format!(r#"{{"client_info":"{client_info}","user_agent":"{user_agent}"}}"#),
         ),
         "/v3/get_headers" => {
             let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
-            let otp = if body.get("sim").is_some() { AFTER_SYNC } else { plain_otp };
+            if fails_to_synchronize && body.get("sim").is_some() {
+                return Resp::json(500, r#"{"result":"GetHeadersError","message":"ADI error -1: cannot synchronize"}"#);
+            }
+            let otp = if body.get("sim").is_some() { synced.as_str() } else { plain_otp };
             Resp::json(
                 200,
                 &format!(
@@ -246,36 +283,42 @@ fn anisette_server_giving(
     })
 }
 
-const STATE_FILE: &str = "anisette-state-windows.plist";
+/// An anisette server announcing a Mac, as they all do now.
+fn anisette_server_giving(
+    plain_otp: &'static str,
+) -> (String, Arc<Mutex<Vec<Req>>>, Arc<Mutex<Vec<String>>>) {
+    anisette_server_announcing(plain_otp, CLIENT_INFO, USER_AGENT)
+}
 
-/// A configuration whose anisette server is `url`, with a fallback, and whose identity is already
-/// provisioned.
-fn anisette_config_with_fallback(url: &str, fallback: Option<&str>) -> (AnisetteConfiguration, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("plume-flow-{}", rand::random::<u64>()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join(STATE_FILE),
-        r#"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict>
+const STATE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict>
 <key>keychain_identifier</key><data>CQkJCQkJCQkJCQkJCQkJCQ==</data>
-<key>adi_pb</key><data>AQID</data></dict></plist>"#,
-    )
-    .unwrap();
+<key>adi_pb</key><data>AQID</data></dict></plist>"#;
+
+/// A configuration whose anisette servers are `urls`, in this order, and whose identity with each of
+/// them is already provisioned (one file per server, as plumesign keeps them).
+fn anisette_config(urls: &[&str]) -> (AnisetteConfiguration, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("plume-flow-{}", rand::random::<u64>()));
+    for url in urls {
+        let path = omnisette::remote_anisette_v3::state_path(&dir, url);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, STATE_XML).unwrap();
+    }
     let config = AnisetteConfiguration::default()
-        .set_anisette_url_v3(url.to_string())
-        .set_fallback_url_v3(fallback.map(str::to_string))
+        .set_servers_v3(urls.iter().map(|url| url.to_string()).collect())
         .set_configuration_path(dir.clone());
     (config, dir)
 }
 
-/// The device identifier the identity stored in `dir` has now.
-fn stored_identifier(dir: &std::path::Path) -> Vec<u8> {
-    plist::Value::from_file(dir.join(STATE_FILE))
-        .unwrap()
-        .as_dictionary()
+/// The device identifier the identity stored in `dir` for `server` has now (empty when there is none).
+fn stored_identifier(dir: &std::path::Path, server: &str) -> Vec<u8> {
+    plist::Value::from_file(omnisette::remote_anisette_v3::state_path(dir, server))
+        .ok()
+        .as_ref()
+        .and_then(Value::as_dictionary)
         .and_then(|d| d.get("keychain_identifier"))
         .and_then(Value::as_data)
-        .unwrap()
-        .to_vec()
+        .map(<[u8]>::to_vec)
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------- GrandSlam
@@ -321,6 +364,12 @@ struct Apple {
     /// Requests that carry this one-time password get the HTML 503 page: Apple refuses the data of
     /// the server that produced it.
     refuse_otp: Option<&'static str>,
+    /// Requests that carry one of these one-time passwords get this error code and message (-80045:
+    /// Apple refuses the data of the server that produced it).
+    refuse_otp_with: Vec<(&'static str, i64, &'static str)>,
+    /// Requests that carry one of these one-time passwords are told to synchronize (hsc 434), however
+    /// many times they have been.
+    ask_sync_otps: Vec<&'static str>,
     state: Mutex<State>,
 }
 
@@ -339,6 +388,8 @@ impl Apple {
             needs_sync: false,
             stale_otp: None,
             refuse_otp: None,
+            refuse_otp_with: Vec::new(),
+            ask_sync_otps: Vec::new(),
             state: Mutex::new(State::default()),
         }
     }
@@ -459,7 +510,10 @@ impl Apple {
                 status(vec![("ec", int(-45061)), ("em", string("The provisioning is not valid."))]),
             )]);
         }
-        if self.needs_sync && otp == BEFORE_SYNC {
+        if let Some((_, ec, em)) = self.refuse_otp_with.iter().find(|(refused, _, _)| *refused == otp) {
+            return response(vec![("Status", status(vec![("ec", int(*ec)), ("em", string(em))]))]);
+        }
+        if (self.needs_sync && otp == BEFORE_SYNC) || self.ask_sync_otps.contains(&otp) {
             return response(vec![(
                 "Status",
                 status(vec![
@@ -570,12 +624,18 @@ struct Run {
     anisette_url: String,
     /// What the first anisette server received.
     anisette: Vec<Req>,
-    /// What the other anisette servers received (the fallback), in order.
+    /// What the other anisette servers received (the ones behind the first), in order.
     other_anisette: Vec<Vec<Req>>,
     /// The identifiers (base64) that were provisioned through the anisette servers' sockets.
     provisioned: Vec<String>,
-    /// The device identifier of the stored anisette identity when the sign-in ended.
+    /// The device identifier of the stored anisette identity with the first server when the sign-in
+    /// ended.
     identifier: Vec<u8>,
+    /// The URLs of all the anisette servers of the configuration, in order (dead ones included).
+    urls: Vec<String>,
+    /// The server the configuration folder remembers as the one Apple accepted, when the sign-in
+    /// ended.
+    remembered: Option<String>,
 }
 
 impl Run {
@@ -625,11 +685,22 @@ struct Scenario {
     apple: Apple,
     password: &'static str,
     answers: Vec<TwoFactorAction>,
-    /// The one-time password that each anisette server gives to a plain request; the first server is
-    /// the primary, the second the fallback.
+    /// The one-time password that each anisette server gives to a plain request, in the order the
+    /// servers are configured.
     servers: Vec<&'static str>,
     /// The one-time password of the anisette data the sign-in starts with.
     initial_otp: &'static str,
+    /// The client info and user agent the anisette servers announce.
+    announces: (&'static str, &'static str),
+    /// Servers that are down (nothing listens), configured before the others.
+    dead_servers: usize,
+    /// The client info and user agent to send instead of what the servers announce.
+    overrides: ClientOverrides,
+    /// Start from the anisette servers themselves (`Account::login`, as plumesign does) instead of
+    /// from data made by the test.
+    from_servers: bool,
+    /// Indexes of the servers that fail when they are given Apple's synchronization data.
+    failing_sync: Vec<usize>,
 }
 
 impl Scenario {
@@ -640,56 +711,77 @@ impl Scenario {
             answers: Vec::new(),
             servers: vec![BEFORE_SYNC],
             initial_otp: BEFORE_SYNC,
+            announces: (CLIENT_INFO, USER_AGENT),
+            dead_servers: 0,
+            overrides: ClientOverrides::default(),
+            from_servers: false,
+            failing_sync: Vec::new(),
         }
     }
+}
+
+/// The URL of a server that is down: a port nobody listens to.
+fn dead_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    format!("http://{}", listener.local_addr().unwrap())
 }
 
 fn run_scenario(scenario: Scenario) -> Run {
     let apple = Arc::new(scenario.apple);
     let handler = apple.clone();
     let (apple_url, apple_seen) = serve(move |req| handler.handle(req));
-    let servers: Vec<_> = scenario.servers.iter().map(|otp| anisette_server_giving(otp)).collect();
-    let (config, dir) = anisette_config_with_fallback(
-        &servers[0].0,
-        servers.get(1).map(|server| server.0.as_str()),
-    );
+    let (client_info, user_agent) = scenario.announces;
+    let servers: Vec<_> = scenario
+        .servers
+        .iter()
+        .enumerate()
+        .map(|(i, otp)| anisette_server(otp, client_info, user_agent, scenario.failing_sync.contains(&i)))
+        .collect();
+    let dead: Vec<String> = (0..scenario.dead_servers).map(|_| dead_url()).collect();
+    let urls: Vec<String> = dead.iter().cloned().chain(servers.iter().map(|server| server.0.clone())).collect();
+    let (config, dir) = anisette_config(&urls.iter().map(String::as_str).collect::<Vec<_>>());
+    let config = config.set_client_overrides(scenario.overrides.clone());
 
     let mut base_headers = HashMap::new();
-    base_headers.insert("X-Mme-Client-Info".to_string(), WINDOWS.to_string());
+    base_headers.insert("X-Mme-Client-Info".to_string(), client_info.to_string());
     base_headers.insert("X-Apple-I-MD".to_string(), scenario.initial_otp.to_string());
     base_headers.insert("X-Apple-I-MD-M".to_string(), "machine".to_string());
     base_headers.insert("X-Mme-Device-Id".to_string(), "09090909-0909-0909-0909-090909090909".to_string());
     let anisette = AnisetteData {
         base_headers,
         generated_at: SystemTime::now(),
-        config,
-        user_agent: USER_AGENT.to_string(),
+        config: config.clone(),
+        user_agent: user_agent.to_string(),
         fresh_identity: false,
+        server: Some(servers[0].0.clone()),
     };
 
     let prompts = Mutex::new(Vec::new());
     let answers = Mutex::new(VecDeque::from(scenario.answers));
     let password = scenario.password;
+    let ask_credentials = || Ok(("Test.User@Example.com".to_string(), password.to_string()));
+    let ask_code = |request: TwoFactorRequest| {
+        prompts.lock().unwrap().push(request);
+        answers
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| "no answer scripted".to_string())
+    };
     // the sign-in runs on this thread: Apple, and the provisioning of a new identity, are local
     TEST_GSA_HOST.with(|host| *host.borrow_mut() = Some(apple_url.clone()));
     omnisette::remote_anisette_v3::set_lookup_url_for_tests(Some(format!(
         "{apple_url}/grandslam/GsService2/lookup"
     )));
-    let result = block_on(Account::login_with_anisette(
-        || Ok(("Test.User@Example.com".to_string(), password.to_string())),
-        |request: TwoFactorRequest| {
-            prompts.lock().unwrap().push(request);
-            answers
-                .lock()
-                .unwrap()
-                .pop_front()
-                .ok_or_else(|| "no answer scripted".to_string())
-        },
-        anisette,
-    ));
+    let result = if scenario.from_servers {
+        block_on(Account::login(ask_credentials, ask_code, config))
+    } else {
+        block_on(Account::login_with_anisette(ask_credentials, ask_code, anisette))
+    };
     omnisette::remote_anisette_v3::set_lookup_url_for_tests(None);
     TEST_GSA_HOST.with(|host| *host.borrow_mut() = None);
-    let identifier = stored_identifier(&dir);
+    let identifier = stored_identifier(&dir, &servers[0].0);
+    let remembered = omnisette::remote_anisette_v3::remembered_server(&dir, &urls);
     let _ = std::fs::remove_dir_all(dir);
 
     let received = |server: &(String, Arc<Mutex<Vec<Req>>>, Arc<Mutex<Vec<String>>>)| server.1.lock().unwrap().clone();
@@ -702,6 +794,8 @@ fn run_scenario(scenario: Scenario) -> Run {
         other_anisette: servers[1..].iter().map(received).collect(),
         provisioned: servers.iter().flat_map(|server| server.2.lock().unwrap().clone()).collect(),
         identifier,
+        urls,
+        remembered,
     }
 }
 
@@ -788,7 +882,7 @@ fn every_grandslam_request_carries_the_client_info_and_user_agent_of_the_anisett
     run.result.as_ref().unwrap();
     assert!(run.apple.len() >= 6);
     for req in &run.apple {
-        assert_eq!(req.headers["x-mme-client-info"], WINDOWS, "{} {}", req.method, req.path);
+        assert_eq!(req.headers["x-mme-client-info"], CLIENT_INFO, "{} {}", req.method, req.path);
         assert_eq!(req.headers["user-agent"], USER_AGENT, "{} {}", req.method, req.path);
         assert_eq!(req.headers["connection"], "close");
         assert_eq!(req.headers["x-apple-app-info"], "com.apple.gs.xcode.auth");
@@ -960,7 +1054,7 @@ fn a_provisioning_that_stays_invalid_is_not_made_again_for_ever() {
 }
 
 #[test]
-fn minus_80045_is_reported_and_never_sent_again() {
+fn minus_80045_with_a_single_server_is_reported_and_never_sent_again() {
     let mut apple = Apple::new(TwoFa::None);
     apple.refuse_init = Some((-80045, "This action cannot be completed at this time."));
     let run = run(apple, vec![]);
@@ -969,7 +1063,9 @@ fn minus_80045_is_reported_and_never_sent_again() {
         error.to_string(),
         "Authentication SRP error -80045: This action cannot be completed at this time."
     );
+    // no other server to take data from: the refusal is the answer, asked once
     assert_eq!(run.service_requests().len(), 1);
+    assert_eq!(run.remembered, None, "Apple did not accept these data");
 }
 
 #[test]
@@ -1004,6 +1100,219 @@ fn an_apple_that_keeps_asking_for_codes_ends_the_login() {
     let error = run.result.as_ref().unwrap_err();
     assert!(error.to_string().contains("keeps asking"), "{error}");
     assert_eq!(run.prompts.len(), 4);
+}
+
+// ---------------------------------------------------------------- several anisette servers
+
+const REFUSED_80045: &str = "This action cannot be completed at this time.";
+
+#[test]
+fn minus_80045_for_the_data_of_a_server_gets_the_data_of_the_next_one() {
+    let mut apple = Apple::new(TwoFa::None);
+    apple.refuse_otp_with = vec![("otp-first", -80045, REFUSED_80045)];
+    let run = run_scenario(Scenario {
+        servers: vec!["otp-first", BEFORE_SYNC],
+        initial_otp: "otp-first",
+        ..Scenario::new(apple)
+    });
+    run.result.as_ref().unwrap();
+
+    // the refusal is not repeated to the same server: init with the second server's data, then complete
+    assert_eq!(run.operations(), ["init", "init", "complete"]);
+    assert_eq!(otps(&run), ["otp-first", BEFORE_SYNC, BEFORE_SYNC]);
+    // the first server was not asked for new data, the second was, once
+    assert!(run.anisette.iter().all(|r| r.path != "/v3/get_headers"));
+    assert_eq!(run.other_anisette[0].iter().filter(|r| r.path == "/v3/get_headers").count(), 1);
+    // the one Apple accepted is remembered, for the next process
+    assert_eq!(run.remembered.as_deref(), Some(run.urls[1].as_str()));
+}
+
+#[test]
+fn minus_80045_from_every_server_is_reported_after_one_request_to_each() {
+    let mut apple = Apple::new(TwoFa::None);
+    apple.refuse_otp_with = vec![
+        ("otp-a", -80045, REFUSED_80045),
+        ("otp-b", -80045, REFUSED_80045),
+        ("otp-c", -80045, REFUSED_80045),
+    ];
+    let run = run_scenario(Scenario {
+        servers: vec!["otp-a", "otp-b", "otp-c"],
+        initial_otp: "otp-a",
+        ..Scenario::new(apple)
+    });
+    let error = run.result.as_ref().unwrap_err();
+    assert_eq!(error.to_string(), format!("Authentication SRP error -80045: {REFUSED_80045}"));
+    assert_eq!(otps(&run), ["otp-a", "otp-b", "otp-c"], "one request per server, none repeated");
+    assert_eq!(run.remembered, None, "no server was accepted");
+}
+
+#[test]
+fn the_servers_are_tried_in_their_order_until_apple_accepts_one() {
+    let mut apple = Apple::new(TwoFa::None);
+    apple.refuse_otp_with = vec![("otp-a", -80045, REFUSED_80045), ("otp-b", -80009, "MID is invalid.")];
+    apple.refuse_otp = Some("otp-c");
+    let run = run_scenario(Scenario {
+        servers: vec!["otp-a", "otp-b", "otp-c", BEFORE_SYNC, "otp-never-asked"],
+        initial_otp: "otp-a",
+        ..Scenario::new(apple)
+    });
+    run.result.as_ref().unwrap();
+    // -80045, -80009, the HTML 503 (tried twice), then the data Apple takes; the last one is not asked
+    assert_eq!(otps(&run), ["otp-a", "otp-b", "otp-c", "otp-c", BEFORE_SYNC, BEFORE_SYNC]);
+    assert!(run.other_anisette[3].iter().all(|r| r.path != "/v3/get_headers"));
+    assert_eq!(run.remembered.as_deref(), Some(run.urls[3].as_str()));
+}
+
+#[test]
+fn a_synchronization_that_does_not_take_gives_way_to_the_next_server() {
+    // minus 22421 again after the synchronization: the data of this server are not good
+    let mut apple = Apple::new(TwoFa::None);
+    apple.ask_sync_otps = vec!["otp-a", "otp-a-synced"];
+    let run = run_scenario(Scenario {
+        servers: vec!["otp-a", BEFORE_SYNC],
+        initial_otp: "otp-a",
+        ..Scenario::new(apple)
+    });
+    run.result.as_ref().unwrap();
+    assert_eq!(run.operations(), ["init", "init", "init", "complete"]);
+    assert_eq!(otps(&run), ["otp-a", "otp-a-synced", BEFORE_SYNC, BEFORE_SYNC]);
+    // the synchronization went to the server whose data Apple asked for it, and to that one only
+    let sims = |requests: &[Req]| requests.iter().filter(|r| r.path == "/v3/get_headers").count();
+    assert_eq!(sims(&run.anisette), 1);
+    assert_eq!(sims(&run.other_anisette[0]), 1, "the next server gives plain data, not the sim of another");
+    let second: Vec<serde_json::Value> = run.other_anisette[0]
+        .iter()
+        .filter(|r| r.path == "/v3/get_headers")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert!(second[0].get("sim").is_none());
+}
+
+#[test]
+fn a_server_that_cannot_synchronize_gives_way_to_the_next_one_which_never_sees_the_sim() {
+    let mut apple = Apple::new(TwoFa::None);
+    apple.ask_sync_otps = vec!["otp-a"];
+    let run = run_scenario(Scenario {
+        servers: vec!["otp-a", BEFORE_SYNC],
+        initial_otp: "otp-a",
+        failing_sync: vec![0],
+        ..Scenario::new(apple)
+    });
+    run.result.as_ref().unwrap();
+    // asked to synchronize, the server errors, the next server's plain data are used
+    assert_eq!(run.operations(), ["init", "init", "complete"]);
+    assert_eq!(otps(&run), ["otp-a", BEFORE_SYNC, BEFORE_SYNC]);
+    let bodies = |requests: &[Req]| -> Vec<serde_json::Value> {
+        requests
+            .iter()
+            .filter(|r| r.path == "/v3/get_headers")
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect()
+    };
+    let first = bodies(&run.anisette);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0]["sim"], SIM, "the sim went to the server whose data Apple asked to synchronize");
+    let second = bodies(&run.other_anisette[0]);
+    assert_eq!(second.len(), 1);
+    assert!(second[0].get("sim").is_none(), "the sim of one identity means nothing to another server");
+    assert_eq!(run.remembered.as_deref(), Some(run.urls[1].as_str()));
+}
+
+#[test]
+fn minus_45061_that_stays_after_a_new_identity_gets_the_data_of_the_next_server() {
+    let mut apple = Apple::new(TwoFa::None);
+    apple.stale_otp = Some("otp-stale");
+    let run = run_scenario(Scenario {
+        servers: vec!["otp-stale", BEFORE_SYNC],
+        initial_otp: "otp-stale",
+        ..Scenario::new(apple)
+    });
+    run.result.as_ref().unwrap();
+    // -45061, a new identity (still -45061: the server gives the same data), then the next server
+    assert_eq!(otps(&run), ["otp-stale", "otp-stale", BEFORE_SYNC, BEFORE_SYNC]);
+    assert_eq!(run.provisioned.len(), 1, "one new identity with the first server, no loop");
+    assert_ne!(run.identifier, [9u8; 16].to_vec(), "the identity with the first server was made again");
+    assert_eq!(run.remembered.as_deref(), Some(run.urls[1].as_str()));
+}
+
+#[test]
+fn a_server_that_is_down_is_skipped_before_anything_goes_to_apple() {
+    let run = run_scenario(Scenario {
+        dead_servers: 2,
+        from_servers: true,
+        ..Scenario::new(Apple::new(TwoFa::None))
+    });
+    run.result.as_ref().unwrap();
+    // Apple only ever saw the data of the server that answers
+    assert_eq!(otps(&run), [BEFORE_SYNC, BEFORE_SYNC]);
+    assert_eq!(run.remembered.as_deref(), Some(run.urls[2].as_str()));
+}
+
+#[test]
+fn an_unknown_apple_id_still_tells_which_server_apple_accepted() {
+    // -20970: an answer about the account, so Apple took the data
+    let mut apple = Apple::new(TwoFa::None);
+    apple.refuse_init = Some((-20970, "Your account information was entered incorrectly."));
+    let run = run_scenario(Scenario {
+        servers: vec![BEFORE_SYNC, "otp-second"],
+        ..Scenario::new(apple)
+    });
+    let error = run.result.as_ref().unwrap_err();
+    assert!(matches!(error, Error::AuthSrpWithMessage(-20970, _)), "{error}");
+    assert_eq!(run.service_requests().len(), 1, "an answer about the account is not a reason to try another server");
+    assert_eq!(run.remembered.as_deref(), Some(run.urls[0].as_str()));
+}
+
+#[test]
+fn every_request_carries_the_pair_the_server_announces_whatever_it_says() {
+    for (client_info, user_agent) in [
+        (CLIENT_INFO, USER_AGENT),
+        (WINDOWS, WINDOWS_USER_AGENT),
+        (ANDROID, ANDROID_USER_AGENT),
+        ("<Quantum9000> <QuantumOS;42.0> <com.apple.AuthKit/1 (com.apple.akd/9.9)>", "akd/9.9 Whatever/1.0"),
+    ] {
+        let run = run_scenario(Scenario {
+            announces: (client_info, user_agent),
+            from_servers: true,
+            answers: vec![code("123456")],
+            ..Scenario::new(Apple::new(TwoFa::TrustedDevice))
+        });
+        run.result.as_ref().unwrap_or_else(|e| panic!("{client_info}: {e}"));
+        assert!(run.apple.len() >= 6);
+        for req in &run.apple {
+            // the provisioning URL bag is asked with the Mac client info of its own, when the first one lacks it
+            assert_eq!(req.headers["x-mme-client-info"], client_info, "{} {}", req.method, req.path);
+            assert_eq!(req.headers["user-agent"], user_agent, "{} {}", req.method, req.path);
+        }
+    }
+}
+
+#[test]
+fn the_override_replaces_the_client_info_and_user_agent_on_every_request() {
+    let overrides = ClientOverrides::new(
+        Some("<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"),
+        Some("akd/1.0 CFNetwork/811.5.4"),
+    );
+    let run = run_scenario(Scenario {
+        overrides,
+        from_servers: true,
+        answers: vec![TwoFactorAction::SendSms(1), code("123456")],
+        ..Scenario::new(Apple::new(TwoFa::TrustedDevice))
+    });
+    run.result.as_ref().unwrap();
+    // GrandSlam, the push, the SMS request that fails, the code: all of them, not only the login
+    assert!(run.apple.len() >= 8, "{}", run.apple.len());
+    for req in &run.apple {
+        assert_eq!(
+            req.headers["x-mme-client-info"],
+            "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>",
+            "{} {}",
+            req.method,
+            req.path
+        );
+        assert_eq!(req.headers["user-agent"], "akd/1.0 CFNetwork/811.5.4", "{} {}", req.method, req.path);
+    }
+    // and nothing was overridden by default: the other tests of this file carry the server's pair
 }
 
 // ---------------------------------------------------------------- the developer portal
@@ -1041,6 +1350,12 @@ struct SessionRun {
     portal: Vec<Req>,
     apple: Vec<Req>,
     anisette: Vec<Req>,
+    /// What the anisette servers behind the first received, in order.
+    other_anisette: Vec<Vec<Req>>,
+    /// The URLs of the anisette servers, in order.
+    urls: Vec<String>,
+    /// The server the configuration folder remembers as the one the portal accepted.
+    remembered: Option<String>,
 }
 
 impl Drop for SessionRun {
@@ -1072,11 +1387,24 @@ fn open_session(
     accepts: Option<&'static str>,
     refusal: fn() -> Resp,
 ) -> SessionRun {
+    open_session_with(apple, fresh_identity, accepts, refusal, vec![BEFORE_SYNC])
+}
+
+/// [`open_session`] with several anisette servers, which give these one-time passwords (the data the
+/// session starts with are the first server's).
+fn open_session_with(
+    apple: Apple,
+    fresh_identity: bool,
+    accepts: Option<&'static str>,
+    refusal: fn() -> Resp,
+    otps: Vec<&'static str>,
+) -> SessionRun {
     let apple = Arc::new(apple);
     let handler = apple.clone();
     let (apple_url, apple_seen) = serve(move |req| handler.handle(req));
-    let (anisette_url, anisette_seen, _) = anisette_server_giving(BEFORE_SYNC);
-    let (config, dir) = anisette_config_with_fallback(&anisette_url, None);
+    let servers: Vec<_> = otps.iter().map(|otp| anisette_server_giving(otp)).collect();
+    let urls: Vec<String> = servers.iter().map(|server| server.0.clone()).collect();
+    let (config, dir) = anisette_config(&urls.iter().map(String::as_str).collect::<Vec<_>>());
     let (portal_url, portal_seen) = serve(move |req| {
         let otp = req.headers.get("x-apple-i-md").map(String::as_str);
         if accepts.is_some() && otp != accepts {
@@ -1089,8 +1417,8 @@ fn open_session(
     });
 
     let mut base_headers = HashMap::new();
-    base_headers.insert("X-Mme-Client-Info".to_string(), WINDOWS.to_string());
-    base_headers.insert("X-Apple-I-MD".to_string(), BEFORE_SYNC.to_string());
+    base_headers.insert("X-Mme-Client-Info".to_string(), CLIENT_INFO.to_string());
+    base_headers.insert("X-Apple-I-MD".to_string(), otps[0].to_string());
     base_headers.insert("X-Apple-I-MD-M".to_string(), "machine".to_string());
     base_headers.insert("X-Mme-Device-Id".to_string(), "09090909-0909-0909-0909-090909090909".to_string());
     let anisette = AnisetteData {
@@ -1099,6 +1427,7 @@ fn open_session(
         config,
         user_agent: USER_AGENT.to_string(),
         fresh_identity,
+        server: Some(urls[0].clone()),
     };
 
     TEST_GSA_HOST.with(|host| *host.borrow_mut() = Some(apple_url));
@@ -1112,7 +1441,10 @@ fn open_session(
         result,
         portal: portal_seen.lock().unwrap().clone(),
         apple: apple_seen.lock().unwrap().clone(),
-        anisette: anisette_seen.lock().unwrap().clone(),
+        anisette: servers[0].1.lock().unwrap().clone(),
+        other_anisette: servers[1..].iter().map(|server| server.1.lock().unwrap().clone()).collect(),
+        remembered: omnisette::remote_anisette_v3::remembered_server(&dir, &urls),
+        urls,
     };
     let _ = std::fs::remove_dir_all(dir);
     run
@@ -1124,8 +1456,9 @@ fn the_portal_sees_the_client_info_the_user_agent_and_the_anisette_data_of_the_s
     let session = run.result.as_ref().ok().expect("the session should be established");
 
     assert_eq!(run.portal.len(), 1);
+    assert_eq!(run.remembered.as_deref(), Some(run.urls[0].as_str()), "the portal accepted this server's data");
     let h = &run.portal[0].headers;
-    assert_eq!(h["x-mme-client-info"], WINDOWS);
+    assert_eq!(h["x-mme-client-info"], CLIENT_INFO);
     assert_eq!(h["user-agent"], USER_AGENT);
     assert_eq!(h["x-apple-i-identity-id"], "adsid-1");
     assert_eq!(h["x-apple-gs-token"], "gs-token-1");
@@ -1146,6 +1479,55 @@ fn the_portal_sees_the_client_info_the_user_agent_and_the_anisette_data_of_the_s
     );
     // no GrandSlam request for an identity that is not new
     assert!(run.apple.is_empty());
+}
+
+#[test]
+fn a_portal_that_answers_503_to_the_data_of_a_server_gets_the_data_of_the_next() {
+    let run = open_session_with(
+        Apple::new(TwoFa::None),
+        false,
+        Some("otp-b"),
+        unavailable,
+        vec!["otp-a", "otp-b", "otp-c"],
+    );
+    assert!(run.result.is_ok(), "the session should be established with the second server");
+    assert_eq!(run.portal_otps(), ["otp-a", "otp-b"], "the third server is not asked");
+    assert!(run.other_anisette[1].is_empty());
+    // the server the portal accepted is the one to try first next time
+    assert_eq!(run.remembered.as_deref(), Some(run.urls[1].as_str()));
+    // nothing went to GrandSlam: the identities are known, only the portal refused the first data
+    assert!(run.apple.is_empty());
+}
+
+#[test]
+fn a_portal_that_refuses_every_server_is_reported_after_one_request_to_each() {
+    let run = open_session_with(
+        Apple::new(TwoFa::None),
+        false,
+        Some("nothing-is-accepted"),
+        unavailable,
+        vec!["otp-a", "otp-b"],
+    );
+    let error = run.error();
+    assert!(matches!(error, Error::DeveloperHttp { status: 503, .. }), "{error}");
+    assert_eq!(run.portal_otps(), ["otp-a", "otp-b"]);
+    assert_eq!(run.remembered, None);
+}
+
+#[test]
+fn an_expired_session_answer_does_not_make_the_portal_change_servers() {
+    // 1100 is the portal talking about the session, not about the data: no other server is asked
+    let run = open_session_with(
+        Apple::new(TwoFa::None),
+        false,
+        Some("nothing-is-accepted"),
+        session_expired,
+        vec!["otp-a", "otp-b"],
+    );
+    let error = run.error();
+    assert!(matches!(error, Error::DeveloperApi { result_code: 1100, .. }), "{error}");
+    assert_eq!(run.portal_otps(), ["otp-a"]);
+    assert!(run.other_anisette[0].is_empty());
 }
 
 #[test]
