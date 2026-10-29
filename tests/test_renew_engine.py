@@ -737,10 +737,11 @@ class CertificateWatch(Base):
 
 class Startup(Base):
     def test_interrupted_add_leaves_no_ghost(self):
+        now = time.time()        # not NOW (taken at import): the suite can run for minutes on CI
         ghost = self.add_app("https://dl.example/x.ipa", enabled=0, bundle_id=None, status="pending",
-                             created_at=NOW - 600, version=None)
+                             created_at=now - 600, version=None)
         fresh = self.add_app("https://dl.example/y.ipa", enabled=0, bundle_id=None, status="pending",
-                             created_at=NOW - 5, version=None)
+                             created_at=now - 5, version=None)
         paused = self.add_app("Paused", enabled=0)
         (renew.app_dir(ghost) / "original.ipa").write_bytes(b"x")
         renew.startup()

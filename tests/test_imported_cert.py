@@ -81,7 +81,7 @@ class ProfileParsing(unittest.TestCase):
         self.assertEqual(p.udids, frozenset({ic.norm_udid(fx.UDID), "aaaabbbb"}))
         self.assertEqual(p.cert_ders, (certdata.CERT1,))
         self.assertTrue(p.has_device_list and not p.all_devices)
-        self.assertAlmostEqual(p.expires_at, NOW + 300 * DAY, delta=60)
+        self.assertAlmostEqual(p.expires_at, NOW + 300 * DAY, delta=900)   # NOW is taken at import: slow CI runners
 
     def test_wildcards(self):
         self.assertEqual(profile(app_id="ABCDE12345.*").pattern, "*")
@@ -221,7 +221,7 @@ class P12(unittest.TestCase):
         self.assertEqual(m.info.der, fx.der(self.cert))
         self.assertEqual(m.info.subject, f"Apple Development: Test ({fx.TEAM})")
         self.assertEqual(m.info.serial, ipa.cert_serial(fx.der(self.cert)))               # the form apps.cert_serial uses
-        self.assertAlmostEqual(m.info.not_after, NOW + 300 * DAY, delta=60)
+        self.assertAlmostEqual(m.info.not_after, NOW + 300 * DAY, delta=900)   # NOW is taken at import: slow CI runners
         self.assertEqual(m.info.key_kind, "rsa")
 
     def test_wrong_and_missing_passwords(self):
@@ -288,14 +288,14 @@ class Prepare(unittest.TestCase):
         prep = ic.prepare(device_row(), self.p12, "pw", self.profile(), self.app)
         self.assertEqual(prep.name, f"Apple Development: Test ({fx.TEAM})")
         self.assertEqual(prep.warnings, [])
-        self.assertAlmostEqual(prep.expires_at, NOW + 300 * DAY, delta=60)       # the earlier of the certificate and the profile
+        self.assertAlmostEqual(prep.expires_at, NOW + 300 * DAY, delta=900)   # NOW is taken at import: slow CI runners       # the earlier of the certificate and the profile
 
     def test_expiry_is_the_earlier_of_certificate_and_profile(self):
-        self.assertAlmostEqual(ic.prepare(device_row(), self.p12, "pw", self.profile(days=100)).expires_at, NOW + 100 * DAY, delta=60)
+        self.assertAlmostEqual(ic.prepare(device_row(), self.p12, "pw", self.profile(days=100)).expires_at, NOW + 100 * DAY, delta=900)   # NOW is taken at import: slow CI runners
         _, short = fx.make_cert(days=40, key=self.key)
         p12 = fx.make_p12(self.key, short, "pw")
         prep = ic.prepare(device_row(), p12, "pw", fx.profile_bytes([fx.der(short)], days=200))
-        self.assertAlmostEqual(prep.expires_at, NOW + 40 * DAY, delta=60)
+        self.assertAlmostEqual(prep.expires_at, NOW + 40 * DAY, delta=900)   # NOW is taken at import: slow CI runners
 
     def test_each_problem_has_its_code(self):
         d = device_row()
@@ -660,9 +660,9 @@ class Store(CertBase):
             signed.write_bytes(make_signed(NOW + 100 * DAY))
             self.assertAlmostEqual(ic.signature_expiry(ident, signed), NOW + 100 * DAY, delta=5)
             signed.write_bytes(make_signed(NOW + 900 * DAY))
-            self.assertAlmostEqual(ic.signature_expiry(ident, signed), NOW + 300 * DAY, delta=60)
+            self.assertAlmostEqual(ic.signature_expiry(ident, signed), NOW + 300 * DAY, delta=900)   # NOW is taken at import: slow CI runners
             signed.write_bytes(b"not an ipa")
-            self.assertAlmostEqual(ic.signature_expiry(ident, signed), NOW + 300 * DAY, delta=60)
+            self.assertAlmostEqual(ic.signature_expiry(ident, signed), NOW + 300 * DAY, delta=900)   # NOW is taken at import: slow CI runners
         finally:
             signed.unlink(missing_ok=True)
 
@@ -678,7 +678,7 @@ class StoreImport(CertBase):
         self.assertEqual((ident["device_id"], ident["team_id"], ident["profile_app_id"], ident["profile_platforms"]),
                          (self.tv["id"], fx.TEAM, "*", "tvOS"))
         self.assertEqual(ident["cert_serial"], ipa.cert_serial(fx.der(shared_pair()[1])))
-        self.assertAlmostEqual(ident["expires_at"], NOW + 300 * DAY, delta=60)
+        self.assertAlmostEqual(ident["expires_at"], NOW + 300 * DAY, delta=900)   # NOW is taken at import: slow CI runners
         self.assertNotIn("PRIVATE KEY", json.dumps(ident))
         self.assertTrue(ic.has_material(ident["id"]))
         self.assertEqual(ic.state_of(ident, NOW), "ok")
@@ -692,7 +692,7 @@ class StoreImport(CertBase):
         again = ic.commit(prep, self.tv["id"], replace_id=ident["id"])
         self.assertEqual(again["id"], ident["id"])
         self.assertEqual((again["revoked_at"], again["notified_level"], again["check_state"]), (None, None, None))
-        self.assertAlmostEqual(again["expires_at"], NOW + 100 * DAY, delta=60)
+        self.assertAlmostEqual(again["expires_at"], NOW + 100 * DAY, delta=900)   # NOW is taken at import: slow CI runners
         self.assertEqual(len(ic.rows()), 1)
 
     def test_a_failed_write_leaves_no_row_behind(self):
@@ -917,7 +917,7 @@ class CertRenew(CertBase):
     def test_signs_and_installs_without_any_apple_account(self):
         a = self.run_renew()                                      # no account is connected in this test at all
         self.assertEqual((a["status"], a["last_error"], a["fail_count"], a["needs_action"]), ("ok", None, 0, None))
-        self.assertAlmostEqual(a["expires_at"], NOW + 300 * DAY, delta=60)
+        self.assertAlmostEqual(a["expires_at"], NOW + 300 * DAY, delta=900)   # NOW is taken at import: slow CI runners
         self.assertEqual(self.installed, [["signed.ipa"]])
         self.assertEqual((a["sign_mode"], a["cert_id"], a["account_email"]), ("certificate", self.ident["id"], None))
         self.assertTrue(a["cert_serial"])
