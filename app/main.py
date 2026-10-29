@@ -28,7 +28,7 @@ from .util import replace_retry
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     db.init()
-    settings.migrate()         # serveur anisette Android enregistré -> serveur par défaut
+    settings.migrate()         # nettoyage unique des réglages anisette d'une version précédente
     imported_cert.sweep_temp()     # clés d'une signature interrompue
     imported_cert.settle()         # fichiers scellés sans certificat, clés d'une sauvegarde à sceller
     _purge_half_added()
@@ -1386,6 +1386,9 @@ def app_delete(app_id: int):
 def settings_get(request: Request):
     return {
         "settings": settings.describe(),
+        # les serveurs anisette réellement essayés, dans l'ordre, et ceux par défaut : l'interface les montre
+        # au lieu de les recopier en dur
+        "anisette": {"servers": settings.anisette_servers(), "defaults": list(settings.DEFAULT_ANISETTE_SERVERS)},
         "auth": {"enabled": auth.enabled(), "has_password": auth.has_password(),
                  "password_from_env": bool(auth.PASSWORD_ENV), "trusted": auth.trusted(request)},
         "version": VERSION,

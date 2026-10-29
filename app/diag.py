@@ -150,47 +150,57 @@ def _client_info(url: str) -> tuple[dict | None, str]:
     return data, ""
 
 
-def _windows(data: dict | None) -> bool:
-    """Le serveur annonce des données Windows. Un client_info qui n'est pas du texte (réponse JSON étrange)
-    ne l'est pas : jamais d'exception ici, le diagnostic doit toujours répondre."""
+def _server_line(url: str, data: dict | None, err: str, seconds: float | None = None) -> dict:
+    """Ce qu'on sait d'un serveur : joignable ou non, le client info / user agent qu'il annonce et son temps de
+    réponse. Un texte étrange n'est jamais une exception ici, le diagnostic doit toujours répondre."""
+    ms = None if seconds is None else round(seconds * 1000)
     info = data.get("client_info") if isinstance(data, dict) else None
-    return isinstance(info, str) and "windows" in info.lower()
+    if not isinstance(info, str) or not info.strip():
+        return {"url": url, "reachable": False, "client_info": None, "user_agent": None, "ms": ms,
+                "error": err or "unreachable"}
+    user_agent = data.get("user_agent")
+    return {"url": url, "reachable": True, "client_info": info.strip(), "ms": ms,
+            "user_agent": user_agent.strip() if isinstance(user_agent, str) else None, "error": ""}
 
 
 async def _anisette() -> dict:
-    """Serveur anisette : joignable, et il fournit des données Windows (les seules qu'Apple accepte).
-    Chaque serveur est interrogé avec sa latence : le premier qui convient sert, les suivants prennent le
-    relais. Avec le serveur par défaut, son serveur de repli prend le relais quand il ne répond pas."""
-    servers = settings.anisette_servers()
+    """Serveurs anisette : chacun est interrogé (client info et user agent annoncés, temps de réponse, ou la raison
+    pour laquelle il ne répond pas). N'importe quel serveur anisette v3 qui répond est utilisable, quelle que soit
+    la plateforme qu'il annonce : seul Apple dit si les données conviennent, et plumesign passe au serveur suivant
+    quand l'un échoue ou qu'Apple refuse ses données."""
+    urls = settings.anisette_servers()
 
-    async def probe(url: str) -> tuple[str, dict | None, str, float]:
-        t0 = time.time()
+    async def probe(url: str) -> dict:
+        started = time.time()
         data, err = await asyncio.to_thread(_client_info, url)
-        return url, data, err, time.time() - t0
+        return _server_line(url, data, err, time.time() - started)
 
-    found = list(await asyncio.gather(*(probe(u) for u in servers)))
-    good = next((i for i, (_, data, _, _) in enumerate(found) if _windows(data)), None)
-    if good is not None:
-        url, data, _, dt = found[good]
-        ms = f"{dt * 1000:.0f} ms"
-        if good > 0:
-            first_url, first_data, first_err, _ = found[0]
-            why = first_err or f"répond « {first_data['client_info']} »"
-            return _check("anisette", "warn", f"{first_url} inutilisable ({why}) : repli sur {url} ({ms})", url)
-        detail = f"{url} : {data['client_info']} ({ms})"
-        # les autres serveurs que l'utilisateur a listés (pas le repli implicite du serveur par défaut)
-        for other, odata, oerr, odt in found[1:]:
-            if any(settings.same_server(other, u) for u in settings.anisette_urls()):
-                state = f"{odata['client_info']}" if _windows(odata) else (oerr or "données non Windows")
-                detail += f" ; {other} : {state} ({odt * 1000:.0f} ms)"
-        return _check("anisette", "ok", detail, url)
-    url, data, err, _ = found[-1]
-    if len(found) == 1 and data:
-        # plumesign refuse un tel serveur sans rien envoyer à Apple : les renouvellements échoueront
-        return _check("anisette", "error",
-                      f"{url} répond « {data['client_info']} » : Apple n'accepte que des données Windows, "
-                      "plumesign n'utilisera pas ce serveur (laisser le réglage vide pour le serveur par défaut)", url)
-    return _check("anisette", "error", " ; ".join(f"{u} : {e or 'données non Windows'}" for u, _, e, _ in found), url)
+    servers = list(await asyncio.gather(*(probe(url) for url in urls)))
+    last = plume.last_server()       # le dernier serveur dont Apple a accepté les données (anisette/last-server.json)
+    for s in servers:
+        s["last_accepted"] = bool(last and settings.same_server(last["server"], s["url"]))
+    forced = {"client_info": settings.anisette_client_info() or None,
+              "user_agent": settings.anisette_user_agent() or None}
+    value = {"servers": servers, "last_good": last, "override": forced if any(forced.values()) else None}
+
+    def line(s: dict) -> str:
+        ms = f" ({s['ms']} ms)" if s["reachable"] and s["ms"] is not None else ""
+        return f"{s['url']} : {s['client_info'] if s['reachable'] else s['error']}{ms}"
+
+    extra = " ; client identity forced by the settings" if value["override"] else ""
+    up = [s for s in servers if s["reachable"]]
+    if not up:
+        return _check("anisette", "error", "no anisette server answers: " + " ; ".join(line(s) for s in servers) + extra,
+                      value)
+    first = servers[0]
+    if first["reachable"]:
+        detail = line(first)
+        if servers[1:]:
+            detail += " ; behind it: " + " ; ".join(line(s) for s in servers[1:])
+        return _check("anisette", "ok", detail + extra, value)
+    return _check("anisette", "warn",
+                  f"{first['url']} does not answer ({first['error']}): {up[0]['url']} takes over ({up[0]['client_info']})"
+                  + extra, value)
 
 
 def _password_file() -> dict | None:

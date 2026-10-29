@@ -67,7 +67,8 @@ class Base(unittest.TestCase):
         db.init()
         for t in ("apps", "devices", "events", "account_status", "account_devices", "revoked_sessions"):
             db.execute(f"DELETE FROM {t}")
-        for key in ("renew_window_start", "renew_window_end", "anisette_url", "admin_password", "pair_host"):
+        for key in ("renew_window_start", "renew_window_end", "anisette_url", "anisette_fallback", "anisette_servers",
+                    "admin_password", "pair_host"):
             settings.raw_set(key, None)
         renew.STOPPING = False          # les tests d'API ferment l'application, qui lève ce drapeau
         renew.TASK = None
@@ -75,7 +76,6 @@ class Base(unittest.TestCase):
             s.clear()
         renew.PHASE.clear()
         plume._LAST.clear()
-        plume._ANISETTE_OK = None
         self.addCleanup(self.clear_accounts)
         self.clear_accounts()
 
@@ -908,49 +908,55 @@ class SettingsCodes(Base):
         self.assertEqual(settings.anisette_urls(), [])
 
 
-class AnisetteFailover(Base):
-    def fake_run(self, responses):
+class AnisetteServersReachPlumesign(Base):
+    """tvsign donne à plumesign la liste complète des serveurs anisette ; c'est plumesign qui passe de l'un à
+    l'autre (injoignable, en erreur, données refusées par Apple), en une seule exécution de la commande."""
+
+    def fake_run(self, code=0, output="ok"):
         calls = []
 
         async def run(*args, env=None, **kw):
-            url = env.get("PLUMESIGN_ANISETTE_URL")
-            calls.append(url)
-            code, out = responses.get(url, (0, "ok"))
-            return proc.Result(code, out)
+            calls.append((env.get("PLUMESIGN_ANISETTE_URL"), env.get("PLUMESIGN_ANISETTE_FALLBACK_URL")))
+            return proc.Result(code, output)
         return run, calls
 
-    def test_next_server_takes_over_and_is_remembered(self):
+    def test_the_chosen_servers_go_first_in_one_run(self):
         settings.raw_set("anisette_url", "https://a.example https://b.example")
-        run, calls = self.fake_run({"https://a.example": (1, "Anisette error: connection refused")})
+        run, calls = self.fake_run()
         with mock.patch.object(plume, "run", run):
             res = asyncio.run(plume._plume("account", "devices"))
-            self.assertTrue(res.ok)
-            self.assertEqual(calls, ["https://a.example", "https://b.example"])
-            calls.clear()
-            asyncio.run(plume._plume("account", "devices"))
-        self.assertEqual(calls, ["https://b.example"], "le dernier serveur qui a répondu passe en premier")
+        self.assertTrue(res.ok)
+        self.assertEqual(len(calls), 1)
+        first, behind = calls[0]
+        self.assertEqual(first, "https://a.example")
+        self.assertEqual(behind.split()[:1], ["https://b.example"])
+        self.assertEqual(behind.split()[1:], list(settings.DEFAULT_ANISETTE_SERVERS))
 
-    def test_other_errors_do_not_switch_servers(self):
+    def test_the_chosen_servers_alone_when_the_fallback_is_off(self):
         settings.raw_set("anisette_url", "https://a.example https://b.example")
-        run, calls = self.fake_run({"https://a.example": (1, "Developer API error 9000: nope")})
-        with mock.patch.object(plume, "run", run):
-            res = asyncio.run(plume._plume("account", "devices"))
-        self.assertFalse(res.ok)
-        self.assertEqual(calls, ["https://a.example"])
-
-    def test_all_servers_down_returns_the_last_error(self):
-        settings.raw_set("anisette_url", "https://a.example https://b.example")
-        run, calls = self.fake_run({"https://a.example": (1, "Anisette error: a"), "https://b.example": (1, "Anisette error: b")})
-        with mock.patch.object(plume, "run", run):
-            res = asyncio.run(plume._plume("account", "devices"))
-        self.assertIn("Anisette error: b", res.output)
-        self.assertEqual(len(calls), 2)
-
-    def test_default_server_when_none_configured(self):
-        run, calls = self.fake_run({})
+        settings.raw_set("anisette_fallback", "off")
+        run, calls = self.fake_run()
         with mock.patch.object(plume, "run", run):
             asyncio.run(plume._plume("account", "devices"))
-        self.assertEqual(calls, [None])
+        self.assertEqual(calls, [("https://a.example", "https://b.example")])
+
+    def test_a_failure_is_not_run_again_from_here(self):
+        settings.raw_set("anisette_url", "https://a.example https://b.example")
+        for output in ("Anisette error: connection refused", "Developer API error 9000: nope",
+                       "Error: Apple answered -80045 (cannot be completed at this time)"):
+            run, calls = self.fake_run(1, output)
+            with mock.patch.object(plume, "run", run):
+                res = asyncio.run(plume._plume("account", "devices"))
+            self.assertFalse(res.ok)
+            self.assertIn(output, res.output)
+            self.assertEqual(len(calls), 1, output)
+
+    def test_default_servers_when_none_configured(self):
+        run, calls = self.fake_run()
+        with mock.patch.object(plume, "run", run):
+            asyncio.run(plume._plume("account", "devices"))
+        servers = list(settings.DEFAULT_ANISETTE_SERVERS)
+        self.assertEqual(calls, [(servers[0], " ".join(servers[1:]))])
 
 
 # ---------- IPA, dépôt GitHub ----------

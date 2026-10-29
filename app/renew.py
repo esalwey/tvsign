@@ -657,8 +657,8 @@ def failure_kind(exc: BaseException) -> str | None:
     if isinstance(exc, plume.LimitReached):
         return "limit"
     if getattr(exc, "user_kind", None) in plume.USER_KINDS or _NEEDS_USER.search(str(exc)):
-        # SMS refusé, Apple ID jamais connecté sur un appareil, serveur anisette non Windows (plume._failure), équipe,
-        # certificats : aucun essai automatique n'y change rien
+        # SMS refusé, Apple ID jamais connecté sur un appareil (plume._failure), équipe, certificats : aucun essai
+        # automatique n'y change rien
         return "config"
     return None
 

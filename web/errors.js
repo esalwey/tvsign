@@ -6,6 +6,7 @@
 // Un texte libre (message de plumesign, d'un téléchargement…) passe par les causes connues ci-dessous.
 // Réglage (clé de l'API) -> libellé du champ affiché, pour qu'une erreur de validation parle comme le formulaire.
 const LIBELLE_REGLAGE = { language: "language", renew_before_hours: "renew_before", renew_before_hours_mobile: "renew_before_mobile", anisette_url: "anisette_server",
+  anisette_fallback: "anisette_fallback", anisette_servers: "anisette_servers", anisette_client_info: "anisette_client_info", anisette_user_agent: "anisette_user_agent",
   renew_window_start: "set_lbl_renew_window_start", renew_window_end: "set_lbl_renew_window_end",
   update_check: "update_check" };
 const libelleReglage = (k) => (k === "ntfy_url" ? "ntfy" : LIBELLE_REGLAGE[k] ? t(LIBELLE_REGLAGE[k]) : k);
@@ -72,7 +73,6 @@ const CAUSES = [
   [/(GrandSlam|GSA|developer services) (answered|returned) HTTP 50[234]|Apple answered HTTP 50[234] to the anisette|Apple répond HTTP 50[234]|50[234] Service Temporarily Unavailable/i, "c_gsa_503"],
   [/SMS 2FA refused|Access to this Apple Developer Service was denied|refuse les codes par SMS/i, "c_sms_denied"],
   [/-22411\b/, "c_never_signed_in"],
-  [/only accepts Windows anisette|ne fournit pas de données Windows/i, "c_anisette_unsupported"],
   [/-22421\b|-22409\b|-80009\b|MID is invalid|-45061|not provisioned/i, "c_anisette_refused"],
   [/anisette/i, "c_anisette"],
   [/reconnexion|-22406|HTTP Some\(401\)|unauthori[sz]ed|session .*(expir|invalid)|not logged|log ?in required/i, "c_session"],
@@ -229,10 +229,12 @@ const EVENEMENTS = [
   [/^Connexion Apple (.+) annulée$/, "ev_login_cancelled", ["email"]],
   [/^Compte Apple (.+) valide : reprise de (\d+) renouvellement\(s\) en attente$/, "ev_account_resume", ["email", "n"]],
   [/^notification (.+) échouée : (.+)$/, "ev_notify_failed", ["dest", "why"]],
-  [/^serveur anisette (.+) en échec, essai avec (.+)$/, "ev_anisette_failover", ["from", "to"]],
-  [/^Serveur anisette (.+?) retiré, .*$/, "ev_anisette_removed", ["servers"]],
-  [/^Identité anisette Android abandonnée .*$/, "ev_anisette_android", []],
-  [/^Identité anisette réinitialisée \(.+\) : une nouvelle sera créée au prochain essai$/, "ev_anisette_reset", []],
+  [/^Serveur anisette : (.+)$/, "ev_anisette_event", ["message"]],
+  [/^Serveur anisette (.+?) effacé des réglages : .*$/, "ev_anisette_stale", ["servers"]],
+  [/^Serveur anisette (.+?) : utilisé seul, comme avant la mise à jour .*$/, "ev_anisette_alone", ["servers"]],
+  [/^Identité anisette d'une version précédente reprise par (.+?) : .*$/, "ev_anisette_legacy_taken", ["servers"]],
+  [/^Identité anisette d'une version précédente abandonnée .*$/, "ev_anisette_legacy_dropped", []],
+  [/^Identité anisette de (.+?) réinitialisée \(.+\) : une nouvelle sera créée au prochain essai .*$/, "ev_anisette_reset", ["server"]],
   [/^Équipe (.+) choisie pour (.+) : les prochaines signatures l'utilisent$/, "ev_team_chosen", ["team", "email"]],
   [/^Restauration refusée \((.+?)\) : (.+)$/, "ev_restore_refused", ["code", "why"]],
 ];

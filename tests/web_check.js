@@ -249,17 +249,23 @@ test("journal en anglais : lignes du serveur de la 1.1", () => {
     ["Connexion Apple a@b.c annulée", "Apple sign-in of a@b.c cancelled"],
     ["Compte Apple a@b.c valide : reprise de 2 renouvellement(s) en attente", "Apple ID a@b.c valid: 2 waiting renewal(s) resumed"],
     ["notification ntfy échouée : HTTP 404", "Notification to ntfy failed: HTTP 404"],
-    ["serveur anisette https://a.example en échec, essai avec https://b.example", "Anisette server https://a.example failed, trying https://b.example"],
-    ["Serveur anisette ani.sidestore.app retiré, remplacé par le serveur par défaut (https://ani.jkcoxson.com) : Apple refuse les données des serveurs anisette Android depuis le 12 octobre 2026 (erreur -80045)",
-      "Anisette server ani.sidestore.app removed: Apple refuses the data of Android anisette servers since 12 October 2026"],
-    ["Identité anisette réinitialisée (Apple refuse les données anisette : signature) : une nouvelle sera créée au prochain essai",
-      "Anisette identity reset (Apple refused the anisette data): a new one will be created at the next attempt"],
+    ["Serveur anisette : anisette server https://a.example is not usable: connection refused",
+      "Anisette server: anisette server https://a.example is not usable: connection refused"],
+    ["Serveur anisette ani.sidestore.app effacé des réglages : serveur de 1.0.0 qui n'est plus utilisé, les serveurs par défaut sont essayés à la place",
+      "Anisette server ani.sidestore.app cleared from the settings: it was a server of version 1.0.0 and is not used any more"],
+    ["Serveur anisette https://own.example : utilisé seul, comme avant la mise à jour (Réglages › « Si ce serveur échoue » pour essayer aussi les serveurs par défaut)",
+      "Anisette server https://own.example: used alone, as before the update (Settings › If this server fails › Try the default servers to use the others too)"],
+    ["Identité anisette d'une version précédente reprise par https://own.example : elle y reste valide ; les autres serveurs anisette créeront la leur au prochain contact avec Apple",
+      "Anisette identity of an earlier version taken over by https://own.example: it stays valid there, the other anisette servers will create theirs at the next contact with Apple"],
+    ["Identité anisette d'une version précédente abandonnée : une identité par serveur anisette sera créée au prochain contact avec Apple",
+      "Anisette identity of an earlier version dropped: one identity per anisette server will be created at the next contact with Apple"],
+    ["Identité anisette de https://ani.iloader.app réinitialisée (Apple refuse les données anisette : signature) : une nouvelle sera créée au prochain essai avec ce serveur (les autres serveurs gardent la leur)",
+      "Anisette identity of https://ani.iloader.app reset (Apple refused its anisette data): a new one will be created at the next attempt with this server, the other servers keep theirs"],
     ["Équipe ABCDE12345 choisie pour a@b.c : les prochaines signatures l'utilisent", "Team ABCDE12345 chosen for a@b.c: the next signatures use it"],
     ["Nuvio : signature avec le certificat importé « Mon cert »", "Nuvio: signing with the imported certificate “Mon cert”"],
     ["Nuvio : signature avec a@b.c", "Nuvio: signing with a@b.c"],
   ];
   for (const [fr, en] of cas) eq(e(fr), en, fr);
-  ok(/^Android anisette identity dropped/.test(e("Identité anisette Android abandonnée (Apple refuse ses données depuis le 12 octobre 2026) : une identité Windows sera créée au prochain contact avec Apple")));
   ok(/^Restore refused \(restore_failed\): /.test(e("Restauration refusée (restore_failed) : restauration annulée, rien n'a changé : [WinError 5]")));
   for (const [, en] of cas) ok(!/[{}]/.test(en), en);
 });

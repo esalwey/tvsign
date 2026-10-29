@@ -43,7 +43,6 @@ CAUSES: list[tuple[re.Pattern, str, str]] = [
     (re.compile(r"(GrandSlam|GSA|developer services) (answered|returned) HTTP 50[234]|Apple answered HTTP 50[234] to the anisette|Apple répond HTTP 50[234]|50[234] Service Temporarily Unavailable", re.I), "c_gsa_503", "Apple refuses the request (HTTP 503)"),
     (re.compile(r"SMS 2FA refused|Access to this Apple Developer Service was denied|refuse les codes par SMS", re.I), "c_sms_denied", "Text-message code refused by Apple"),
     (re.compile(r"-22411\b"), "c_never_signed_in", "Apple ID never used on an Apple device (-22411)"),
-    (re.compile(r"only accepts Windows anisette|ne fournit pas de données Windows", re.I), "c_anisette_unsupported", "Anisette server not accepted by Apple"),
     (re.compile(r"-22421\b|-22409\b|-80009\b|MID is invalid|-45061|not provisioned", re.I), "c_anisette_refused", "Apple refuses the anisette data"),
     (re.compile(r"anisette", re.I), "c_anisette", "Authentication service unavailable"),
     (re.compile(r"reconnexion|-22406|HTTP Some\(401\)|unauthori[sz]ed|session .*(expir|invalid)|not logged|log ?in required", re.I), "c_session", "Apple session expired"),

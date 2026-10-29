@@ -44,8 +44,9 @@ services:
   # Optional anisette server of your own (instead of the community one):
   #   docker compose --profile anisette up -d
   # then enter http://127.0.0.1:6969 as the anisette server in tvsign's Settings. Several addresses
-  # can be listed there: the next one takes over when the first is down.
-  # tvsign only uses an anisette server that announces Windows data (Settings > Diagnostics tells).
+  # can be listed there: the next one takes over when the first is down or Apple refuses its data.
+  # tvsign sends the data of a server as the server announces them, whatever platform that is: Apple decides
+  # (Settings > Diagnostics shows what each server announces).
   anisette:
     # pinned (tag + digest) like the other images of this stack; bump both together to update
     image: dadoum/anisette-v3-server:10-2026@sha256:8577c27cb7592900947960799bf03c79a53bf857ed951e4c48ef6e06c6e0f488

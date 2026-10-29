@@ -35,7 +35,7 @@ from app import backup, db, devices, ipa, main, notifier, plume, reasons, renew,
 from app.config import PAIR_HOST, PLUME_HOME  # noqa: E402
 from app.proc import Result, Session  # noqa: E402
 from test_devices import Calls, make_app, make_device  # noqa: E402
-from test_hotfix import NEVER_SIGNED_IN, NOT_WINDOWS, SMS_403  # noqa: E402
+from test_hotfix import NEVER_SIGNED_IN, SMS_403  # noqa: E402
 from test_ios import HEADERS, add_device, make_ipa  # noqa: E402
 from test_updates import make_ipa as make_tv_ipa, sha  # noqa: E402
 from test_web import i18n  # noqa: E402
@@ -526,8 +526,8 @@ class ActionsForTheUser(unittest.TestCase):
     def tearDown(self):
         db.execute("DELETE FROM account_status WHERE email = 'classify@example.com'")
 
-    def test_sms_never_signed_in_and_non_windows_servers_need_the_user(self):
-        for output in (SMS_403, NEVER_SIGNED_IN, NOT_WINDOWS):
+    def test_sms_and_never_signed_in_need_the_user(self):
+        for output in (SMS_403, NEVER_SIGNED_IN):
             e = self.fail(output)
             self.assertIs(type(e), RuntimeError, output)          # même classe et même texte qu'en 1.0.1
             self.assertEqual(renew.failure_kind(e), "config", output)
@@ -856,7 +856,8 @@ class LegacyAnisetteIsMentionedOnce(unittest.TestCase):
         db.init()
         STORE.mkdir(parents=True, exist_ok=True)
         self.old = STORE / "state.plist"
-        self.new = STORE / plume.ANISETTE_STATE
+        self.new = STORE / plume.ANISETTE_DIR / "mac-ani.jkcoxson.com.plist"
+        self.new.parent.mkdir(parents=True, exist_ok=True)
         self.old.write_bytes(b"old")
         self.new.unlink(missing_ok=True)
         settings.raw_set(plume._LEGACY_NOTED, None)

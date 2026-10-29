@@ -308,7 +308,7 @@ def restore(archive: Path) -> dict:
                 for sid, until in revoked:
                     db.execute("INSERT INTO revoked_sessions (sid, until) VALUES (?, ?) "
                                "ON CONFLICT(sid) DO UPDATE SET until = excluded.until", sid, until)
-                settings.migrate()      # la sauvegarde peut venir d'avant l'abandon des serveurs anisette Android
+                settings.migrate()      # la sauvegarde peut venir d'avant la liste des serveurs anisette (1.0.1 ou plus ancien)
                 imported_cert.settle()  # clés de l'archive (en clair) : scellées avec la clé de cette instance
                 # Apps importées dont l'IPA n'est pas dans la sauvegarde : inutilisables, on le dit tout de suite
                 # (sinon l'échec n'apparaît qu'à la fenêtre de renouvellement, des jours plus tard).

@@ -1784,6 +1784,22 @@ const WIZ_RENDU = {
   },
 };
 
+// Serveurs anisette du diagnostic : chacun avec ce qu'il annonce (client info, user agent) ou la raison pour
+// laquelle il ne répond pas. Aucun n'est jugé sur la plateforme qu'il annonce : seul Apple dit si ses données conviennent.
+function lignesServeurs(v) {
+  const lignes = v.servers.map((s) => {
+    const delai = s.reachable && s.ms != null ? ` · ${s.ms} ms` : "";
+    const dernier = s.last_accepted ? ` · ${esc(t("diag_server_last"))}` : "";
+    const annonce = s.reachable ? [s.client_info, s.user_agent].filter(Boolean).join(" · ") : s.error;
+    return `<p class="row__sub"><span class="etat etat--${s.reachable ? "ok" : "err"}">${t(s.reachable ? "diag_server_up" : "diag_server_down")}</span> <span class="mono">${esc(s.url)}</span>${delai}${dernier}<br><span class="mono">${esc(annonce)}</span></p>`;
+  });
+  if (v.override) {
+    const pair = [v.override.client_info, v.override.user_agent].filter(Boolean).join(" · ");
+    lignes.push(`<p class="row__sub">${esc(t("diag_override"))} <span class="mono">${esc(pair)}</span></p>`);
+  }
+  return lignes.join("");
+}
+
 function listeDiag(d) {
   return `<div class="list">${d.checks.map((c) => {
     const ton = c.status === "ok" ? "ok" : c.status === "warn" ? "warn" : "err";
@@ -1792,12 +1808,14 @@ function listeDiag(d) {
       ? (c.value?.direct ? "diag_mdns_direct" : c.value?.bridge ? "diag_mdns_bridge" : "diag_mdns_fix")
       : `diag_${c.id}_fix`;
     const conseil = c.status !== "ok" ? conseilEdition(cleConseil, AUTH?.edition) : "";
+    // les serveurs anisette sont listés un par un (ce qu'ils annoncent, ou pourquoi ils ne répondent pas)
+    const detail = c.id === "anisette" && Array.isArray(c.value?.servers) ? lignesServeurs(c.value) : `<p class="row__sub">${esc(diagDetail(c, d))}</p>`;
     return `<div class="row">
       <span class="row__icon row__icon--${COULEUR[ton]}">${c.status === "ok" ? ICONS.ok : ICONS.alerte}</span>
       <div class="row__label">
         <p class="row__title">${t("diag_" + c.id)}</p>
         <p class="row__sub"><span class="etat etat--${ton}">${t("diag_" + c.status)}</span>${c.id === "plumesign" && c.value ? ` · <span class="mono">${esc(c.value)}</span>` : ""}</p>
-        <p class="row__sub">${esc(diagDetail(c, d))}</p>
+        ${detail}
         ${conseil ? `<p class="row__sub">${esc(conseil)}</p>` : ""}
       </div>
     </div>`;
@@ -1903,6 +1921,8 @@ async function chargerReglages() {
     label.querySelector(".verrou")?.remove();
     if (s.locked) label.insertAdjacentHTML("beforeend", `<span class="verrou" title="${esc(t("set_by_env", { env: s.env }))}">${esc(s.env)}</span>`);
   }
+  const actual = $("#anisette-actual");
+  if (actual) actual.textContent = Array.isArray(REGLAGES.anisette?.servers) ? t("anisette_actual", { list: REGLAGES.anisette.servers.join(" → ") }) : "";
   $("#version").textContent = REGLAGES.version;
   afficherMaj(REGLAGES.update);
   // des apps importées : sans leur .ipa dans la sauvegarde, elles sont à réimporter après une restauration

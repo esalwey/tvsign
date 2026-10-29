@@ -1,5 +1,6 @@
 """Enveloppe de plumesign : comptes Apple, enregistrement d'appareils, signature, découverte."""
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -18,7 +19,7 @@ LOCK = asyncio.Lock()
 STORE = PLUME_HOME / "PlumeImpactor"
 
 
-def env(anisette: str | None = None) -> dict:
+def env() -> dict:
     e = os.environ.copy()
     # plumesign range ses données dans %APPDATA% (Windows) ou $XDG_CONFIG_HOME (Linux)
     e["APPDATA" if os.name == "nt" else "XDG_CONFIG_HOME"] = str(PLUME_HOME)
@@ -26,15 +27,22 @@ def env(anisette: str | None = None) -> dict:
     e.pop("PLUMESIGN_PASSWORD", None)        # jamais hérité : passé seulement à « account login »
     for secret in ("TVSIGN_PASSWORD", "TVSIGN_LAUNCH_TOKEN", "TVSIGN_GITHUB_TOKEN"):
         e.pop(secret, None)                  # secrets de tvsign : inutiles à plumesign
-    # Le serveur anisette vient des réglages seulement : jamais hérité tel quel de l'environnement (il
-    # pourrait désigner un serveur Android). Vide = serveur par défaut de plumesign, avec son repli.
-    for name in ("PLUMESIGN_ANISETTE_URL", "ANISETTE_URL_V3"):
+    # Les serveurs anisette et l'identité client viennent des réglages seulement (qui lisent déjà les variables
+    # d'environnement, valeur invalide ignorée) : jamais hérités tels quels. plumesign reçoit la liste complète,
+    # dans l'ordre : le premier serveur dans PLUMESIGN_ANISETTE_URL, les suivants dans
+    # PLUMESIGN_ANISETTE_FALLBACK_URL (« none » : aucun autre). C'est plumesign qui passe d'un serveur au suivant
+    # (injoignable, en erreur, données refusées par Apple), la même liste pour tvsign (diagnostic, dernier
+    # serveur) et pour plumesign ; la changer ne demande ni nouvelle version ni recompilation (settings.py).
+    for name in ("PLUMESIGN_ANISETTE_URL", "ANISETTE_URL_V3", "PLUMESIGN_ANISETTE_FALLBACK_URL",
+                 "PLUMESIGN_ANISETTE_CLIENT_INFO", "PLUMESIGN_ANISETTE_USER_AGENT"):
         e.pop(name, None)
-    if anisette is None:
-        urls = _anisette_urls()
-        anisette = urls[0] if urls else ""
-    if anisette:
-        e["PLUMESIGN_ANISETTE_URL"] = anisette
+    servers = settings.anisette_servers()
+    e["PLUMESIGN_ANISETTE_URL"] = servers[0]
+    e["PLUMESIGN_ANISETTE_FALLBACK_URL"] = " ".join(servers[1:]) or "none"
+    for name, value in (("PLUMESIGN_ANISETTE_CLIENT_INFO", settings.anisette_client_info()),
+                        ("PLUMESIGN_ANISETTE_USER_AGENT", settings.anisette_user_agent())):
+        if value:
+            e[name] = value                  # issue de secours : à la place de ce que le serveur annonce
     # Compte plein : jamais de révocation de certificats étrangers sans l'accord de l'utilisateur.
     e["PLUMESIGN_REVOKE"] = settings.cert_revoke()
     # Les copies de travail de plumesign (plume_stage_*) vont dans notre dossier de données, pas dans
@@ -72,44 +80,18 @@ def sweep_stage(max_age: float = 3600) -> int:
     return removed
 
 
-# ---------- serveurs anisette : le dernier qui a répondu d'abord, les autres en secours ----------
-
-_ANISETTE_OK: str | None = None
-_ANISETTE_FAIL = re.compile(r"anisette", re.I)
-# Refus d'Apple ou de l'utilisateur que changer de serveur anisette ne résout pas (et qui compteraient
-# comme un essai de plus chez Apple) : pas de bascule.
-_NO_FAILOVER = frozenset({"apple_refused", "apple_rate_limited", "sms_denied", "never_signed_in"})
-
-
-def _anisette_urls() -> list[str]:
-    """Adresses configurées, la dernière qui a fonctionné en tête. Vide : serveur par défaut de plumesign."""
-    urls = settings.anisette_urls()
-    if _ANISETTE_OK in urls:
-        urls = [_ANISETTE_OK] + [u for u in urls if u != _ANISETTE_OK]
-    return urls
-
+# ---------- serveurs anisette : plumesign passe de l'un à l'autre, tvsign le dit ----------
 
 async def _plume(*args, extra_env: dict | None = None, **kw) -> Result:
-    """`plumesign …` avec bascule sur le serveur anisette suivant quand celui-ci est en panne
-    (une seule passe sur la liste). Sans liste de plusieurs adresses : un simple run()."""
-    global _ANISETTE_OK
-    urls = _anisette_urls()
-    res = None
-    for i, url in enumerate(urls or [None]):
-        e = env(url)
-        if extra_env:
-            e.update(extra_env)
-        res = await run(PLUMESIGN, *args, env=e, **kw)
-        if res.ok:
-            if url and len(urls) > 1:
-                _ANISETTE_OK = url
-            return res
-        if i + 1 >= len(urls):
-            return res
-        errors = _errors(res.output + res.err)
-        if not _ANISETTE_FAIL.search(errors) or classify(errors) in _NO_FAILOVER:
-            return res
-        db.log(f"serveur anisette {url} en échec, essai avec {urls[i + 1]}", "warn")
+    """`plumesign …` avec l'environnement de tvsign (env). La bascule d'un serveur anisette au suivant (injoignable,
+    en erreur, ou dont Apple refuse les données) se fait dans plumesign, qui a la liste complète et l'identité de
+    chaque serveur : relancer la commande d'ici ferait une demande de plus chez Apple pour le même Apple ID. Ce
+    qu'il a fait est repris dans le journal (note_anisette_events), que la commande réussisse ou non."""
+    e = env()
+    if extra_env:
+        e.update(extra_env)
+    res = await run(PLUMESIGN, *args, env=e, **kw)
+    note_anisette_events(res.output)
     return res
 
 
@@ -159,20 +141,30 @@ def import_existing_store() -> None:
 
 
 def note_legacy_anisette() -> bool:
-    """Au démarrage : une identité anisette de l'ancienne version (state.plist, Android) est inutile,
-    Apple refuse ses données. plumesign la supprime et en crée une Windows au prochain contact avec
-    Apple ; on le dit une fois dans le journal (et non à chaque démarrage tant que ce contact n'a pas eu lieu).
-    True si l'ancienne était encore là."""
-    if not (STORE / "state.plist").exists() or (STORE / ANISETTE_STATE).exists():
+    """Au démarrage : l'identité anisette d'une version précédente (un seul fichier pour tous les serveurs :
+    state.plist en 1.0.0, anisette-state-windows.plist en 1.0.1) appartenait au serveur qui l'avait provisionnée.
+    Un serveur choisi par l'utilisateur la reprend (elle y est toujours valide : même identifiant d'appareil,
+    pas de nouveau provisionnement) ; les serveurs par défaut ont changé de plateforme depuis et ne s'en servent
+    pas, plumesign la supprime alors et crée une identité par serveur au prochain contact avec Apple. On le dit
+    une fois dans le journal (et non à chaque démarrage tant que ce contact n'a pas eu lieu). True si l'ancienne
+    était encore là."""
+    if any((STORE / ANISETTE_DIR).glob("*.plist")):
+        return False
+    if not any((STORE / name).exists() for name in LEGACY_ANISETTE_FILES):
         return False
     if settings.raw_get(_LEGACY_NOTED) is None:
-        db.log("Identité anisette Android abandonnée (Apple refuse ses données depuis le 12 octobre 2026) : "
-               "une identité Windows sera créée au prochain contact avec Apple")
+        custom = settings.anisette_urls()
+        if custom:
+            db.log(f"Identité anisette d'une version précédente reprise par {' '.join(custom)} : elle y reste valide ; "
+                   "les autres serveurs anisette créeront la leur au prochain contact avec Apple")
+        else:
+            db.log("Identité anisette d'une version précédente abandonnée : une identité par serveur anisette sera "
+                   "créée au prochain contact avec Apple")
         settings.raw_set(_LEGACY_NOTED, "1")
     return True
 
 
-_LEGACY_NOTED = "anisette_legacy_noted"     # l'ancienne identité Android a déjà été signalée au journal
+_LEGACY_NOTED = "anisette_legacy_noted"     # l'ancienne identité unique (sans serveur) a déjà été signalée au journal
 
 
 # ---------- comptes ----------
@@ -298,7 +290,7 @@ async def _switch(email: str) -> None:
         raise UnknownAccount(f"compte {email} introuvable")
     res = await _plume("account", "switch", email, timeout=30)
     if not res.ok:
-        raise RuntimeError(f"compte {email} introuvable : {res.tail()}")
+        raise RuntimeError(f"compte {email} introuvable : {_tail(res)}")
 
 
 @asynccontextmanager
@@ -362,12 +354,39 @@ def _errors(output: str) -> str:
     return "\n".join(line for line in output.splitlines() if not _LOG_LINE.match(line))
 
 
+# Ce que plumesign dit, dans son journal, d'un serveur anisette qu'il quitte (« anisette server X is not usable: … »,
+# « … the data of X are given up, using Y instead », « the developer portal refuses the data of X … ») : repris dans
+# le journal de tvsign pour qu'on voie qu'un serveur est tombé ou refusé, même quand l'opération réussit grâce au suivant.
+_ANISETTE_WARN = re.compile(r"^\[[^\]]*\bWARN\s+(?:omnisette|plume_core)[^\]]*\]\s+"
+                            r"(?P<msg>.*(?:anisette server|are given up|refuses the data).*)$", re.I)
+
+
+def note_anisette_events(output: str) -> int:
+    """Reporte dans le journal les changements de serveur anisette que plumesign a faits (une ligne par
+    message différent), succès de l'opération ou non. Renvoie le nombre de lignes écrites."""
+    seen: list[str] = []
+    for line in output.splitlines():
+        m = _ANISETTE_WARN.match(line.strip())
+        message = m["msg"].strip()[:300] if m else ""
+        if message and message not in seen:
+            seen.append(message)
+            db.log(f"Serveur anisette : {message}", "warn")
+    return len(seen)
+
+
+# La réponse d'un serveur anisette qui n'est pas celle qu'on attend (« https://x/v3/client_info answered HTTP 502
+# without client info: 502 Bad Gateway »). Cette page vient du serveur anisette, pas d'Apple : retirée avant de
+# chercher un refus d'Apple dans le texte (une erreur 429 ou 503 d'un serveur anisette n'est pas celle d'Apple).
+_ANISETTE_ANSWER = re.compile(r"answered HTTP \d+ without (?:client info|headers): [^|\n]*")
+
+
 # Refus d'Apple qui ne disent rien de la session et qu'il ne sert à rien de répéter :
 # - -80045 « This action cannot be completed at this time » : refus de l'ouverture de session (SRP init),
-#   côté compte ou adresse IP, même avec des données anisette Windows valides ;
+#   côté compte ou adresse IP, ou données anisette refusées : plumesign a déjà essayé les données de chaque
+#   serveur anisette quand il arrive jusqu'ici ;
 # - HTTP 429 : trop de requêtes, Apple demande de ralentir ;
-# - HTTP 503 (page HTML) : données anisette ou identité d'appareil refusées (serveur Android, identité
-#   périmée), ou charge momentanée du serveur d'Apple. Les services développeur (« Apple developer services »)
+# - HTTP 503 (page HTML) : données anisette ou identité d'appareil refusées (plumesign essaie alors les autres
+#   serveurs), ou charge momentanée du serveur d'Apple. Les services développeur (« Apple developer services »)
 #   répondent comme GrandSlam.
 _APPLE_REFUSED = re.compile(r"-80045\b|cannot be completed at this time", re.I)
 _APPLE_429 = re.compile(r"(GrandSlam|GSA|developer services) (answered|returned) HTTP 429|"
@@ -379,8 +398,6 @@ _APPLE_503 = re.compile(r"(GrandSlam|GSA|developer services) (answered|returned)
 _SMS_DENIED = re.compile(r"SMS 2FA refused|Access to this Apple Developer Service was denied", re.I)
 # -22411 : Apple ID jamais utilisé sur un appareil Apple
 _NEVER_SIGNED_IN = re.compile(r"-22411\b")
-# Serveur anisette qui ne fournit pas de données Windows : plumesign ne l'utilise pas (Apple les refuse)
-_ANISETTE_UNSUPPORTED = re.compile(r"only accepts Windows anisette", re.I)
 # -22421 (hsc 434), -22409, -80009 : données anisette désynchronisées ou refusées ;
 # -45061 : identité anisette non provisionnée (plumesign en refait une toute seule)
 _ANISETTE_REFUSED = re.compile(r"-22421\b|-22409\b|-80009\b|MID is invalid", re.I)
@@ -388,20 +405,21 @@ _REPROVISION = re.compile(r"-45061\b|Anisette not provisioned", re.I)
 
 # Ce qu'il faut faire d'une erreur : « apple_refused » (-80045) et « apple_rate_limited » (429) attendent
 # longtemps, Apple limite les essais ; « apple_503 » et « anisette_* » sont réessayées à l'allure habituelle ;
-# « sms_denied », « never_signed_in » et « anisette_unsupported » demandent une action de l'utilisateur
-# (aucun essai automatique n'y change rien).
-USER_KINDS = frozenset({"sms_denied", "never_signed_in", "anisette_unsupported"})
+# « sms_denied » et « never_signed_in » demandent une action de l'utilisateur (aucun essai automatique n'y
+# change rien).
+USER_KINDS = frozenset({"sms_denied", "never_signed_in"})
 SLOW_KINDS = frozenset({"apple_refused", "apple_rate_limited"})
 
 
 def classify(output: str) -> str | None:
     """Nature d'un refus d'Apple ou d'un problème d'anisette reconnu dans la sortie de plumesign, ou None.
     Jamais « session expirée » : ces erreurs ne disent rien de l'état de la session.
-    Les lignes de journal (repli sur un autre serveur, nouvel essai…) ne comptent pas : seule l'erreur finale."""
-    output = _errors(output)
+    Les lignes de journal (repli sur un autre serveur, nouvel essai…) ne comptent pas : seule l'erreur finale.
+    Les pages renvoyées par les serveurs anisette non plus : ce ne sont pas des réponses d'Apple."""
+    output = _ANISETTE_ANSWER.sub("", _errors(output))
     for kind, rx in (("apple_refused", _APPLE_REFUSED), ("apple_rate_limited", _APPLE_429),
                      ("apple_503", _APPLE_503), ("sms_denied", _SMS_DENIED),
-                     ("never_signed_in", _NEVER_SIGNED_IN), ("anisette_unsupported", _ANISETTE_UNSUPPORTED),
+                     ("never_signed_in", _NEVER_SIGNED_IN),
                      ("anisette_refused", _ANISETTE_REFUSED), ("anisette_reprovision", _REPROVISION)):
         if rx.search(output):
             return kind
@@ -460,26 +478,89 @@ class AppleRefused(RuntimeError):
         return self.kind in SLOW_KINDS
 
 
-ANISETTE_STATE = "anisette-state-windows.plist"      # identité anisette de plumesign (voir PATCHES.md)
-_RESET_AT = 0.0
+ANISETTE_DIR = "anisette"      # une identité par serveur anisette : anisette/<serveur>.plist (voir PATCHES.md)
+LAST_SERVER_FILE = "last-server.json"      # le dernier serveur dont Apple a accepté les données, dans ce dossier
+# L'identité unique des versions précédentes : state.plist (1.0.0, Android), anisette-state-windows.plist (1.0.1)
+LEGACY_ANISETTE_FILES = ("state.plist", "anisette-state-windows.plist")
+_RESET_AT: dict[str, float] = {}      # clé de serveur -> dernière réinitialisation de son identité
 
 
-def reset_anisette(reason: str) -> bool:
-    """Oublie l'identité anisette : plumesign en crée et en provisionne une nouvelle à la commande suivante.
-    Pour des données qu'Apple refuse alors que le serveur répond (-22409, -80009, -22421 après resynchronisation).
-    Au plus une fois par heure : chaque identité provisionnée est une requête de plus chez Apple."""
-    global _RESET_AT
-    if time.time() - _RESET_AT < 3600:
+def server_key(url: str) -> str:
+    """Nom de fichier de l'identité d'un serveur : le même calcul que omnisette::remote_anisette_v3::server_key
+    (hôte en minuscules, port s'il n'est pas celui du schéma, chemin s'il y en a un ; tout sauf lettres, chiffres,
+    points et tirets devient « _ » ; jamais un nom réservé de Windows ; 80 caractères au plus, avec une empreinte
+    au-delà)."""
+    url = url.strip()
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        scheme, rest = "https", url
+    rest = re.split(r"[?#]", rest, maxsplit=1)[0]
+    authority, _, path = rest.partition("/")
+    authority = authority.rsplit("@", 1)[-1].lower()
+    scheme = scheme.lower()
+    if scheme == "https" and authority.endswith(":443"):
+        authority = authority[:-4]
+    elif scheme == "http" and authority.endswith(":80"):
+        authority = authority[:-3]
+    key = authority.rstrip(".")
+    path = path.strip("/")
+    if path:
+        key += "/" + path.lower()
+    safe = "".join(c if (c.isascii() and c.isalnum()) or c in ".-" else "_" for c in key).strip(".")
+    if not safe:
+        return "server"
+    first = safe.split(".")[0].lower()
+
+    def numbered(prefix: str) -> bool:
+        return first.startswith(prefix) and len(first) == len(prefix) + 1 and first[-1].isdigit()
+
+    if first in ("con", "prn", "aux", "nul") or numbered("com") or numbered("lpt"):
+        safe = "_" + safe
+    if len(safe) > 80:
+        digest = hashlib.sha256(key.encode()).hexdigest()
+        return f"{safe[:64]}-{digest[:8]}"
+    return safe
+
+
+_USING = re.compile(r"using (\S+) instead")
+
+
+def refused_server(output: str) -> str:
+    """Le serveur anisette dont Apple vient de refuser les données : le dernier « using Y instead » du journal de
+    plumesign (le serveur qui a pris le relais est celui des données qui échouent à la fin), sinon le dernier
+    serveur dont Apple a accepté les données, sinon le premier de la liste."""
+    used = _USING.findall(output)
+    if used:
+        return used[-1]
+    last = last_server()
+    return last["server"] if last else settings.anisette_servers()[0]
+
+
+def reset_anisette(reason: str, output: str = "") -> bool:
+    """Oublie l'identité anisette d'UN serveur, celui dont Apple refuse les données (refused_server(output)) :
+    plumesign en crée et en provisionne une nouvelle à la commande suivante. Pour des données qu'Apple refuse alors
+    que les serveurs répondent (-22409, -80009, -22421 après resynchronisation). Les identités des autres serveurs,
+    qui marchent, restent : en refaire une coûte des requêtes chez Apple et un nouvel identifiant d'appareil.
+    Au plus une fois par heure et par serveur."""
+    server = refused_server(output)
+    key = server_key(server)
+    if time.time() - _RESET_AT.get(key, 0.0) < 3600:
         return False
-    try:
-        (STORE / ANISETTE_STATE).unlink()
-    except FileNotFoundError:
+    removed = 0
+    for state in ((STORE / ANISETTE_DIR / f"{key}.plist"), (STORE / ANISETTE_DIR / f"{key}.plist.tmp")):
+        try:
+            state.unlink()
+            removed += 1
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            db.log(f"identité anisette non réinitialisée : {e}", "warn")
+            return False
+    if not removed:
         return False
-    except OSError as e:
-        db.log(f"identité anisette non réinitialisée : {e}", "warn")
-        return False
-    _RESET_AT = time.time()
-    db.log(f"Identité anisette réinitialisée ({reason}) : une nouvelle sera créée au prochain essai", "warn")
+    _RESET_AT[key] = time.time()
+    db.log(f"Identité anisette de {server} réinitialisée ({reason}) : une nouvelle sera créée au prochain essai "
+           "avec ce serveur (les autres serveurs gardent la leur)", "warn")
     return True
 
 
@@ -498,6 +579,32 @@ def is_limit(text: str) -> bool:
     return bool(_LIMIT.search(text or ""))
 
 
+def last_server() -> dict | None:
+    """Le dernier serveur anisette dont Apple a accepté les données, tel que plumesign l'a retenu :
+    {"server", "at"}, ou None (rien de retenu, fichier illisible, ou liste de serveurs qui a changé depuis :
+    plumesign l'ignorerait aussi)."""
+    try:
+        data = json.loads((STORE / ANISETTE_DIR / LAST_SERVER_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("server"), str):
+        return None
+    listed = data.get("servers")
+    wanted = settings.anisette_servers()
+    if not isinstance(listed, list) or len(listed) != len(wanted) or not all(
+            isinstance(a, str) and settings.same_server(a, b) for a, b in zip(listed, wanted)):
+        return None
+    return {"server": data["server"], "at": data.get("at") if isinstance(data.get("at"), str) else None}
+
+
+def _tail(res: Result, n: int = 3) -> str:
+    """Les dernières lignes d'erreur de plumesign, sans ses lignes de journal : un « WARN … Apple refuses the data
+    (-80045) » du repli sur un autre serveur n'est pas la raison de l'échec, et le web le classerait pourtant
+    comme « Apple a bloqué ». Retombe sur les dernières lignes brutes quand il n'y a que du journal."""
+    lines = [l for l in _errors(res.output + "\n" + (getattr(res, "err", "") or "")).splitlines() if l.strip()]
+    return " | ".join(lines[-n:]) if lines else res.tail(n)
+
+
 def _failure(email: str, what: str, res: Result, content: bool = False) -> RuntimeError:
     """Erreur d'une commande plumesign du compte, classée : session expirée (bouton Reconnecter),
     refus d'Apple (attendre), passagère (anisette, réseau), ou autre. content : l'IPA signée est en cause
@@ -512,17 +619,17 @@ def _failure(email: str, what: str, res: Result, content: bool = False) -> Runti
     if session_expired(res.output):
         _set_status(email, False, f"session expirée, reconnexion nécessaire : {REAUTH_REASON}")
         return SessionExpired(f"session Apple de {email} expirée : reconnecte-le (bouton Reconnecter) "
-                              f"[{what} : {res.tail(2)}]", email)
+                              f"[{what} : {_tail(res, 2)}]", email)
     if is_limit(res.output):
-        return LimitReached(limit_message(what, res.tail(2)))
+        return LimitReached(limit_message(what, _tail(res, 2)))
     if kind == "anisette_refused":
-        reset_anisette(f"Apple refuse les données anisette : {what}")
+        reset_anisette(f"Apple refuse les données anisette : {what}", res.output)
     errors = _errors(res.output)
     if kind or re.search(r"anisette|panicked", errors, re.I) or _TRANSIENT.search(errors) or res.code == -1:
         return Transient(f"{what} : {_why(res)} (passager, nouvel essai automatique)")
     if content and is_content_error(res.output):
-        return ContentError(f"{what} : {res.tail()}")
-    return RuntimeError(f"{what} : {res.tail()}")
+        return ContentError(f"{what} : {_tail(res)}")
+    return RuntimeError(f"{what} : {_tail(res)}")
 
 
 def explain(kind: str | None, detail: str = "") -> str | None:
@@ -537,16 +644,12 @@ def explain(kind: str | None, detail: str = "") -> str | None:
         return ("Apple limite le nombre de requêtes (HTTP 429) : n'insiste pas, tvsign attend plusieurs heures "
                 f"avant de réessayer{tail}")
     if kind == "apple_503":
-        return ("Apple répond HTTP 503 : données anisette refusées (serveur anisette Android ?) ou serveur d'Apple "
-                f"surchargé ; nouvel essai automatique plus tard{tail}")
+        return ("Apple répond HTTP 503 : données anisette refusées (tvsign essaie les autres serveurs anisette) ou "
+                f"serveur d'Apple surchargé ; nouvel essai automatique plus tard{tail}")
     if kind == "sms_denied":
         return f"Apple refuse les codes par SMS : utilise le code d'un appareil Apple de confiance{tail}"
     if kind == "never_signed_in":
         return f"Apple refuse cet Apple ID (-22411) : il n'a jamais été connecté sur un appareil Apple{tail}"
-    if kind == "anisette_unsupported":
-        return ("le serveur anisette choisi ne fournit pas de données Windows, les seules qu'Apple accepte depuis le "
-                "12 octobre 2026 : laisse le réglage vide (serveur par défaut) ou choisis un serveur qui en fournit"
-                f"{tail}")
     if kind == "anisette_refused":
         return f"Apple refuse les données anisette (-22421/-22409) : identité anisette à réinitialiser{tail}"
     if kind == "anisette_reprovision":
@@ -561,17 +664,17 @@ def limit_message(what: str, detail: str = "") -> str:
 
 
 def _why(res: Result) -> str:
-    known = explain(classify(res.output), res.tail(1))
+    known = explain(classify(res.output), _tail(res, 1))
     if known:
         return known
     errors = _errors(res.output)
     if re.search(r"anisette", errors, re.I):
-        return f"serveur anisette indisponible : {res.tail(2)}"
+        return f"serveur anisette indisponible : {_tail(res, 2)}"
     if re.search(r"panicked", errors, re.I):
-        return f"plumesign a planté (réponse inattendue d'Apple ?) : {res.tail(2)}"
+        return f"plumesign a planté (réponse inattendue d'Apple ?) : {_tail(res, 2)}"
     if _TRANSIENT.search(errors):
-        return f"réseau ou Apple injoignable : {res.tail(2)}"
-    return f"vérification impossible : {res.tail(2)}"
+        return f"réseau ou Apple injoignable : {_tail(res, 2)}"
+    return f"vérification impossible : {_tail(res, 2)}"
 
 
 async def check_account(email: str) -> bool | None:
@@ -606,6 +709,7 @@ def start_login(email: str, password: str) -> Session:
     session.result["email"] = email
 
     async def done(s: Session) -> None:
+        note_anisette_events("\n".join(s.lines))
         if s.exit_ok:
             _set_status(email, True, "connecté")
             _backup_store()
@@ -622,7 +726,7 @@ def start_login(email: str, password: str) -> Session:
             db.log(f"Connexion Apple {email} échouée : "
                    f"{explain(kind, last) or ' | '.join(errors[-2:] or s.lines[-2:])}", "error")
             if kind == "anisette_refused":
-                reset_anisette("connexion refusée pour des données anisette invalides")
+                reset_anisette("connexion refusée pour des données anisette invalides", output)
 
     async def go() -> None:
         try:
@@ -677,7 +781,7 @@ async def logout(email: str) -> None:
         _forget_cert_expiry(email)
         raise
     if not res.ok:
-        raise RuntimeError(f"plumesign account logout : {res.tail(2)}")
+        raise RuntimeError(f"plumesign account logout : {_tail(res, 2)}")
     db.execute("DELETE FROM account_status WHERE email = ?", email)
     _forget_cert_expiry(email)
     # plumesign ne désigne plus de compte par défaut : on en choisit un de façon stable (ordre alphabétique)

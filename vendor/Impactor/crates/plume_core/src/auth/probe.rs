@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use omnisette::AnisetteConfiguration;
+use omnisette::{AnisetteConfiguration, ClientOverrides};
 use omnisette::anisette_headers_provider::AnisetteHeadersProvider;
 use omnisette::remote_anisette_v3::RemoteAnisetteProviderV3;
 use sha2::Sha256;
@@ -50,6 +50,8 @@ pub struct ProbeReport {
     pub client_info: String,
     pub user_agent: String,
     pub user_agent_overridden: bool,
+    /// The client info or the user agent sent is not the one the server announced (an override).
+    pub pair_overridden: bool,
     pub identity_is_new: bool,
     /// Anisette headers sent (long values shortened).
     pub headers: Vec<(String, String)>,
@@ -117,22 +119,23 @@ async fn init_once(
     Ok((attempt, sim))
 }
 
-/// Fetch the anisette data of `server` (no failover, the servers are used as given, even an
-/// Android one, so that old and new configurations can be compared) and send the SRP `init` request
-/// for a throwaway Apple ID. A first answer that asks to synchronize the new identity (hsc 434) is
-/// followed once. At most two requests are sent to Apple.
+/// Fetch the anisette data of `server` (no failover: the server is used as given, whatever it
+/// announces, so that the answers Apple gives to different servers and configurations can be
+/// compared) and send the SRP `init` request for a throwaway Apple ID. A first answer that asks to
+/// synchronize the new identity (hsc 434) is followed once. At most two requests are sent to Apple.
 ///
 /// `legacy_user_agent`: send the fixed macOS user agent of tvsign 1.0.0 instead of the one the
-/// server reports.
+/// server reports. `overrides`: send this client info and user agent instead of the server's.
 pub async fn probe_gsa_init(
     server: &str,
     state_dir: PathBuf,
     legacy_user_agent: Option<&str>,
+    overrides: ClientOverrides,
 ) -> Result<ProbeReport, Error> {
     std::fs::create_dir_all(&state_dir)?;
-    // any platform: the point is to compare what Apple answers to each kind of server
-    let mut provider = RemoteAnisetteProviderV3::new(server.to_string(), state_dir, "0".to_string())
-        .allow_any_platform(true);
+    let pair_overridden = !overrides.is_empty();
+    let mut provider = RemoteAnisetteProviderV3::new(server.to_string(), state_dir.clone(), "0".to_string())
+        .with_overrides(overrides);
     let base_headers: HashMap<String, String> = provider.get_authentication_headers().await?;
     let server_ua = provider.user_agent().unwrap_or_else(|| DEFAULT_USER_AGENT.to_string());
     let user_agent = legacy_user_agent.map(str::to_owned).unwrap_or_else(|| server_ua.clone());
@@ -140,10 +143,13 @@ pub async fn probe_gsa_init(
     let mut anisette = AnisetteData {
         base_headers,
         generated_at: SystemTime::now(),
-        config: AnisetteConfiguration::default(),
+        config: AnisetteConfiguration::default()
+            .set_anisette_url_v3(server.to_string())
+            .set_configuration_path(state_dir),
         user_agent: user_agent.clone(),
         fresh_identity: provider.identity_is_new(),
         refresh_failed_at: None,
+        server: provider.server_used(),
     };
 
     let mut report = ProbeReport {
@@ -151,6 +157,7 @@ pub async fn probe_gsa_init(
         client_info: anisette.client_info()?,
         user_agent,
         user_agent_overridden: legacy_user_agent.is_some(),
+        pair_overridden,
         identity_is_new: anisette.fresh_identity,
         headers: {
             let mut v: Vec<_> = anisette

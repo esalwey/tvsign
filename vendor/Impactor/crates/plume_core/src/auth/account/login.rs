@@ -7,7 +7,7 @@ use srp::groups::G2048;
 use crate::Error;
 
 use crate::auth::account::{
-    check_error, parse_response, resync_sim, send_with_retry, status_hsc,
+    MAX_SERVER_SWITCHES, check_error, parse_response, resync_sim, send_with_retry, status_hsc,
 };
 use crate::auth::anisette_data::AnisetteData;
 use crate::auth::{
@@ -46,7 +46,16 @@ macro_rules! plist_get_string {
 }
 
 /// `init` requests after which the answer is taken as it is, whatever it asks for.
-const MAX_INIT_REQUESTS: u8 = 4;
+const MAX_INIT_REQUESTS: u8 = 16;
+/// `init` requests that the data of one anisette server may cost: the first one, the one after the
+/// synchronization, and the ones after a new identity and its own synchronization.
+const MAX_INIT_REQUESTS_PER_SERVER: u8 = 4;
+/// Switches of anisette server that a -80045 may cost in one sign-in. -80045 is the refusal of the
+/// connection, the account or the IP address as much as of the data: every other server means a new
+/// device identifier, a provisioning, a synchronization and two more `init` requests for the same Apple
+/// ID within seconds, which is what feeds the throttle that -80045 can be. One other server, then the
+/// answer is the error.
+const MAX_SWITCHES_FOR_80045: u8 = 1;
 /// Steps (2FA prompts, new logins) after which a conversation that does not end is given up.
 const MAX_LOGIN_STEPS: u8 = 15;
 /// Prompts for a code after which Apple is considered to be asking in a loop (a code that was
@@ -99,37 +108,83 @@ pub(crate) enum InitStep {
     Resync(String),
     /// Apple does not know the provisioning (-45061): make a new identity and provision it.
     Reprovision,
+    /// Apple refuses the data of this anisette server, for the reason given: the data of the next
+    /// server are tried, if there is one.
+    SwitchServer(&'static str),
     /// Nothing to do first: this is the answer.
     Proceed,
 }
 
+/// Why this answer of GrandSlam to the `init` request says that Apple does not accept the anisette
+/// data it was sent, or `None` when it is an answer about the account (even an error like a wrong
+/// Apple ID: the data were accepted).
+///
+/// -80045 is the refusal Apple gave to Android data in October 2026, and it can also be the account or
+/// the connection: the next server's data are all this sign-in can change, but only once (see
+/// [`InitPlan`]) and never from a server Apple accepted recently. -45061 and -22421 are the ones that stay after a new identity and a synchronization;
+/// -22409, -80009 and "MID is invalid" are data that do not hold together.
+pub(crate) fn data_refusal(answer: &Dictionary) -> Option<&'static str> {
+    match check_error(answer) {
+        Err(Error::AuthSrpWithMessage(-80045, _)) => Some("-80045"),
+        Err(Error::AuthSrpWithMessage(-45061, _)) => Some("-45061"),
+        Err(Error::AuthSrpWithMessage(-22421, _)) => Some("-22421"),
+        Err(Error::AuthSrpWithMessage(-22409, _)) => Some("-22409"),
+        Err(Error::AuthSrpWithMessage(-80009, _)) => Some("-80009"),
+        Err(Error::AuthSrpWithMessage(_, message)) if message.contains("MID is invalid") => {
+            Some("MID is invalid")
+        }
+        _ => None,
+    }
+}
+
 /// The budget of the `init` step. Each correction is allowed once per anisette identity (a new
-/// identity has never been seen by Apple, so it needs its own synchronization), and the request is
-/// sent [`MAX_INIT_REQUESTS`] times at most: no answer of Apple can make the sign-in loop.
+/// identity has never been seen by Apple, so it needs its own synchronization), one server gets
+/// [`MAX_INIT_REQUESTS_PER_SERVER`] requests, the data of another server are tried at most
+/// [`MAX_SERVER_SWITCHES`] times, and the request is sent [`MAX_INIT_REQUESTS`] times at most: no answer
+/// of Apple can make the sign-in loop.
 pub(crate) struct InitPlan {
     sent: u8,
+    sent_here: u8,
+    switches: u8,
     can_resync: bool,
     can_reprovision: bool,
-    can_switch_server: bool,
+    /// Switches already made for a -80045.
+    switches_for_80045: u8,
+    /// Apple accepted the data of the server in use recently (it is the one kept in `last-server.json`).
+    server_trusted: bool,
 }
 
 impl InitPlan {
     pub(crate) fn new() -> InitPlan {
         InitPlan {
             sent: 0,
+            sent_here: 0,
+            switches: 0,
             can_resync: true,
             can_reprovision: true,
-            can_switch_server: true,
+            switches_for_80045: 0,
+            server_trusted: false,
         }
+    }
+
+    /// Whether Apple accepted the data of the server in use recently. A -80045 from such a server is
+    /// about the account or the connection, not about the data, and no other server will change it.
+    pub(crate) fn set_server_trusted(&mut self, trusted: bool) {
+        self.server_trusted = trusted;
     }
 
     /// An `init` request is about to be sent.
     pub(crate) fn request_sent(&mut self) {
         self.sent = self.sent.saturating_add(1);
+        self.sent_here = self.sent_here.saturating_add(1);
     }
 
     fn exhausted(&self) -> bool {
         self.sent >= MAX_INIT_REQUESTS
+    }
+
+    fn exhausted_here(&self) -> bool {
+        self.sent_here >= MAX_INIT_REQUESTS_PER_SERVER
     }
 
     /// What the answer to the request that was just sent asks for.
@@ -137,29 +192,53 @@ impl InitPlan {
         if self.exhausted() {
             return InitStep::Proceed;
         }
-        if self.can_resync
-            && let Some(sim) = resync_sim(answer)
-        {
-            self.can_resync = false;
-            return InitStep::Resync(sim);
+        if !self.exhausted_here() {
+            if self.can_resync
+                && let Some(sim) = resync_sim(answer)
+            {
+                self.can_resync = false;
+                return InitStep::Resync(sim);
+            }
+            if self.can_reprovision
+                && matches!(check_error(answer), Err(Error::AuthSrpWithMessage(-45061, _)))
+            {
+                self.can_reprovision = false;
+                return InitStep::Reprovision;
+            }
         }
-        if self.can_reprovision
-            && matches!(check_error(answer), Err(Error::AuthSrpWithMessage(-45061, _)))
-        {
-            self.can_reprovision = false;
-            return InitStep::Reprovision;
+        match data_refusal(answer) {
+            Some("-80045") => {
+                // the account, the connection or the data: one other server at most, none at all when
+                // Apple accepted this server's data recently
+                if self.server_trusted || self.switches_for_80045 >= MAX_SWITCHES_FOR_80045 {
+                    InitStep::Proceed
+                } else {
+                    self.switches_for_80045 += 1;
+                    InitStep::SwitchServer("-80045")
+                }
+            }
+            Some(reason) => InitStep::SwitchServer(reason),
+            None => InitStep::Proceed,
         }
-        InitStep::Proceed
     }
 
-    /// The request got no usable answer, only an HTML 503 (after the retries): may the data of the
-    /// other anisette server be tried? Once.
+    /// The request got no usable answer, only an HTML 503 (after the retries), or the server could not
+    /// go on with its data: may the data of the next anisette server be tried?
     pub(crate) fn may_switch_server(&mut self) -> bool {
-        if self.exhausted() || !self.can_switch_server {
+        if self.exhausted() || self.switches >= MAX_SERVER_SWITCHES {
             return false;
         }
-        self.can_switch_server = false;
+        self.switches += 1;
         true
+    }
+
+    /// The data are those of another server now, with an identity of its own: it has its own budget,
+    /// and Apple may ask it to synchronize as well.
+    pub(crate) fn server_switched(&mut self) {
+        self.sent_here = 0;
+        self.server_trusted = false;
+        self.can_resync = true;
+        self.can_reprovision = true;
     }
 
     /// The anisette data now belong to an identity Apple has not seen: it will ask it to
@@ -424,47 +503,90 @@ impl Account {
 
         // The first answers may ask for something before the login proper: hsc 434 (synchronize the
         // anisette identity with Apple), -45061 (the provisioning is not valid: make a new
-        // identity), or only a 503 page, which is how Apple refuses the data of an anisette server
-        // (try the other server). Each once per identity, and never more than MAX_INIT_REQUESTS
-        // requests.
+        // identity), or refuse the data of the anisette server in use (-80045, an HTML 503 page,
+        // -45061 or -22421 again): the data of the next server are tried. Each correction once per
+        // identity, and never more than MAX_INIT_REQUESTS requests.
         let mut plan = InitPlan::new();
         let res = loop {
             plan.request_sent();
             let answer = match send_init(&self.client, &anisette, &a_pub, &username_for_spd).await {
                 Ok(answer) => answer,
                 Err(error @ Error::GsaHttp { status: 503, .. }) if plan.may_switch_server() => {
-                    match self.switch_anisette_server().await {
-                        Ok(Some(fresh)) => {
+                    match self.take_other_server(&anisette, "Apple answers HTTP 503").await {
+                        Some(fresh) => {
                             anisette = fresh;
-                            if anisette.fresh_identity {
-                                plan.identity_replaced();
-                            }
+                            plan.server_switched();
                             continue;
                         }
-                        Ok(None) => return Err(error),
-                        Err(e) => {
-                            log::warn!("the other anisette server cannot be used either: {e}");
-                            return Err(error);
-                        }
+                        None => return Err(error),
                     }
                 }
                 Err(error) => return Err(error),
             };
+            plan.set_server_trusted(anisette.from_remembered_server());
             match plan.after_answer(&answer) {
                 InitStep::Resync(sim) => {
                     log::info!("Apple asks the anisette identity to synchronize (hsc 434)");
-                    anisette = self.resync_anisette(&sim).await?;
-                    if anisette.fresh_identity {
-                        // the server had lost the identity and made a new one, unknown to Apple
-                        plan.identity_replaced();
+                    match self.resync_anisette(&sim).await {
+                        Ok(fresh) => {
+                            anisette = fresh;
+                            if anisette.fresh_identity {
+                                // the server had lost the identity and made a new one, unknown to Apple
+                                plan.identity_replaced();
+                            }
+                        }
+                        Err(error @ Error::Anisette(_)) if plan.may_switch_server() => {
+                            // that server cannot go on with its identity: the next one may
+                            match self.take_other_server(&anisette, "the anisette server cannot synchronize").await {
+                                Some(fresh) => {
+                                    anisette = fresh;
+                                    plan.server_switched();
+                                }
+                                None => return Err(error),
+                            }
+                        }
+                        Err(error) => return Err(error),
                     }
                 }
                 InitStep::Reprovision => {
                     log::warn!("Apple answered -45061: making a new anisette identity");
-                    anisette = self.reprovision_anisette().await?;
-                    plan.identity_replaced();
+                    match self.reprovision_anisette().await {
+                        Ok(fresh) => {
+                            anisette = fresh;
+                            plan.identity_replaced();
+                        }
+                        Err(error @ Error::Anisette(_)) if plan.may_switch_server() => {
+                            match self.take_other_server(&anisette, "the anisette server cannot provision").await {
+                                Some(fresh) => {
+                                    anisette = fresh;
+                                    plan.server_switched();
+                                }
+                                None => return Err(error),
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                InitStep::SwitchServer(reason) => {
+                    if plan.may_switch_server()
+                        && let Some(fresh) = self
+                            .take_other_server(&anisette, &format!("Apple refuses the data ({reason})"))
+                            .await
+                    {
+                        anisette = fresh;
+                        plan.server_switched();
+                        continue;
+                    }
+                    // no other server to ask: the refusal is the answer
+                    check_error(&answer)?;
+                    break answer;
                 }
                 InitStep::Proceed => {
+                    if data_refusal(&answer).is_none() && resync_sim(&answer).is_none() {
+                        // Apple answered about the account (even to say that it is not known): it
+                        // accepts the data of this server, which is the one to try first next time
+                        anisette.confirm_server();
+                    }
                     check_error(&answer)?;
                     break answer;
                 }
@@ -583,24 +705,52 @@ impl Account {
         Ok(fresh)
     }
 
-    /// Make a new anisette identity and provision it (Apple answered -45061), and use the new data.
+    /// Make a new anisette identity with the server in use and provision it (Apple answered -45061),
+    /// and use the new data. The identities with the other servers stay.
     async fn reprovision_anisette(&self) -> Result<AnisetteData, Error> {
         let mut locked = self.anisette.lock().await;
-        omnisette::reset_identity(locked.config.configuration_path())?;
-        let fresh = AnisetteData::new(locked.config.clone()).await?;
+        let server = locked
+            .server
+            .clone()
+            .or_else(|| locked.config.servers_v3().first().cloned());
+        if let Some(server) = server {
+            omnisette::reset_identity(locked.config.configuration_path(), &server)?;
+        }
+        // the new identity belongs to the server that lost it, not to another one
+        let fresh = locked.refresh().await?;
         *locked = fresh.clone();
         Ok(fresh)
     }
 
-    /// Apple keeps refusing the data of the anisette server in use (a 503 page again and again):
-    /// take the data of the other configured server instead. `None` when there is no other server.
+    /// Apple refuses the data of the anisette server in use (`why`): take the data of the next
+    /// server instead, and keep to it for the rest of the sign-in. `None` when there is no other
+    /// server left to try or none can give data: the caller reports what Apple said.
+    async fn take_other_server(&self, failed: &AnisetteData, why: &str) -> Option<AnisetteData> {
+        let from = failed.server.as_deref().unwrap_or("the anisette server");
+        match self.switch_anisette_server().await {
+            Ok(Some(fresh)) => {
+                log::warn!(
+                    "{why}: the data of {from} are given up, using {} instead",
+                    fresh.server.as_deref().unwrap_or("another anisette server")
+                );
+                Some(fresh)
+            }
+            Ok(None) => {
+                log::warn!("{why}, and there is no other anisette server left to try");
+                None
+            }
+            Err(e) => {
+                log::warn!("{why}, and the other anisette servers cannot be used either: {e}");
+                None
+            }
+        }
+    }
+
     async fn switch_anisette_server(&self) -> Result<Option<AnisetteData>, Error> {
         let mut locked = self.anisette.lock().await;
-        let mut config = locked.config.clone();
-        if !config.prefer_other_server_v3() {
+        let Some(fresh) = locked.from_other_server().await? else {
             return Ok(None);
-        }
-        let fresh = AnisetteData::new(config).await?;
+        };
         *locked = fresh.clone();
         Ok(Some(fresh))
     }
@@ -695,15 +845,17 @@ mod tests {
 
     const ASK_SYNC: &str = "<key>hsc</key><integer>434</integer><key>X-Apple-I-MD-DATA</key><string>SIM</string><key>ec</key><integer>-22421</integer><key>em</key><string>Try again.</string>";
     const NOT_PROVISIONED: &str = "<key>ec</key><integer>-45061</integer><key>em</key><string>not provisioned</string>";
+    const REFUSED: &str = "<key>ec</key><integer>-80045</integer><key>em</key><string>This action cannot be completed at this time.</string>";
 
     #[test]
     fn a_new_identity_is_synchronized_once() {
         let mut plan = InitPlan::new();
         plan.request_sent();
         assert_eq!(plan.after_answer(&answer(ASK_SYNC)), InitStep::Resync("SIM".to_string()));
-        // asked again after the synchronization: Apple's answer is final (it is the error -22421)
+        // asked again after the synchronization: the data of this server do not hold, Apple's
+        // answer is -22421 and the next server's data are the thing to try
         plan.request_sent();
-        assert_eq!(plan.after_answer(&answer(ASK_SYNC)), InitStep::Proceed);
+        assert_eq!(plan.after_answer(&answer(ASK_SYNC)), InitStep::SwitchServer("-22421"));
     }
 
     #[test]
@@ -711,8 +863,9 @@ mod tests {
         let mut plan = InitPlan::new();
         plan.request_sent();
         assert_eq!(plan.after_answer(&answer(NOT_PROVISIONED)), InitStep::Reprovision);
+        // still -45061 with the new identity: another server
         plan.request_sent();
-        assert_eq!(plan.after_answer(&answer(NOT_PROVISIONED)), InitStep::Proceed);
+        assert_eq!(plan.after_answer(&answer(NOT_PROVISIONED)), InitStep::SwitchServer("-45061"));
     }
 
     #[test]
@@ -732,6 +885,65 @@ mod tests {
     }
 
     #[test]
+    fn the_refusals_that_point_at_the_anisette_data_are_these() {
+        for (entries, reason) in [
+            (REFUSED, "-80045"),
+            ("<key>ec</key><integer>-45061</integer>", "-45061"),
+            ("<key>ec</key><integer>-22421</integer>", "-22421"),
+            ("<key>ec</key><integer>-22409</integer>", "-22409"),
+            ("<key>ec</key><integer>-80009</integer><key>em</key><string>MID is invalid.</string>", "-80009"),
+            ("<key>ec</key><integer>-1</integer><key>em</key><string>MID is invalid.</string>", "MID is invalid"),
+        ] {
+            assert_eq!(data_refusal(&answer(entries)), Some(reason), "{entries}");
+            let mut plan = InitPlan::new();
+            plan.request_sent();
+            // a refusal of this kind is not a correction to make (but -45061, once): the next
+            // server's data are tried
+            assert!(
+                matches!(plan.after_answer(&answer(entries)), InitStep::SwitchServer(_) | InitStep::Reprovision),
+                "{entries}"
+            );
+        }
+    }
+
+    #[test]
+    fn answers_about_the_account_are_not_refusals_of_the_data() {
+        // unknown Apple ID, wrong password, wrong code, a good answer: Apple accepted the data
+        for entries in [
+            "<key>ec</key><integer>-20970</integer><key>em</key><string>Your account information was entered incorrectly.</string>",
+            "<key>ec</key><integer>-22406</integer>",
+            "<key>ec</key><integer>-21669</integer>",
+            "<key>ec</key><integer>-22411</integer>",
+            "<key>ec</key><integer>0</integer><key>em</key><string></string>",
+            "<key>hsc</key><integer>200</integer>",
+            "",
+        ] {
+            assert_eq!(data_refusal(&answer(entries)), None, "{entries}");
+            let mut plan = InitPlan::new();
+            plan.request_sent();
+            assert_eq!(plan.after_answer(&answer(entries)), InitStep::Proceed, "{entries}");
+        }
+    }
+
+    #[test]
+    fn a_server_gets_its_own_budget_and_its_own_corrections() {
+        let mut plan = InitPlan::new();
+        // server 1: asked to synchronize, then refused
+        plan.request_sent();
+        assert_eq!(plan.after_answer(&answer(ASK_SYNC)), InitStep::Resync("SIM".to_string()));
+        plan.request_sent();
+        assert_eq!(plan.after_answer(&answer(REFUSED)), InitStep::SwitchServer("-80045"));
+        assert!(plan.may_switch_server());
+        plan.server_switched();
+        // server 2: has an identity of its own, which Apple may ask to synchronize as well, and which
+        // may be provisioned again once
+        plan.request_sent();
+        assert_eq!(plan.after_answer(&answer(ASK_SYNC)), InitStep::Resync("SIM".to_string()));
+        plan.request_sent();
+        assert_eq!(plan.after_answer(&answer(NOT_PROVISIONED)), InitStep::Reprovision);
+    }
+
+    #[test]
     fn nothing_makes_the_init_loop_for_ever() {
         // an Apple that asks for a synchronization every time, whatever is done
         let mut plan = InitPlan::new();
@@ -742,15 +954,73 @@ mod tests {
             match plan.after_answer(&answer(ASK_SYNC)) {
                 InitStep::Proceed => break,
                 InitStep::Resync(_) => plan.identity_replaced(),
+                InitStep::SwitchServer(_) => {
+                    if plan.may_switch_server() {
+                        plan.server_switched();
+                    } else {
+                        break;
+                    }
+                }
                 InitStep::Reprovision => unreachable!(),
             }
-            assert!(requests < 20, "the loop does not end");
+            assert!(requests < 100, "the loop does not end");
         }
         assert_eq!(requests, usize::from(MAX_INIT_REQUESTS));
-        // and a server that is switched back and forth
+
+        // an Apple that refuses the data of every server (-22409): one request each, then the switches
+        // run out
         let mut plan = InitPlan::new();
+        let mut requests = 0;
+        loop {
+            plan.request_sent();
+            requests += 1;
+            match plan.after_answer(&answer("<key>ec</key><integer>-22409</integer>")) {
+                InitStep::SwitchServer(_) if plan.may_switch_server() => plan.server_switched(),
+                _ => break,
+            }
+            assert!(requests < 100, "the loop does not end");
+        }
+        assert_eq!(requests, usize::from(MAX_SERVER_SWITCHES) + 1);
+
+        // -80045 from every server: it can be the account or the connection, so one other server at
+        // most and then the error, not a tour of every server with a new identity each
+        let mut plan = InitPlan::new();
+        let mut requests = 0;
+        loop {
+            plan.request_sent();
+            requests += 1;
+            match plan.after_answer(&answer(REFUSED)) {
+                InitStep::SwitchServer(_) if plan.may_switch_server() => plan.server_switched(),
+                _ => break,
+            }
+            assert!(requests < 100, "the loop does not end");
+        }
+        assert_eq!(requests, usize::from(MAX_SWITCHES_FOR_80045) + 1);
+    }
+
+    #[test]
+    fn a_server_apple_accepted_recently_is_not_given_up_for_a_80045() {
+        // -80045 from the server that worked last time is the account or the connection: no other server
+        // can change that, and each one would cost a new identity and more requests
+        let mut plan = InitPlan::new();
+        plan.set_server_trusted(true);
+        plan.request_sent();
+        assert_eq!(plan.after_answer(&answer(REFUSED)), InitStep::Proceed);
+        // the other refusals still point at the data of that server
+        assert_eq!(
+            plan.after_answer(&answer("<key>ec</key><integer>-22409</integer>")),
+            InitStep::SwitchServer("-22409")
+        );
+        // a server that is not trusted gets its one switch, and the trust does not follow to the next one
+        let mut plan = InitPlan::new();
+        plan.set_server_trusted(true);
+        plan.server_switched();
+        plan.request_sent();
+        assert_eq!(plan.after_answer(&answer(REFUSED)), InitStep::SwitchServer("-80045"));
         assert!(plan.may_switch_server());
-        assert!(!plan.may_switch_server());
+        plan.server_switched();
+        plan.request_sent();
+        assert_eq!(plan.after_answer(&answer(REFUSED)), InitStep::Proceed);
     }
 
     #[test]
@@ -761,6 +1031,19 @@ mod tests {
         }
         assert!(!plan.may_switch_server());
         assert_eq!(plan.after_answer(&answer(NOT_PROVISIONED)), InitStep::Proceed);
+        assert_eq!(plan.after_answer(&answer(REFUSED)), InitStep::Proceed);
+    }
+
+    #[test]
+    fn one_server_cannot_use_up_the_whole_budget() {
+        let mut plan = InitPlan::new();
+        for _ in 0..MAX_INIT_REQUESTS_PER_SERVER {
+            plan.request_sent();
+        }
+        // the corrections are spent for this server; the refusal itself still leads to the next one
+        assert_eq!(plan.after_answer(&answer(NOT_PROVISIONED)), InitStep::SwitchServer("-45061"));
+        assert_eq!(plan.after_answer(&answer(ASK_SYNC)), InitStep::SwitchServer("-22421"));
+        assert!(plan.may_switch_server());
     }
 
     #[test]

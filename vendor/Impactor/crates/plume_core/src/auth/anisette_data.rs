@@ -6,10 +6,16 @@ use reqwest::header::{HeaderMap, HeaderValue};
 
 use crate::Error;
 
-/// `X-Xcode-Version` of the GrandSlam, 2FA and developer requests (the provisioning requests of the
-/// anisette identity send the same one).
+/// `X-Xcode-Version` of the GrandSlam, 2FA and developer requests when `PLUMESIGN_XCODE_VERSION` is not
+/// set (the provisioning requests of the anisette identity send the same one).
 pub const XCODE_VERSION: &str = omnisette::remote_anisette_v3::XCODE_VERSION;
-/// User agent used when the anisette provider does not report one with its client info.
+
+/// The `X-Xcode-Version` to send: the environment's `PLUMESIGN_XCODE_VERSION` or [`XCODE_VERSION`].
+pub fn xcode_version() -> String {
+    omnisette::remote_anisette_v3::xcode_version()
+}
+/// User agent used when the anisette provider does not report one with its client info and the user did
+/// not override it (`PLUMESIGN_ANISETTE_USER_AGENT`).
 pub const DEFAULT_USER_AGENT: &str = "akd/1.0 CFNetwork/808.1.4";
 /// GrandSlam answers HTTP 503 to a client info that names Xcode (since September 2026).
 const BLOCKED_CLIENT_ID: &str = "com.apple.dt.Xcode";
@@ -29,18 +35,36 @@ pub struct AnisetteData {
     /// Last refresh given up after its tries: during `REFRESH_BACKOFF` the previous data are kept
     /// instead of trying (and waiting) at every request to Apple.
     pub(crate) refresh_failed_at: Option<Instant>,
+    /// The anisette server that produced these data (`None` when they did not come from one of the
+    /// servers of the configuration). The identity, the synchronization and Apple's verdict on the
+    /// data all belong to this server.
+    pub server: Option<String>,
+}
+
+/// The client identifier written in place of the one GrandSlam blocks: `PLUMESIGN_ANISETTE_CLIENT_ID`, else
+/// [`REPLACEMENT_CLIENT_ID`]. `None` (the value `keep`, `none` or `off`) sends the client info as announced.
+fn client_id_replacement() -> Option<String> {
+    match omnisette::env_header_override(omnisette::CLIENT_ID_ENV) {
+        Some(value) if ["keep", "none", "off"].iter().any(|v| value.eq_ignore_ascii_case(v)) => None,
+        Some(value) => Some(value),
+        None => Some(REPLACEMENT_CLIENT_ID.to_string()),
+    }
 }
 
 /// The client info as the server reported it. Only a client identifier that GrandSlam blocks
-/// (Xcode) is replaced; a Windows client info (`com.apple.iTunes/...`) is sent as it is, any change
-/// to it is refused with HTTP 503.
+/// (Xcode) is replaced (see [`client_id_replacement`]); any other client info (a Windows one with
+/// `com.apple.iTunes/...`, a Mac one) is sent as it is, any change to it is refused with HTTP 503.
 pub fn sanitize_client_info(info: &str) -> String {
-    let Some(start) = info.find(BLOCKED_CLIENT_ID) else {
+    sanitize_client_info_with(info, client_id_replacement().as_deref())
+}
+
+fn sanitize_client_info_with(info: &str, replacement: Option<&str>) -> String {
+    let (Some(replacement), Some(start)) = (replacement, info.find(BLOCKED_CLIENT_ID)) else {
         return info.to_string();
     };
     let rest = &info[start..];
     let end = rest.find([')', '>']).unwrap_or(rest.len());
-    format!("{}{}{}", &info[..start], REPLACEMENT_CLIENT_ID, &rest[end..])
+    format!("{}{}{}", &info[..start], replacement, &rest[end..])
 }
 
 fn header_value(value: &str) -> Result<HeaderValue, Error> {
@@ -55,9 +79,25 @@ fn header_value(value: &str) -> Result<HeaderValue, Error> {
 const REFRESH_BACKOFF: Duration = Duration::from_secs(30);
 
 impl AnisetteData {
+    /// Data from the first server that serves, over the whole list (the free failover of the start of a
+    /// sign-in or of a portal session). Servers that cannot be reached or fail are left out of the
+    /// configuration that travels with the data, so that the later switches of the same sign-in do not
+    /// pay their timeouts again.
     pub async fn new(config: AnisetteConfiguration) -> Result<Self, Error> {
-        let mut b = AnisetteHeaders::get_anisette_headers_provider(config.clone())?;
+        Self::fetch(config.clone(), config).await
+    }
+
+    /// Data fetched with `fetch_config` (the servers to ask), kept with `config` (what the sign-in knows).
+    async fn fetch(fetch_config: AnisetteConfiguration, mut config: AnisetteConfiguration) -> Result<Self, Error> {
+        let mut b = AnisetteHeaders::get_anisette_headers_provider(fetch_config)?;
         let base_headers = b.provider.get_authentication_headers().await?;
+        let server = b.provider.server_used();
+        for failed in b.provider.failed_servers() {
+            // not usable now: left alone until the sign-in ends (the server that served stays usable)
+            if server.as_deref().is_none_or(|used| !omnisette::same_server(used, &failed)) {
+                config.refuse_server_v3(&failed);
+            }
+        }
 
         Ok(AnisetteData {
             base_headers,
@@ -65,12 +105,51 @@ impl AnisetteData {
             user_agent: b
                 .provider
                 .user_agent()
+                .or_else(|| config.client_overrides().user_agent.clone())
                 .unwrap_or_else(|| DEFAULT_USER_AGENT.to_string()),
             fresh_identity: b.provider.identity_is_new(),
             // the server that answered is the first one tried by the next refresh
-            config: config.set_preferred_url_v3(b.provider.server_used()),
+            config: config.set_preferred_url_v3(server.clone()),
             refresh_failed_at: None,
+            server,
         })
+    }
+
+    /// Whether Apple accepted the data of the server that produced these recently (the server kept in
+    /// `anisette/last-server.json`): a refusal from it is then more likely about the account or the
+    /// connection than about the data.
+    pub fn from_remembered_server(&self) -> bool {
+        let Some(server) = &self.server else {
+            return false;
+        };
+        omnisette::remembered_server(self.config.configuration_path(), self.config.configured_servers_v3())
+            .is_some_and(|remembered| omnisette::same_server(&remembered, server))
+    }
+
+    /// Apple answered about the account: it accepts the data of the server that produced these. That
+    /// server is the one to try first next time, by this process and by the next ones.
+    pub fn confirm_server(&self) {
+        if let Some(server) = &self.server {
+            omnisette::remember_server(
+                self.config.configuration_path(),
+                self.config.configured_servers_v3(),
+                server,
+            );
+        }
+    }
+
+    /// Apple refuses the data of the server that produced these (or the server fails to go on with
+    /// them): the data of the next server, which this sign-in then keeps to. `None` when there is no
+    /// other server left to try.
+    pub async fn from_other_server(&self) -> Result<Option<Self>, Error> {
+        let mut config = self.config.clone();
+        let Some(refused) = self.server.clone().or_else(|| config.servers_v3().first().cloned()) else {
+            return Ok(None);
+        };
+        if !config.refuse_server_v3(&refused) {
+            return Ok(None);
+        }
+        Self::new(config).await.map(Some)
     }
 
     pub fn needs_refresh(&self) -> bool {
@@ -86,8 +165,15 @@ impl AnisetteData {
         self.generated_at.elapsed().unwrap_or_default().as_secs()
     }
 
+    /// New headers from the server that produced these ones, and from no other: the device identifier,
+    /// the one-time passwords and the client info of a conversation with Apple (a 2FA code typed a
+    /// minute later) belong to one server. When that server is down this is an error, not another
+    /// server's data (the free failover is for [`Self::new`], at the start of a sign-in or a session).
     pub async fn refresh(&self) -> Result<Self, crate::Error> {
-        Self::new(self.config.clone()).await
+        match &self.server {
+            Some(server) => Self::fetch(self.config.only_server_v3(server), self.config.clone()).await,
+            None => Self::new(self.config.clone()).await,
+        }
     }
 
     /// New headers after GrandSlam asked for a synchronization (hsc 434, `sim` being its
@@ -95,9 +181,16 @@ impl AnisetteData {
     /// that has lost the identity (-45061) makes a new one instead: the data are then those of an
     /// identity Apple has never seen (`fresh_identity`), which is asked to synchronize in its turn.
     pub async fn resync(&self, sim: &str) -> Result<Self, Error> {
-        let mut b = AnisetteHeaders::get_anisette_headers_provider(self.config.clone())?;
+        // the sim belongs to the identity of the server that produced the data: it goes to that
+        // server and to no other one, which could do nothing with it
+        let config = match &self.server {
+            Some(server) => self.config.only_server_v3(server),
+            None => self.config.clone(),
+        };
+        let mut b = AnisetteHeaders::get_anisette_headers_provider(config)?;
         let headers = b.provider.resync_anisette_headers(sim).await?;
         let base_headers = b.provider.normalize_headers(headers);
+        let server = b.provider.server_used();
 
         Ok(AnisetteData {
             base_headers,
@@ -107,17 +200,18 @@ impl AnisetteData {
                 .user_agent()
                 .unwrap_or_else(|| self.user_agent.clone()),
             fresh_identity: b.provider.identity_is_new(),
-            config: self.config.clone().set_preferred_url_v3(b.provider.server_used()),
+            config: self.config.clone().set_preferred_url_v3(server.clone()),
             refresh_failed_at: None,
+            server,
         })
     }
 
-    /// Fetches the data again in place: three tries with a pause (a failover to the other server is
-    /// part of each try), then, when the previous data are still valid, they are kept instead of
-    /// failing in the middle of a sign or a 2FA wait. After an abandoned refresh no new attempt is made
-    /// for `REFRESH_BACKOFF` as long as the previous data are valid, so an outage does not add its
-    /// retries to every request to Apple. Data that are not valid any more are an error: Apple would
-    /// only refuse them. A server that cannot be used at all (not Windows) is not retried.
+    /// Fetches the data again in place: three tries with a pause, all of them with the server that produced
+    /// the data (see [`Self::refresh`]: a conversation with Apple does not change server), then, when the
+    /// previous data are still valid, they are kept instead of failing in the middle of a sign or a 2FA
+    /// wait. After an abandoned refresh no new attempt is made for `REFRESH_BACKOFF` as long as the
+    /// previous data are valid, so an outage does not add its retries to every request to Apple. Data
+    /// that are not valid any more are an error: Apple would only refuse them.
     pub async fn refresh_in_place(&mut self) -> Result<(), Error> {
         let backoff = self.in_backoff(Instant::now());
         if backoff && self.is_valid() {
@@ -132,7 +226,6 @@ impl AnisetteData {
                     *self = fresh;
                     return Ok(());
                 }
-                Err(e @ Error::Anisette(AnisetteError::UnsupportedServer(_))) => return Err(e),
                 Err(e) => {
                     log::warn!("anisette refresh failed (attempt {attempt}/{tries}): {e}");
                     last = Some(e);
@@ -181,7 +274,7 @@ impl AnisetteData {
                 "X-Apple-App-Info".to_owned(),
                 "com.apple.gs.xcode.auth".to_owned(),
             );
-            headers.insert("X-Xcode-Version".to_owned(), XCODE_VERSION.to_owned());
+            headers.insert("X-Xcode-Version".to_owned(), xcode_version());
         }
 
         if cpd {
@@ -234,7 +327,7 @@ impl AnisetteData {
         headers.insert("Accept", HeaderValue::from_static(accept));
         headers.insert("User-Agent", header_value(&self.user_agent)?);
         headers.insert("X-Mme-Client-Info", header_value(&self.client_info()?)?);
-        headers.insert("X-Xcode-Version", HeaderValue::from_static(XCODE_VERSION));
+        headers.insert("X-Xcode-Version", header_value(&xcode_version())?);
         headers.insert(
             "X-Apple-App-Info",
             HeaderValue::from_static("com.apple.gs.xcode.auth"),
@@ -263,6 +356,7 @@ mod tests {
             user_agent: "akd/1.0 CFNetwork/808.1.4".to_string(),
             fresh_identity: false,
             refresh_failed_at: None,
+            server: None,
         }
     }
 
@@ -282,6 +376,17 @@ mod tests {
         );
         let akd = "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
         assert_eq!(sanitize_client_info(akd), akd);
+    }
+
+    #[test]
+    fn the_replacement_of_the_blocked_identifier_can_be_chosen_or_switched_off() {
+        let xcode = "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>";
+        assert_eq!(
+            sanitize_client_info_with(xcode, Some("com.apple.akd/2.0")),
+            "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/2.0)>"
+        );
+        // `keep`: the client info goes out as the server announced it, whatever it names
+        assert_eq!(sanitize_client_info_with(xcode, None), xcode);
     }
 
     #[test]

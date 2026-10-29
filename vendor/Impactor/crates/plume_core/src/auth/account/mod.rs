@@ -16,6 +16,11 @@ use srp::ClientVerifier;
 
 use crate::Error;
 
+/// Times the data of another anisette server are tried, after Apple refused those of the one in use
+/// (or the server failed), by one sign-in or one developer session: the servers are few, and every
+/// attempt is a request to Apple.
+pub(crate) const MAX_SERVER_SWITCHES: u8 = 8;
+
 /// Retries of a GrandSlam request that was shed, after the first try: 429 asks to slow down (the
 /// answer to wait and try again, three times at most); the edge in front of GrandSlam answers
 /// `503 Service Temporarily Unavailable` (HTML) to requests it refuses (anisette data or a client

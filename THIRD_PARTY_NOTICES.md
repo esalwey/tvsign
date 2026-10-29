@@ -11,11 +11,12 @@ The `plume_core` crate (`vendor/Impactor/crates/plume_core`) is licensed MPL-2.0
 source files stay under that license (https://www.mozilla.org/MPL/2.0/), and their source is
 available in `vendor/Impactor/crates/plume_core` of this repository, including our modifications.
 
-The Windows anisette handling of `plumesign` (version 1.0.1: client info and user agent taken from the
-anisette server, a new anisette identity on error -45061, the headers and the Mac client info of the
-requests to Apple's provisioning service, synchronization on `hsc` 434, the `hsc` 409 case of the
-two-factor step) follows [isideload](https://github.com/nab138/isideload) (MIT), re-written for
-`omnisette` and `plume_core` (see `vendor/Impactor/PATCHES.md`). Its license:
+The anisette handling of `plumesign` (since 1.0.1: client info and user agent taken from the anisette
+server, a new anisette identity on error -45061, the headers and the Mac client info of the requests to
+Apple's provisioning service, synchronization on `hsc` 434, the `hsc` 409 case of the two-factor step; and,
+since 1.0.2, a list of servers tried in turn with one identity per server) follows
+[isideload](https://github.com/nab138/isideload) (MIT), re-written for `omnisette` and `plume_core` (see
+`vendor/Impactor/PATCHES.md`). Its license:
 
 > MIT License
 >

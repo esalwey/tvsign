@@ -351,7 +351,8 @@ class AccountList(unittest.TestCase):
 
 
 class AnisetteClientInfoCheck(unittest.TestCase):
-    """What the diagnostic accepts as an anisette-v3 server (the Windows decision is in test_hotfix)."""
+    """What the diagnostic accepts as an anisette-v3 server: one that announces a client info and a user agent,
+    whatever they say (no platform is judged, see test_hotfix)."""
 
     def fetch(self, body: bytes):
         import io

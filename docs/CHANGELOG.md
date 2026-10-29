@@ -58,6 +58,18 @@ defaults are not the ones of 1.0.
 - New pairings are made under a name of their own (`tvsign-xxxxxxxx`); the ones you already have keep theirs.
 - `docker-compose.yml` defaults `TZ` to UTC (it said Europe/Paris). If you replace your compose file with the
   new one, set `TZ` in a `.env` file next to it, or the time window and the journal use UTC.
+- **Anisette servers** (also in 1.0.2): what Apple accepts changes every few weeks (Android anisette until
+  12 October 2026, Windows until 22 October, macOS since), and 1.0.1 refused every server that did not
+  announce Windows, so it could not sign in at all. tvsign no longer judges a server by the platform it
+  announces: the data go to Apple with the client info and user agent the server announces, and Apple's
+  answer decides. It tries a list of servers (five by default, `mac-ani.jkcoxson.com` first) and moves on to
+  the next when one cannot be reached, fails, or when Apple refuses its data; the one that worked last goes
+  first. Each server has its own anisette identity. The servers you choose (several can be listed) are tried
+  first, the default ones behind them; Settings › Signing service › "If this server fails" turns that off,
+  and a server chosen before the update stays alone until you change it. The list, and the client info and
+  user agent sent to Apple, can be changed in Settings › Advanced (or `TVSIGN_ANISETTE_SERVERS`,
+  `TVSIGN_ANISETTE_CLIENT_INFO`, `TVSIGN_ANISETTE_USER_AGENT`) without a new version. Settings › Diagnostics
+  shows what each server announces and how fast it answers, and the journal says when tvsign left one.
 
 ### Going back to 1.0.x
 
@@ -65,6 +77,14 @@ defaults are not the ones of 1.0.
 settings of 1.1: an app signed with an imported certificate is signed with the Apple ID again, and pinned
 versions and "new versions only when I ask" are forgotten. Switch such apps to the Apple ID first, or put the
 copy made before the upgrade back with tvsign stopped.
+
+## 1.0.2
+
+1.0.1 stopped signing in the day the anisette servers changed their data from Windows to macOS (about
+22 October 2026): it refused every server that did not announce Windows. 1.0.2 sends the data of any server
+as the server announces them, tries a list of servers in turn (a server that fails, or whose data Apple
+refuses, gives way to the next) and lets you change the list, and the client info and user agent sent to
+Apple, without a new version. 1.1.0 includes all of it.
 
 ## 1.0.1
 
