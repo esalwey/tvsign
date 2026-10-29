@@ -701,6 +701,8 @@ struct Scenario {
     from_servers: bool,
     /// Indexes of the servers that fail when they are given Apple's synchronization data.
     failing_sync: Vec<usize>,
+    /// Apple accepted the data of the first server in an earlier sign-in (`last-server.json`).
+    trusted_first: bool,
 }
 
 impl Scenario {
@@ -716,6 +718,7 @@ impl Scenario {
             overrides: ClientOverrides::default(),
             from_servers: false,
             failing_sync: Vec::new(),
+            trusted_first: false,
         }
     }
 }
@@ -741,6 +744,9 @@ fn run_scenario(scenario: Scenario) -> Run {
     let urls: Vec<String> = dead.iter().cloned().chain(servers.iter().map(|server| server.0.clone())).collect();
     let (config, dir) = anisette_config(&urls.iter().map(String::as_str).collect::<Vec<_>>());
     let config = config.set_client_overrides(scenario.overrides.clone());
+    if scenario.trusted_first {
+        omnisette::remember_server(&dir, config.configured_servers_v3(), &urls[0]);
+    }
 
     let mut base_headers = HashMap::new();
     base_headers.insert("X-Mme-Client-Info".to_string(), client_info.to_string());
@@ -1128,7 +1134,9 @@ fn minus_80045_for_the_data_of_a_server_gets_the_data_of_the_next_one() {
 }
 
 #[test]
-fn minus_80045_from_every_server_is_reported_after_one_request_to_each() {
+fn minus_80045_from_every_server_is_reported_after_one_other_server() {
+    // -80045 is as likely the account or the connection as the data: a tour of every server would be a new
+    // device identifier, a provisioning and a synchronization each, for one Apple ID, within seconds
     let mut apple = Apple::new(TwoFa::None);
     apple.refuse_otp_with = vec![
         ("otp-a", -80045, REFUSED_80045),
@@ -1142,8 +1150,28 @@ fn minus_80045_from_every_server_is_reported_after_one_request_to_each() {
     });
     let error = run.result.as_ref().unwrap_err();
     assert_eq!(error.to_string(), format!("Authentication SRP error -80045: {REFUSED_80045}"));
-    assert_eq!(otps(&run), ["otp-a", "otp-b", "otp-c"], "one request per server, none repeated");
+    assert_eq!(otps(&run), ["otp-a", "otp-b"], "one other server, none repeated, the third never asked");
+    assert!(run.other_anisette[1].iter().all(|r| r.path != "/v3/get_headers"));
     assert_eq!(run.remembered, None, "no server was accepted");
+}
+
+#[test]
+fn minus_80045_from_the_server_apple_accepted_last_time_is_the_answer_at_once() {
+    // that server's data were good a moment ago: the account or the connection is what Apple refuses, and
+    // no other server's data can change that
+    let mut apple = Apple::new(TwoFa::None);
+    apple.refuse_otp_with = vec![("otp-first", -80045, REFUSED_80045)];
+    let run = run_scenario(Scenario {
+        servers: vec!["otp-first", BEFORE_SYNC],
+        initial_otp: "otp-first",
+        trusted_first: true,
+        ..Scenario::new(apple)
+    });
+    let error = run.result.as_ref().unwrap_err();
+    assert_eq!(error.to_string(), format!("Authentication SRP error -80045: {REFUSED_80045}"));
+    assert_eq!(otps(&run), ["otp-first"]);
+    assert!(run.other_anisette[0].iter().all(|r| r.path != "/v3/get_headers"));
+    assert!(run.provisioned.is_empty());
 }
 
 #[test]
@@ -1463,7 +1491,7 @@ fn the_portal_sees_the_client_info_the_user_agent_and_the_anisette_data_of_the_s
     assert_eq!(h["x-apple-i-identity-id"], "adsid-1");
     assert_eq!(h["x-apple-gs-token"], "gs-token-1");
     assert_eq!(h["x-apple-app-info"], "com.apple.gs.xcode.auth");
-    assert_eq!(h["x-xcode-version"], crate::auth::anisette_data::XCODE_VERSION);
+    assert_eq!(h["x-xcode-version"], crate::auth::anisette_data::xcode_version());
     assert_eq!(h["x-apple-i-md"], BEFORE_SYNC);
     assert_eq!(h["x-apple-i-md-m"], "machine");
     assert_eq!(h["x-mme-device-id"], "09090909-0909-0909-0909-090909090909");
@@ -1591,4 +1619,75 @@ fn a_new_identity_that_apple_does_not_ask_to_synchronize_is_not_touched() {
     assert_eq!(run.portal.len(), 1);
     assert_eq!(run.apple.len(), 1);
     assert!(run.anisette.iter().all(|r| r.path != "/v3/get_headers"));
+}
+
+// ---------------------------------------------------------------- the data of a conversation stay with one server
+
+/// An anisette server like [`anisette_server_giving`] that can be taken down: while `down` is set it
+/// answers 500 to everything.
+fn switchable_server(
+    otp: &'static str,
+    down: Arc<std::sync::atomic::AtomicBool>,
+) -> (String, Arc<Mutex<Vec<Req>>>) {
+    let (url, seen, _) = serve_with_provisioning(move |req| {
+        if down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Resp::status(500);
+        }
+        match req.path.as_str() {
+            "/v3/client_info" => Resp::json(200, &format!(r#"{{"client_info":"{CLIENT_INFO}","user_agent":"{USER_AGENT}"}}"#)),
+            "/v3/get_headers" => Resp::json(
+                200,
+                &format!(r#"{{"result":"Headers","X-Apple-I-MD-M":"machine","X-Apple-I-MD":"{otp}","X-Apple-I-MD-RINFO":"1"}}"#),
+            ),
+            _ => Resp::status(404),
+        }
+    });
+    (url, seen)
+}
+
+#[test]
+fn a_refresh_keeps_to_the_server_of_the_conversation_and_does_not_fail_over() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // the user types a 2FA code for more than a minute: the next request goes out with fresh data. They
+    // must be the data of the same server (the device identifier Apple knows this conversation by), and a
+    // server that went down is an error, not another server's identity in the middle of the conversation
+    let down = Arc::new(AtomicBool::new(false));
+    let (a, _) = switchable_server("otp-a", down.clone());
+    let (b, b_seen) = switchable_server("otp-b", Arc::new(AtomicBool::new(false)));
+    let (config, dir) = anisette_config(&[&a, &b]);
+
+    let data = block_on(AnisetteData::new(config)).unwrap();
+    assert_eq!(data.server.as_deref(), Some(a.as_str()));
+    let again = block_on(data.refresh()).unwrap();
+    assert_eq!(again.server.as_deref(), Some(a.as_str()));
+    assert_eq!(again.base_headers["X-Apple-I-MD"], "otp-a");
+    // the sign-in still knows every server, in case Apple refuses these data later
+    assert_eq!(again.config.configured_servers_v3(), [a.clone(), b.clone()]);
+
+    down.store(true, Ordering::SeqCst);
+    let error = block_on(data.refresh()).unwrap_err();
+    assert!(matches!(error, Error::Anisette(_)), "{error}");
+    assert!(b_seen.lock().unwrap().is_empty(), "the other server was never asked: {:?}", b_seen.lock().unwrap());
+    // the start of a sign-in is where the free failover is
+    let fresh = block_on(AnisetteData::new(data.config.clone().set_preferred_url_v3(None))).unwrap();
+    assert_eq!(fresh.server.as_deref(), Some(b.as_str()));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_server_that_could_not_serve_is_left_alone_by_the_rest_of_the_sign_in() {
+    // otherwise every switch of server would pay the connection timeout of the dead one again
+    let dead = dead_url();
+    let (good, _) = switchable_server("otp-good", Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let (spare, _) = switchable_server("otp-spare", Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let (config, dir) = anisette_config(&[&dead, &good, &spare]);
+
+    let data = block_on(AnisetteData::new(config)).unwrap();
+    assert_eq!(data.server.as_deref(), Some(good.as_str()));
+    assert_eq!(data.config.servers_v3(), [good.clone(), spare.clone()], "the dead server is not tried again");
+    // Apple refuses the data of the server in use: the next one is the spare, not the dead one first
+    let next = block_on(data.from_other_server()).unwrap().expect("the spare is left");
+    assert_eq!(next.server.as_deref(), Some(spare.as_str()));
+    assert!(block_on(next.from_other_server()).unwrap().is_none(), "nothing left but servers already given up");
+    let _ = std::fs::remove_dir_all(dir);
 }

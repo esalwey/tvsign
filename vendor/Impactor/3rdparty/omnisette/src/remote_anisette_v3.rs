@@ -46,8 +46,16 @@ pub const LAST_SERVER_FILE: &str = "last-server.json";
 
 const PROVISIONING_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// `X-Xcode-Version` of every request to GrandSlam (plume_core uses this value as well).
+/// `X-Xcode-Version` of every request to GrandSlam when `PLUMESIGN_XCODE_VERSION` is not set
+/// (plume_core uses [`xcode_version`] as well).
 pub const XCODE_VERSION: &str = "27.0 (27A5218g)";
+
+/// The `X-Xcode-Version` to send: `PLUMESIGN_XCODE_VERSION` when it is set, else [`XCODE_VERSION`]. Apple
+/// follows Xcode releases, so it can be changed without a rebuild.
+pub fn xcode_version() -> String {
+    crate::env_header_override(crate::XCODE_VERSION_ENV).unwrap_or_else(|| XCODE_VERSION.to_string())
+}
+
 /// `X-Apple-App-Info` of every request to GrandSlam.
 const APP_INFO: &str = "com.apple.gs.xcode.auth";
 /// Apple's URL bag, which lists the two provisioning URLs.
@@ -57,6 +65,12 @@ const LOOKUP_URL: &str = "https://gsa.apple.com/grandslam/GsService2/lookup";
 /// when the bag asked with the server's own client info lacks the provisioning URLs.
 const URL_BAG_CLIENT_INFO: &str =
     "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
+
+/// The client info of the second URL bag lookup: `PLUMESIGN_ANISETTE_BAG_CLIENT_INFO` when it is set,
+/// else [`URL_BAG_CLIENT_INFO`].
+fn bag_client_info() -> String {
+    crate::env_header_override(crate::BAG_CLIENT_INFO_ENV).unwrap_or_else(|| URL_BAG_CLIENT_INFO.to_string())
+}
 
 thread_local! {
     /// Where the calling thread asks for Apple's URL bag instead of `gsa.apple.com`: only the tests
@@ -266,7 +280,35 @@ pub fn state_path(dir: &Path, server: &str) -> PathBuf {
     dir.join(STATE_DIR).join(format!("{}.plist", server_key(server)))
 }
 
+/// Whether `server` is one of the servers shipped as defaults. Their data changed platform since the
+/// earlier versions kept their single identity, so an identity of that time is worth nothing to them.
+fn is_default_server(server: &str) -> bool {
+    crate::DEFAULT_ANISETTE_SERVERS_V3
+        .iter()
+        .any(|default| same_server(default, server))
+}
+
+/// The identity of an earlier version (a single file for every server), when there is one. The most
+/// recent version's first.
+fn legacy_state_file(dir: &Path) -> Option<PathBuf> {
+    if dir.as_os_str().is_empty() {
+        return None;
+    }
+    LEGACY_STATE_FILES
+        .iter()
+        .rev()
+        .map(|name| dir.join(name))
+        .find(|path| path.is_file())
+}
+
 /// Read the identity this install has with `server`; a missing or unreadable file means a new identity.
+///
+/// A server of the user's own (not one of the defaults) that has no identity of its own yet takes over the
+/// single identity of an earlier version (`state.plist`, `anisette-state-windows.plist`) when there is
+/// one: that server provisioned it, and it is still valid, so a self-hosted install keeps its device
+/// identifier instead of provisioning and synchronizing again. It is copied to the file of the server;
+/// the old file is dropped once the server has served headers with it ([`drop_legacy_state`]). The default
+/// servers never adopt it: they served other data then.
 fn load_state(dir: &Path, server: &str) -> AnisetteState {
     let path = state_path(dir, server);
     match plist::from_file::<_, AnisetteState>(&path) {
@@ -274,6 +316,19 @@ fn load_state(dir: &Path, server: &str) -> AnisetteState {
         Err(e) => {
             if path.exists() {
                 warn!("anisette state {} is unreadable ({e}): starting with a new identity", path.display());
+            } else if !is_default_server(server)
+                && let Some(legacy) = legacy_state_file(dir)
+                && let Ok(state) = plist::from_file::<_, AnisetteState>(&legacy)
+            {
+                info!(
+                    "{server} takes over the anisette identity {} of an earlier version",
+                    legacy.display()
+                );
+                if let Err(e) = write_state(&path, &state) {
+                    // not fatal: the identity is used now, and adopted again next time
+                    warn!("could not copy the anisette identity of an earlier version for {server}: {e}");
+                }
+                return state;
             } else {
                 info!("no anisette identity with {server} yet: creating a new one");
             }
@@ -282,21 +337,38 @@ fn load_state(dir: &Path, server: &str) -> AnisetteState {
     }
 }
 
-/// Write the identity atomically (a process killed in the middle never leaves half a file), and
-/// drop the files of the earlier versions, which are useless now.
-fn save_state(dir: &Path, server: &str, state: &AnisetteState) -> Result<(), AnisetteError> {
-    let path = state_path(dir, server);
+fn write_state(path: &Path, state: &AnisetteState) -> Result<(), AnisetteError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("plist.tmp");
     plist::to_file_xml(&tmp, state)?;
-    fs::rename(&tmp, &path)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Drop the files of the earlier versions (one identity for every server): they are useless once the
+/// servers have identities of their own.
+fn drop_legacy_state(dir: &Path) {
+    if dir.as_os_str().is_empty() {
+        return;
+    }
     for name in LEGACY_STATE_FILES {
         let legacy = dir.join(name);
         if legacy.exists() && fs::remove_file(&legacy).is_ok() {
             info!("removed the anisette identity {} of an earlier version (one identity per server now)", legacy.display());
         }
+    }
+}
+
+/// Write the identity atomically (a process killed in the middle never leaves half a file). The files of
+/// the earlier versions are dropped here for a default server, which can never use them; for a server
+/// of the user's own they stay until it has served headers ([`drop_legacy_state`]), so that another
+/// custom server can still take the identity over when this one fails.
+fn save_state(dir: &Path, server: &str, state: &AnisetteState) -> Result<(), AnisetteError> {
+    write_state(&state_path(dir, server), state)?;
+    if is_default_server(server) {
+        drop_legacy_state(dir);
     }
     Ok(())
 }
@@ -547,7 +619,7 @@ impl AnisetteClient {
             .header("User-Agent", &self.client_info.user_agent)
             .header("Content-Type", "text/x-xml-plist")
             .header("Accept", "text/x-xml-plist")
-            .header("X-Xcode-Version", XCODE_VERSION)
+            .header("X-Xcode-Version", xcode_version())
             .header("X-Apple-App-Info", APP_INFO)
             .header("Connection", "close")
             .header("X-Apple-I-MD-LU", encode_hex(&state.md_lu()))
@@ -667,7 +739,7 @@ impl AnisetteClient {
             Ok(urls) => urls,
             Err(first @ (AnisetteError::ProvisioningFailed(_) | AnisetteError::AppleRefused { .. })) => {
                 warn!("Apple's URL bag is not usable ({first}): asking again with a Mac client info");
-                self.provisioning_urls(state, URL_BAG_CLIENT_INFO)
+                self.provisioning_urls(state, &bag_client_info())
                     .await
                     .map_err(|second| {
                         AnisetteError::ProvisioningFailed(format!(
@@ -873,6 +945,8 @@ pub struct RemoteAnisetteProviderV3 {
     serial: String,
     new_identity: bool,
     overrides: ClientOverrides,
+    /// Servers that failed to serve during the last request (unreachable, error, no provisioning).
+    failed: Vec<String>,
 }
 
 impl RemoteAnisetteProviderV3 {
@@ -900,6 +974,7 @@ impl RemoteAnisetteProviderV3 {
             serial,
             new_identity: false,
             overrides: ClientOverrides::default(),
+            failed: Vec::new(),
         }
     }
 
@@ -982,6 +1057,9 @@ impl RemoteAnisetteProviderV3 {
             }
             Err(e) => return Err(e),
         };
+        // the server served with this identity (adopted from an earlier version or its own): the single
+        // identity of the earlier versions is of no use to anyone now
+        drop_legacy_state(&self.configuration_path);
         self.new_identity = provisioned_now;
         self.client_info = Some(client.client_info().clone());
         Ok(data.get_headers(self.serial.clone()))
@@ -995,6 +1073,7 @@ impl RemoteAnisetteProviderV3 {
         sim: Option<&str>,
     ) -> Result<HashMap<String, String>, AnisetteError> {
         self.new_identity = false;
+        self.failed.clear();
         if self.servers.is_empty() {
             return Err(AnisetteError::AllServersFailed(
                 "no anisette server is left to try".to_string(),
@@ -1014,6 +1093,7 @@ impl RemoteAnisetteProviderV3 {
                 Err(e) if is_server_problem(&e) => {
                     warn!("anisette server {server} is not usable: {e}");
                     failures.push(format!("{server}: {e}"));
+                    self.failed.push(server.clone());
                     first_error.get_or_insert(e);
                 }
                 Err(e) => return Err(e),
@@ -1066,6 +1146,10 @@ impl AnisetteHeadersProvider for RemoteAnisetteProviderV3 {
 
     fn server_used(&self) -> Option<String> {
         self.served_by.clone()
+    }
+
+    fn failed_servers(&self) -> Vec<String> {
+        self.failed.clone()
     }
 }
 
@@ -1154,7 +1238,7 @@ mod tests {
     #[test]
     fn identities_are_kept_per_server_and_forgotten_on_demand() {
         let dir = temp_dir("omnisette-test");
-        // the identities of the earlier versions are removed once a new one is saved
+        // unreadable files of the earlier versions (not identities): never taken over, dropped with the rest
         for legacy in LEGACY_STATE_FILES {
             fs::write(dir.join(legacy), b"old").unwrap();
         }
@@ -1164,6 +1248,11 @@ mod tests {
         save_state(&dir, a, &state_a).unwrap();
         assert!(state_path(&dir, a).exists());
         assert!(state_path(&dir, a).starts_with(dir.join(STATE_DIR)));
+        // a server of the user's own does not drop them by saving (another one may take them over)
+        for legacy in LEGACY_STATE_FILES {
+            assert!(dir.join(legacy).exists(), "{legacy}");
+        }
+        drop_legacy_state(&dir);
         for legacy in LEGACY_STATE_FILES {
             assert!(!dir.join(legacy).exists(), "{legacy}");
         }
@@ -1522,6 +1611,94 @@ mod tests {
         assert_eq!(count(&primary_seen, "/v3/get_headers"), 0);
         // the server that worked is reported, to be tried first by the next refresh of the sign-in
         assert_eq!(provider.server_used().as_deref(), Some(fallback.as_str()));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_servers_that_failed_are_reported_for_the_sign_in_to_leave_alone() {
+        let (dead, _) = serve(vec![]);
+        let (good, _) = working(MAC_INFO);
+        let (dir, _) = provisioned_dir(&[&dead, &good]);
+        let mut provider = RemoteAnisetteProviderV3::with_servers(
+            vec![dead.clone(), good.clone()],
+            dir.clone(),
+            "0".to_string(),
+        );
+        run(provider.get_authentication_headers()).unwrap();
+        assert_eq!(provider.failed_servers(), [dead.clone()]);
+        // a request that fails nowhere reports nothing (the list is the last request's)
+        let mut provider = RemoteAnisetteProviderV3::new(good.clone(), dir.clone(), "0".to_string());
+        run(provider.get_authentication_headers()).unwrap();
+        assert!(provider.failed_servers().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn write_legacy_identity(dir: &Path, file: &str, id: u8) {
+        fs::create_dir_all(dir).unwrap();
+        let state = AnisetteState {
+            keychain_identifier: [id; 16],
+            adi_pb: Some(vec![id, id]),
+        };
+        plist::to_file_xml(dir.join(file), &state).unwrap();
+    }
+
+    #[test]
+    fn a_server_of_the_user_takes_over_the_identity_of_an_earlier_version() {
+        let dir = temp_dir("omnisette-test");
+        // 1.0.0 and 1.0.1 both left an identity: the most recent version's is the one taken
+        write_legacy_identity(&dir, "state.plist", 4);
+        write_legacy_identity(&dir, "anisette-state-windows.plist", 5);
+        let own = "https://own.example";
+        let adopted = load_state(&dir, own);
+        assert_eq!(adopted.keychain_identifier, [5; 16]);
+        assert_eq!(adopted.adi_pb, Some(vec![5, 5]));
+        // copied to the file of the server, the old files stay until the server has served
+        assert!(state_path(&dir, own).exists());
+        assert!(dir.join("anisette-state-windows.plist").exists() && dir.join("state.plist").exists());
+        assert_eq!(load_state(&dir, own).keychain_identifier, [5; 16]);
+
+        // the default servers served other data then: they never take it over
+        for default in crate::DEFAULT_ANISETTE_SERVERS_V3 {
+            let state = load_state(&dir, default);
+            assert_ne!(state.keychain_identifier, [5; 16], "{default}");
+            assert!(!state.is_provisioned(), "{default}");
+            assert!(!state_path(&dir, default).exists(), "{default}");
+        }
+        // and saving a default server's identity drops them (nobody could use them but a custom server)
+        let mut own_state = AnisetteState::new();
+        own_state.adi_pb = Some(vec![1]);
+        save_state(&dir, crate::DEFAULT_ANISETTE_URL_V3, &own_state).unwrap();
+        assert!(!dir.join("anisette-state-windows.plist").exists() && !dir.join("state.plist").exists());
+        // a folder-less configuration never reads or drops files of the current directory
+        assert!(legacy_state_file(Path::new("")).is_none());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_identity_of_an_earlier_version_is_not_taken_over() {
+        let dir = temp_dir("omnisette-test");
+        fs::write(dir.join("state.plist"), b"not a plist").unwrap();
+        let state = load_state(&dir, "https://own.example");
+        assert!(!state.is_provisioned());
+        assert!(!state_path(&dir, "https://own.example").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_working_identity_of_an_earlier_version_keeps_its_device_with_a_server_of_the_user() {
+        // the self-hosted install of 1.0.1 (or of 1.0.0, or with the old platform flag): its identity is
+        // still valid with its server, which must not provision a new device or ask Apple again
+        let (url, seen) = working(MAC_INFO);
+        let dir = temp_dir("omnisette-http");
+        write_legacy_identity(&dir, "anisette-state-windows.plist", 9);
+        let mut provider = RemoteAnisetteProviderV3::new(url.clone(), dir.clone(), "0".to_string());
+        let headers = run(provider.get_authentication_headers()).unwrap();
+        assert_eq!(headers["X-Mme-Device-Id"], "09090909-0909-0909-0909-090909090909");
+        assert!(!provider.identity_is_new());
+        assert_eq!(count(&seen, "/v3/get_headers"), 1);
+        // the server served with it: the old file is dropped, the server's own file stays
+        assert!(!dir.join("anisette-state-windows.plist").exists());
+        assert_eq!(load_state(&dir, &url).keychain_identifier, [9; 16]);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1899,7 +2076,7 @@ mod provisioning_tests {
             assert_eq!(h["user-agent"], MAC_USER_AGENT, "{path}");
             assert_eq!(h["content-type"], "text/x-xml-plist", "{path}");
             assert_eq!(h["accept"], "text/x-xml-plist", "{path}");
-            assert_eq!(h["x-xcode-version"], XCODE_VERSION, "{path}");
+            assert_eq!(h["x-xcode-version"], xcode_version(), "{path}");
             assert_eq!(h["x-apple-app-info"], "com.apple.gs.xcode.auth", "{path}");
             assert_eq!(h["connection"], "close", "{path}");
             assert_eq!(h["x-apple-i-md-lu"].len(), 64, "{path}");

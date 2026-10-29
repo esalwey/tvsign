@@ -41,9 +41,12 @@ refuses its data; all of it is visible (log lines, Settings > Diagnostics) and c
   (`DEFAULT_ANISETTE_URL_V3` is the first). `resolve_servers(requested, fallback_override)`: nothing requested ->
   the defaults; a server requested (`PLUMESIGN_ANISETTE_URL` / `ANISETTE_URL_V3`, the user's own) -> tried first,
   the defaults behind it, each server once whatever the case or the trailing slash (an address without scheme is
-  `https://`); `PLUMESIGN_ANISETTE_FALLBACK_URL` replaces what comes behind the first server (URLs separated by
-  commas, semicolons or spaces, which is how the default list is changed without a rebuild; `none` or `off`
-  leaves the first server alone). No host is refused or replaced because of its name: 1.0.1's
+  `https://`); `PLUMESIGN_ANISETTE_FALLBACK_URL` is the list of servers (URLs separated by commas, semicolons or
+  spaces, which is how the default list is changed without a rebuild, the first default included: the day a default
+  server is retired nothing has to be recompiled): behind the server requested when there is one, else the whole
+  list instead of the defaults; `none` or `off` leaves the first server alone. tvsign's `anisette_servers`
+  setting (or `TVSIGN_ANISETTE_SERVERS`) feeds it, and `settings.resolve_servers()` computes the same list for
+  the diagnostic and for `last-server.json`. No host is refused or replaced because of its name: 1.0.1's
   `ANDROID_ANISETTE_HOSTS` (six hosts replaced by the default), the single `FALLBACK_ANISETTE_URL_V3`,
   `is_android_anisette_server()` and `url_host()` are gone.
   `AnisetteConfiguration`: `configured_servers_v3()`, `set_servers_v3()`, `set_anisette_url_v3()` (that server
@@ -68,7 +71,13 @@ refuses its data; all of it is visible (log lines, Settings > Diagnostics) and c
   there is one) with everything but letters, digits, dots and dashes written `_`: a file name that is safe, never
   a device name of Windows (`con`, `nul`, `com1`...), 80 characters at most with a digest when it is longer. The
   single identity of the earlier versions (`state.plist` of 1.0.0, `anisette-state-windows.plist` of 1.0.1,
-  `LEGACY_STATE_FILES`) is not read any more and is deleted once an identity is saved. Files are written
+  `LEGACY_STATE_FILES`) is taken over, not lost: a server that is not one of `DEFAULT_ANISETTE_SERVERS_V3` (the
+  user's own, a self-hosted one, the one of the 1.0.1 workaround `PLUMESIGN_ANISETTE_ALLOW_ANY_PLATFORM=1`) and has
+  no identity file yet copies it to its own file (`load_state`; the most recent version's first), so its device
+  identifier, still valid there, is kept and nothing is provisioned or synchronized again. The old files are
+  deleted once a server has served headers with its identity (`drop_legacy_state`), or when a default server saves
+  one (the defaults served other data then: they never adopt it, and it can be of use to nobody else). A server
+  that does not know the identity answers `-45061` and gets a new one (below). Files are written
   atomically; an unreadable one (or an identifier of the wrong length, which used to panic) means a new
   identity; `adi_pb` is optional in the file (an unprovisioned identity round-trips).
 - The server that worked last: `anisette/last-server.json` (`LAST_SERVER_FILE`: `server`, `servers`, `at`).
@@ -81,12 +90,25 @@ refuses its data; all of it is visible (log lines, Settings > Diagnostics) and c
 - Within one sign-in, the server that served the last data is tried first by the next refresh
   (`AnisetteConfiguration::preferred_url_v3()`, `server_order()`) and the servers whose data Apple refused are left
   out (`refuse_server_v3()`). It lives in the configuration that travels with the data, not in a process-wide
-  variable. Trait method `AnisetteHeadersProvider::server_used()`.
+  variable. Trait method `AnisetteHeadersProvider::server_used()`. The servers that could not serve while the data
+  were fetched (`AnisetteHeadersProvider::failed_servers()`: unreachable, an error, no provisioning) are left out
+  of the sign-in the same way, so that a dead server costs its connect timeout once and not at every switch of
+  server (a sign-in with two dead servers and four switches took about 80 s).
+- Data of a conversation stay with one server: `AnisetteData::refresh()` (the data older than a minute, e.g. while
+  the user types a 2FA code) fetches from the server that produced the data and from no other
+  (`only_server_v3`), and an unreachable server is an error. Only `AnisetteData::new` (the start of a sign-in or of
+  a portal session) and the explicit switches (`from_other_server`) may change server. Re-provisioning after a
+  `-45061` of GrandSlam sticks to the server as well.
 - Advanced escape hatch, empty by default: `PLUMESIGN_ANISETTE_CLIENT_INFO` and `PLUMESIGN_ANISETTE_USER_AGENT`
   (`ClientOverrides`, `AnisetteConfiguration::client_overrides()`), each on its own; a value that is not printable
   ASCII is ignored with a warning. They replace what the server announces everywhere it goes to Apple: the headers
   (so GrandSlam, 2FA, SMS and developer portal requests) and the requests of the provisioning. The log says what
-  the server announced and what is sent instead.
+  the server announced and what is sent instead. Three more values that followed the ecosystem are changeable
+  without a rebuild, empty by default: `PLUMESIGN_XCODE_VERSION` (the `X-Xcode-Version`, `omnisette::xcode_version()`,
+  default `XCODE_VERSION`), `PLUMESIGN_ANISETTE_BAG_CLIENT_INFO` (the Mac client info of the second URL bag lookup,
+  default `URL_BAG_CLIENT_INFO`) and `PLUMESIGN_ANISETTE_CLIENT_ID` (the client identifier written in place of
+  `com.apple.dt.Xcode`, default `com.apple.akd/1.0`; `keep`, `none` or `off` send the client info as announced). The
+  user agent override also covers the fallback `DEFAULT_USER_AGENT` (used only when a provider reports none).
 - A server answer of `-45061` ("not provisioned") makes a NEW identity with that server (new random device
   identifier, as isideload does with `force_reset`) and provisions it, once, then asks again for the headers. The
   synchronization data (`sim`) of Apple belonged to the old identity, so the second request goes without
@@ -146,8 +168,8 @@ refuses its data; all of it is visible (log lines, Settings > Diagnostics) and c
   fixed macOS user agent, `Xcode` as developer-portal user agent and the `Accept: */*` are gone). Only a
   client identifier GrandSlam blocks (`com.apple.dt.Xcode`) is replaced by `com.apple.akd/1.0`; any other
   client info (the Windows `com.apple.iTunes/...` of 1.0.1's servers, the macOS one of today's) is never
-  rewritten. `get_header()` no longer lower-cases values. `XCODE_VERSION` is the one of omnisette (the
-  provisioning requests send it too). `AnisetteData` knows the server that produced it (`server`), which the
+  rewritten (`PLUMESIGN_ANISETTE_CLIENT_ID` changes or switches off that replacement). `get_header()` no longer
+  lower-cases values. `xcode_version()` is the one of omnisette (the provisioning requests send it too). `AnisetteData` knows the server that produced it (`server`), which the
   identity, the synchronization and Apple's verdict belong to.
 - The `init` step is run by a small plan (`InitPlan`, `login.rs`) so that no answer of Apple can make the
   sign-in loop: at most 16 `init` requests, 4 for the data of one server, at most 8 switches to another server,
@@ -164,8 +186,12 @@ refuses its data; all of it is visible (log lines, Settings > Diagnostics) and c
     identity (`AnisetteData::fresh_identity` of the new data).
   - Apple refusing the data of the server in use (`data_refusal()`): `-80045` at `init`, an HTML 503 that lasts
     (after the retries below), `-45061` again after the new identity, `-22421` again after the synchronization,
-    `-22409`, `-80009`, "MID is invalid". `-80045` can also be the account or the connection, but the data of the
-    next server are the only thing this sign-in can change, and each server gets one request for it. The server is
+    `-22409`, `-80009`, "MID is invalid". `-80045` is as likely the account, the IP address or a throttle as the
+    data, and every other server means a new device identifier, a provisioning, a synchronization and two more
+    `init` requests for one Apple ID within seconds, which feeds the throttle: it makes ONE switch at most per
+    sign-in (`MAX_SWITCHES_FOR_80045`), and none when the refused server is the one in `last-server.json` (Apple
+    accepted its data recently, `AnisetteData::from_remembered_server()`, `InitPlan::set_server_trusted`), then the
+    answer is the error. The other refusals keep the cap of `MAX_SERVER_SWITCHES`. The server is
     left out for the rest of the sign-in (`AnisetteConfiguration::refuse_server_v3`), the data of the next server
     in the order are fetched (`AnisetteData::from_other_server`, `Account::switch_anisette_server`) and the `init`
     is sent again with the same SRP ephemeral; the new server has its own budget and its own corrections. A server
@@ -244,7 +270,10 @@ refuses its data; all of it is visible (log lines, Settings > Diagnostics) and c
   session against a local portal: headers of the portal requests, 503 pages reported as such, synchronization of
   a new identity the portal refuses (and none for an identity Apple knows, or when Apple does not ask), a portal
   that answers 503 to the data of a server (the next server, remembered; all refused: one request each) and a
-  `1100` that changes nothing.
+  `1100` that changes nothing; the data of a conversation (a refresh that keeps to its server and does not fail
+  over to another one when it is down), the servers that failed to serve left alone by the later switches, a
+  `-80045` that costs one other server at most (and none from the server Apple accepted last), the identity of an
+  earlier version taken over by a server of the user's own (`omnisette` tests) and not by the defaults.
 
 ## What tvsign parses
 
@@ -260,7 +289,15 @@ and the prompt `Enter 2FA code from a trusted Apple device (SMS refused by Apple
 `... Apple only accepts Windows anisette ...` does not exist any more.
 Changing one of these strings means changing `tests/test_hotfix.py` and `web/app.js` (`CAUSES`).
 `app/plume.py` also reads `anisette/last-server.json` (Settings > Diagnostics shows it) and removes the identity
-files `anisette/*.plist` when Apple refuses the anisette data repeatedly.
+file `anisette/<server key>.plist` of the ONE server whose data Apple refuses (the `using Y instead` of the log
+line, else the server of `last-server.json`, else the first one; `plume.server_key()` is `server_key()` ported,
+once an hour per server) when the error is `-22409` / `-80009` / `-22421`: the other servers work, and a new
+identity of each costs Apple requests. The error text shown to the user is made of the error lines only
+(`plume._tail`), never of the WARN lines of a server switch, which the web interface would file under "Apple
+blocked". `app/settings.py` resolves the same list of servers as plumesign (`resolve_servers`, the `anisette_servers`
+setting), and at start it cleans once after an update (`settings.migrate`): a server of 1.0.0 (Android) still stored
+in the settings is cleared, and a server chosen before the update keeps being used alone (`anisette_fallback`
+stored as `off`), as it was in 1.0.1.
 
 ## Diagnostic: `plumesign probe-gsa` (hidden)
 

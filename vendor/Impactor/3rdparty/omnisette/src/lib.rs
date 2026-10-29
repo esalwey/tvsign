@@ -92,8 +92,9 @@ pub const DEFAULT_ANISETTE_URL_V3: &str = DEFAULT_ANISETTE_SERVERS_V3[0];
 
 /// Environment variables that name the anisette v3 server to try first.
 pub const SERVER_ENV: &[&str] = &["PLUMESIGN_ANISETTE_URL", "ANISETTE_URL_V3"];
-/// Servers tried behind the first one, instead of [`DEFAULT_ANISETTE_SERVERS_V3`]: URLs separated by
-/// commas, semicolons or spaces; `none` or `off` for no other server.
+/// The anisette v3 servers, instead of [`DEFAULT_ANISETTE_SERVERS_V3`]: URLs separated by commas,
+/// semicolons or spaces, tried in this order (behind the server the user requested, when there is one);
+/// `none` or `off` for no other server than the first.
 pub const FALLBACK_ENV: &str = "PLUMESIGN_ANISETTE_FALLBACK_URL";
 /// Advanced escape hatch: the `X-Mme-Client-Info` sent to Apple instead of the one the server announces.
 pub const CLIENT_INFO_ENV: &str = "PLUMESIGN_ANISETTE_CLIENT_INFO";
@@ -102,6 +103,15 @@ pub const USER_AGENT_ENV: &str = "PLUMESIGN_ANISETTE_USER_AGENT";
 /// Accepted and ignored. It used to let a server through whatever platform it announced; every server
 /// is used now.
 pub const ALLOW_ANY_PLATFORM_ENV: &str = "PLUMESIGN_ANISETTE_ALLOW_ANY_PLATFORM";
+/// Advanced escape hatch: the `X-Xcode-Version` sent with every request to Apple, instead of
+/// [`remote_anisette_v3::XCODE_VERSION`].
+pub const XCODE_VERSION_ENV: &str = "PLUMESIGN_XCODE_VERSION";
+/// Advanced escape hatch: the client info Apple's URL bag is asked with a second time when the first
+/// answer lacks the provisioning URLs, instead of the built-in Mac one.
+pub const BAG_CLIENT_INFO_ENV: &str = "PLUMESIGN_ANISETTE_BAG_CLIENT_INFO";
+/// Advanced escape hatch: the client identifier written in place of `com.apple.dt.Xcode` (which GrandSlam
+/// blocks) in the client info; `keep` (or `none`, `off`) sends the client info as the server announced it.
+pub const CLIENT_ID_ENV: &str = "PLUMESIGN_ANISETTE_CLIENT_ID";
 
 /// First non-empty URL among the given environment variables, in order.
 fn env_url(names: &[&str]) -> Option<String> {
@@ -149,24 +159,31 @@ fn dedupe_servers(servers: Vec<String>) -> Vec<String> {
 
 /// Decide which servers to use, in order.
 ///
-/// - nothing requested: [`DEFAULT_ANISETTE_SERVERS_V3`];
-/// - a server requested (the user's own): tried first, the default servers behind it;
-/// - `fallback_override`: replaces the servers behind the first one (URLs separated by commas,
-///   semicolons or spaces); `none` or `off` leaves the first one alone.
+/// - nothing requested, no list: [`DEFAULT_ANISETTE_SERVERS_V3`];
+/// - a server requested (the user's own): tried first, then `fallback_override` when it is a list,
+///   else the default servers;
+/// - `fallback_override` a list of URLs (separated by commas, semicolons or spaces) and nothing
+///   requested: that list is the list of servers, in that order (this is how the defaults, the first
+///   one included, are replaced without a rebuild when the ecosystem moves);
+/// - `fallback_override` `none` or `off`: the first server alone.
 ///
 /// No address is refused or replaced because of the host it names: the answer of the server (and then
 /// Apple's) decides.
 pub fn resolve_servers(requested: Option<&str>, fallback_override: Option<&str>) -> Vec<String> {
-    let first = requested
+    let requested = requested
         .map(str::trim)
         .filter(|u| !u.is_empty())
-        .map(normalize_server)
-        .unwrap_or_else(|| DEFAULT_ANISETTE_URL_V3.to_string());
-    let mut servers = vec![first];
-    match fallback_override.map(str::trim) {
-        Some(f) if f.eq_ignore_ascii_case("none") || f.eq_ignore_ascii_case("off") => {}
-        Some(f) if !f.is_empty() => servers.extend(split_servers(f)),
-        _ => servers.extend(DEFAULT_ANISETTE_SERVERS_V3.iter().map(|s| s.to_string())),
+        .map(normalize_server);
+    let list = fallback_override.map(str::trim).unwrap_or("");
+    let mut servers: Vec<String> = Vec::new();
+    if list.eq_ignore_ascii_case("none") || list.eq_ignore_ascii_case("off") {
+        servers.push(requested.unwrap_or_else(|| DEFAULT_ANISETTE_URL_V3.to_string()));
+    } else if !split_servers(list).is_empty() {
+        servers.extend(requested);
+        servers.extend(split_servers(list));
+    } else {
+        servers.push(requested.unwrap_or_else(|| DEFAULT_ANISETTE_URL_V3.to_string()));
+        servers.extend(DEFAULT_ANISETTE_SERVERS_V3.iter().map(|s| s.to_string()));
     }
     dedupe_servers(servers)
 }
@@ -208,6 +225,12 @@ fn clean_override(name: &str, value: Option<&str>) -> Option<String> {
         log::warn!("{name} is ignored: it holds characters that cannot go in an HTTP header");
         None
     }
+}
+
+/// The value of an advanced environment variable that ends up in an HTTP header (empty, or not
+/// printable ASCII: ignored, the latter with a warning).
+pub fn env_header_override(name: &str) -> Option<String> {
+    clean_override(name, env_url(&[name]).as_deref())
 }
 
 impl ClientOverrides {
@@ -502,6 +525,12 @@ pub fn remember_server(configuration_path: &std::path::Path, servers: &[String],
     remote_anisette_v3::remember_server(configuration_path, servers, server)
 }
 
+/// The server Apple accepted the data of last time, when `servers` is the list it was made for.
+#[cfg(feature = "remote-anisette-v3")]
+pub fn remembered_server(configuration_path: &std::path::Path, servers: &[String]) -> Option<String> {
+    remote_anisette_v3::remembered_server(configuration_path, servers)
+}
+
 #[cfg(test)]
 mod server_tests {
     use super::*;
@@ -581,15 +610,19 @@ mod server_tests {
     }
 
     #[test]
-    fn the_fallback_override_replaces_the_default_servers_behind_the_first() {
+    fn the_list_replaces_the_default_servers() {
         assert_eq!(
             resolve_servers(Some("https://own.example"), Some("https://b.example/")),
             ["https://own.example", "https://b.example"]
         );
+        // nothing requested: the list is the whole list, the first default included (a default that the
+        // ecosystem retired can be dropped without a rebuild)
         assert_eq!(
             resolve_servers(None, Some("https://b.example, https://c.example;https://d.example  https://e.example")),
-            [DEFAULT_ANISETTE_URL_V3, "https://b.example", "https://c.example", "https://d.example", "https://e.example"]
+            ["https://b.example", "https://c.example", "https://d.example", "https://e.example"]
         );
+        // a list that holds no address is no list
+        assert_eq!(resolve_servers(None, Some(" , ; ")), defaults());
         // a server named twice is tried once
         assert_eq!(
             resolve_servers(Some("https://b.example"), Some("https://B.example/ https://c.example")),

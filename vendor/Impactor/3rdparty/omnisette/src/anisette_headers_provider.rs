@@ -46,6 +46,12 @@ pub trait AnisetteHeadersProvider: Send + Sync {
         None
     }
 
+    /// The servers that failed to serve during the last request (a provider that chooses between several):
+    /// the sign-in leaves them alone from then on instead of paying their timeout again at each switch.
+    fn failed_servers(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Headers again, after GrandSlam asked for a synchronization (`hsc` 434 with an
     /// `X-Apple-I-MD-DATA` value, passed as `sim`).
     #[cfg_attr(not(feature = "async"), remove_async_await::remove_async_await)]
